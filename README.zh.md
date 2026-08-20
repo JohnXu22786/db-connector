@@ -262,3 +262,8 @@ npm run check          # build + src 与 test 的类型检查
 - SQL 扫描遵循 ANSI 字符串转义（`''`），支持双引号标识符、反引号标识符、PostgreSQL 美元引用字符串、`--` / `/* */` 注释与 `::` / `:=`。MySQL 单引号字符串内的反斜杠转义仅近似识别；由于分类只用于**拒绝**写入而不会放行写入，故不会扩大写面。
 - 当查询恰有 `limit` 行且 guard `LIMIT` 生效时，`truncated: true` 也可能为真（已在文档中说明的歧义）。
 - PostgreSQL/MySQL 的内省与执行已实现但仅能对真实服务器验证；SQLite 路径已被测试完整覆盖。
+
+## 许可证
+
+MIT——见 [LICENSE](./LICENSE)。遇到问题或希望新增驱动？欢迎在
+[github.com/JohnXu22786/db-connector](https://github.com/JohnXu22786/db-connector/issues) 提交 issue。

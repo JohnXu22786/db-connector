@@ -320,3 +320,8 @@ the tools, the `/db` command, and the plugin entry.
   `limit` rows while the guard `LIMIT` applied (documented ambiguity).
 - PostgreSQL/MySQL introspection and execution are implemented but exercised
   only against real servers; the SQLite path is fully covered by the tests.
+
+## License
+
+MIT — see [LICENSE](./LICENSE). Found a bug or want a new driver? Open an
+issue at [github.com/JohnXu22786/db-connector](https://github.com/JohnXu22786/db-connector/issues).
