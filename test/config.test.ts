@@ -62,6 +62,17 @@ test('resolveConnectionSpec validates ports and name characters', () => {
   );
 });
 
+test('sqlite ignores a port value while server drivers validate it', () => {
+  // A leftover/copied port on a sqlite connection must not fail resolution.
+  const local = resolveConnectionSpec({ name: 'a', driver: 'sqlite', port: 'not-a-number' }, ENV);
+  assert.equal(local.port, undefined);
+  // ...but server drivers still reject a garbage port loudly.
+  assert.throws(
+    () => resolveConnectionSpec({ name: 'p', driver: 'postgres', database: 'd', port: 'not-a-number' }, ENV),
+    (e) => (e as DbConnectorError).code === 'INVALID_ARGS',
+  );
+});
+
 test('password resolution: env above inline, ref applied later', () => {
   const spec = resolveConnectionSpec(
     { name: 'p', driver: 'postgres', database: 'd', password: 'inline', passwordEnv: 'DB_PASSWORD' },

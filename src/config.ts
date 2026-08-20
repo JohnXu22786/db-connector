@@ -112,7 +112,10 @@ export function resolveConnectionSpec(
     database,
     host: expandEnv(raw.host, env),
     user: expandEnv(raw.user, env),
-    port: toPort(portValue, driver === 'postgres' ? 5432 : 3306, driver),
+    // SQLite has no network port; ignore any value the user carried over so a
+    // leftover "port" (e.g. from a copied server connection) cannot fail a
+    // local connection. Server drivers resolve and validate it below.
+    port: driver === 'sqlite' ? undefined : toPort(portValue, driver === 'postgres' ? 5432 : 3306, driver),
     password,
     passwordSource,
     connectionString,
@@ -132,7 +135,6 @@ export function resolveConnectionSpec(
     }
     result.host = undefined;
     result.user = undefined;
-    result.port = undefined;
     result.ssl = undefined;
     result.options = raw.options ?? {};
   } else {
@@ -142,7 +144,6 @@ export function resolveConnectionSpec(
         `${driver} connection requires "database" (or a "connectionString")`,
       );
     }
-    result.port = toPort(portValue, driver === 'postgres' ? 5432 : 3306, driver);
   }
 
   return result;
