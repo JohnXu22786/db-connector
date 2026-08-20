@@ -5,6 +5,9 @@
 #
 # A patch replaces a row's whole `config`, so restate every key you want to
 # keep, not just the ones you change.
+#
+# To remove the bundle entirely, unload the row: `dsh plugin --profile <name>
+# rm dsh-db-connector` (or drop the row from your profile patch layer).
 
 - update:
     - id: db-connector
@@ -21,6 +24,13 @@
             database: analytics
             user: readonly
             passwordEnv: ANALYTICS_PG_PASSWORD
+          legacy:
+            driver: mysql
+            host: 10.0.0.5
+            port: 3306
+            database: legacy
+            user: app_read
+            passwordRef: LEGACY_READ_PASSWORD
 
         audit:
           enabled: true
