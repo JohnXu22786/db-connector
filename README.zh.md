@@ -52,6 +52,13 @@ SQLite 无需任何额外安装。开发（`npm test`）建议使用 Node ≥ 23
 dsh plugin --profile <name> add /path/to/dsh-db-connector
 ```
 
+该包也已发布到 npm，可单独使用引擎 / 编程式 API：
+
+```bash
+npm install -g dsh-db-connector   # 全局安装，CLI 方式使用引擎
+npm install dsh-db-connector      # 或作为本地依赖加入
+```
+
 （等价地：把 `"dsh-db-connector": "link:/path/to/dsh-db-connector"` 加入 profile 的 `dependencies`，并把 `"dsh-db-connector"` 追加到 `dsh.profile.bundles`。）
 
 启动时 `apply(ctx, config)` 依次：

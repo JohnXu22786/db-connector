@@ -61,6 +61,13 @@ Install the bundle into a profile:
 dsh plugin --profile <name> add /path/to/dsh-db-connector
 ```
 
+The package is also on npm for the standalone tooling / programmatic API:
+
+```bash
+npm install -g dsh-db-connector   # global CLI-style usage of the engine
+npm install dsh-db-connector      # or add it as a local dependency
+```
+
 (Equivalently: add it to the profile's `dependencies`
 (`"dsh-db-connector": "link:/path/to/dsh-db-connector"`) and append
 `"dsh-db-connector"` to `dsh.profile.bundles`.)
