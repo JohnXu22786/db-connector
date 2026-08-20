@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.npm/
+*.tgz
+*.tsbuildinfo
 *.log
 .DS_Store
 .credential
