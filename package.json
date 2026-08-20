@@ -1,0 +1,72 @@
+{
+  "name": "dsh-db-connector",
+  "version": "0.1.0",
+  "description": "Database connector bundle for DeepSeek Harness (dsh): SQLite/PostgreSQL/MySQL connections, schema introspection, read-only safety, write approval gate, and a JSONL SQL audit trail.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "database",
+    "sql",
+    "sqlite",
+    "postgres",
+    "mysql",
+    "tools"
+  ],
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "npm run build && tsc -p tsconfig.test.json",
+    "test": "npm run build && node --test \"test/*.test.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "pg": "^8.13.0",
+    "mysql2": "^3.11.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    },
+    "mysql2": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "author": "JohnXu22786",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JohnXu22786/db-connector.git"
+  },
+  "homepage": "https://github.com/JohnXu22786/db-connector#readme",
+  "bugs": {
+    "url": "https://github.com/JohnXu22786/db-connector/issues"
+  }
+}

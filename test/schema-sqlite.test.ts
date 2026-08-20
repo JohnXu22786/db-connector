@@ -1,0 +1,74 @@
+﻿/**
+ * Schema introspection tests on SQLite: tables/views/columns/indexes/FKs,
+ * snapshot caching (TTL), refresh, and filter narrowing.
+ */
+
+import { strict as assert } from 'node:assert';
+import { test } from 'node:test';
+import { freshSignal, makeHarness, seedSqlite } from './helpers.ts';
+
+test('schema snapshot lists tables, columns, indexes, foreign keys', async () => {
+  const h = makeHarness();
+  await seedSqlite(h);
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(
+    s.tables.map((t) => t.name).sort(),
+    ['orders', 'users'],
+  );
+  assert.equal(s.views.length, 0);
+
+  const userCols = s.columns.filter((c) => c.table === 'users');
+  assert.equal(userCols.length, 3);
+  const idCol = userCols.find((c) => c.name === 'id')!;
+  assert.equal(idCol.primaryKey, true);
+  assert.equal(idCol.nullable, false);
+  assert.equal(idCol.ordinal, 1);
+  const emailCol = userCols.find((c) => c.name === 'email')!;
+  assert.equal(emailCol.type.toUpperCase(), 'TEXT');
+  assert.equal(emailCol.nullable, false);
+
+  const emailIndex = s.indexes.find((i) => i.table === 'users' && i.columns.includes('email'));
+  assert.ok(emailIndex, 'email UNIQUE constraint surfaces as an index');
+  assert.equal(emailIndex!.unique, true);
+
+  const fk = s.foreignKeys.find((f) => f.table === 'orders');
+  assert.ok(fk);
+  assert.deepEqual(fk!.columns, ['user_id']);
+  assert.equal(fk!.referencedTable, 'users');
+  assert.deepEqual(fk!.referencedColumns, ['id']);
+});
+
+test('schema snapshots are cached within TTL and refreshable', async () => {
+  const h = makeHarness({ schema: { ttlMs: 600000 } });
+  await seedSqlite(h);
+
+  const first = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  assert.equal(first.fromCache, false);
+  const second = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  assert.equal(second.fromCache, true);
+  assert.equal(second.capturedAt, first.capturedAt);
+
+  const fresh = await h.engine.schema({ connection: 'sample', refresh: true, way: 'cli' }, freshSignal());
+  assert.equal(fresh.fromCache, false);
+});
+
+test('schema filter narrows to matching tables and their objects', async () => {
+  const h = makeHarness();
+  await seedSqlite(h);
+  const s = await h.engine.schema({ connection: 'sample', filter: 'user', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(s.tables.map((t) => t.name), ['users']);
+  assert.equal(s.columns.every((c) => c.table === 'users'), true);
+  assert.equal(s.indexes.every((i) => i.table === 'users'), true);
+  assert.equal(s.foreignKeys.length, 0); // orders (owner of the FK) filtered out
+});
+
+test('schema result is credential-free JSON', async () => {
+  const h = makeHarness();
+  await seedSqlite(h);
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const text = JSON.stringify(s);
+  assert.ok(!text.includes('password'));
+});
+

@@ -1,0 +1,37 @@
+# Example dsh `--patch` overlay on top of the dsh-db-connector bundle row.
+#
+# Use with: dsh web --patch ./examples/profile.overlay.yml
+# (or fold the same content into your profile's cordis.patch.yml).
+#
+# A patch replaces a row's whole `config`, so restate every key you want to
+# keep, not just the ones you change.
+
+- update:
+    - id: db-connector
+      name: 'dsh-db-connector'
+      config:
+        connections:
+          app:
+            driver: sqlite
+            database: ./data/app.db
+          analytics:
+            driver: postgres
+            host: localhost
+            port: 5432
+            database: analytics
+            user: readonly
+            passwordEnv: ANALYTICS_PG_PASSWORD
+
+        audit:
+          enabled: true
+          path: ./run/dsh-db-audit.jsonl
+
+        query:
+          maxRows: 500
+          timeoutMs: 15000
+          maxSqlChars: 256
+
+        schema:
+          ttlMs: 120000
+
+        defaultAllowWrite: false

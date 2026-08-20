@@ -1,0 +1,31 @@
+- insert:
+    # dsh-db-connector: one plugin row mounted by package name so Node module
+    # resolution finds the installed bundle. Tune defaults here or override
+    # this row (by id) from a later patch layer / the profile's own patch.
+    - id: db-connector
+      name: 'dsh-db-connector'
+      config:
+        # Pre-registered connections. Each value references credentials by
+        # environment-variable NAME (or a `${VAR}` placeholder in any field) —
+        # inline secrets are allowed but strongly discouraged. All connections
+        # can also be created at runtime through the `db_connect` tool.
+        connections: {}
+
+        audit:
+          # Path of the JSONL audit log. Supports `${ENV}` placeholders and
+          # the DSH_DB_CONNECTOR_AUDIT_PATH override. Default:
+          #   '<process.cwd()>/.dsh-db/audit.jsonl'
+          path: null
+
+        # Default query guardrails (per-call overrides are always possible).
+        query:
+          maxRows: 1000      # rows capped per SELECT result
+          timeoutMs: 30000   # hard per-statement deadline (AbortSignal-based)
+          maxSqlChars: 512   # statement text stored per audit record
+
+        schema:
+          ttlMs: 60000       # schema snapshot cache lifetime per connection
+
+        # Write approval gate is non-negotiable and ON by default; only this
+        # global default (and per-call `allowWrite`) can permit a write.
+        defaultAllowWrite: false
