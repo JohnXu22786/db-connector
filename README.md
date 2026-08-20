@@ -1,5 +1,9 @@
 # dsh-db-connector
 
+[![npm version](https://img.shields.io/npm/v/dsh-db-connector)](https://www.npmjs.com/package/dsh-db-connector)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[中文说明](./README.zh.md)
+
 A database connector bundle for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 (`dsh`, the "everything is a plugin" framework built on Cordis).
 

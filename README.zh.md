@@ -1,5 +1,9 @@
 # dsh-db-connector
 
+[![npm version](https://img.shields.io/npm/v/dsh-db-connector)](https://www.npmjs.com/package/dsh-db-connector)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+[English](./README.md)
+
 一个面向 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
 （`dsh`，基于 Cordis 的「一切皆是插件」框架）的数据库连接器 bundle。
 
