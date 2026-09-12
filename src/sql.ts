@@ -198,6 +198,19 @@ function meaningful(sql: string): Token[] {
   return scan(sql).filter((t) => t.type !== 'space' && t.type !== 'comment');
 }
 
+function isFetchCountToken(token: Token, next?: Token): boolean {
+  if (token.depth !== 0) return false;
+  if (token.type === 'param') return true;
+  if (token.type !== 'symbol') return false;
+  if (/^\d$/.test(token.value)) return true;
+  return (
+    token.value === '$' &&
+    next?.type === 'symbol' &&
+    next.depth === 0 &&
+    /^\d$/.test(next.value)
+  );
+}
+
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
 function firstDataKeyword(sql: string): Token | undefined {
   const tokens = meaningful(sql);
@@ -514,8 +527,9 @@ export function rewriteNamedToPositional(
 
 /**
  * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * or FETCH FIRST/NEXT clause already. Used only as a courtesy guard: the
- * executor always caps rows on the consuming side no matter what this returns.
+ * or complete FETCH FIRST/NEXT row clause already. Used only as a courtesy
+ * guard: the executor always caps rows on the consuming side no matter what
+ * this returns.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -529,10 +543,37 @@ export function ensureSelectLimit(
     if (t.type !== 'word' || t.depth !== 0) return false;
     const word = t.value.toUpperCase();
     if (word === 'LIMIT') return true;
-    const next = tokens[index + 1];
-    return word === 'FETCH' && next?.type === 'word' && next.depth === 0 && (
-      next.value.toUpperCase() === 'FIRST' || next.value.toUpperCase() === 'NEXT'
-    );
+    if (word !== 'FETCH') return false;
+
+    const modifier = tokens[index + 1];
+    if (
+      modifier?.type !== 'word' ||
+      modifier.depth !== 0 ||
+      (modifier.value.toUpperCase() !== 'FIRST' && modifier.value.toUpperCase() !== 'NEXT')
+    ) {
+      return false;
+    }
+
+    let cursor = index + 2;
+    while (
+      cursor < tokens.length &&
+      isFetchCountToken(tokens[cursor]!, tokens[cursor + 1])
+    ) cursor += 1;
+    const row = tokens[cursor];
+    if (
+      row?.type !== 'word' ||
+      row.depth !== 0 ||
+      (row.value.toUpperCase() !== 'ROW' && row.value.toUpperCase() !== 'ROWS')
+    ) {
+      return false;
+    }
+    const ending = tokens[cursor + 1];
+    if (ending?.type !== 'word' || ending.depth !== 0) return false;
+    if (ending.value.toUpperCase() === 'ONLY') return true;
+    return ending.value.toUpperCase() === 'WITH' &&
+      tokens[cursor + 2]?.type === 'word' &&
+      tokens[cursor + 2]?.depth === 0 &&
+      tokens[cursor + 2]?.value.toUpperCase() === 'TIES';
   });
   if (hasTopLevelRowCap) return { sql, applied: false };
 
