@@ -309,7 +309,15 @@ export function isNonTransactionalStatement(sql: string, driver: DriverKind): bo
     .map((token) => token.value.toUpperCase());
 
   if (words[0] === 'VACUUM') return driver === 'sqlite' || driver === 'postgres';
+  // SQLite PRAGMAs are intentionally opaque to the read classifier. Some
+  // write forms, notably `PRAGMA journal_mode = WAL`, cannot run inside an
+  // explicit transaction, so execute all PRAGMAs directly once approved.
+  if (words[0] === 'PRAGMA') return driver === 'sqlite';
   if (driver !== 'postgres') return false;
+
+  if (words[0] === 'ALTER' && words[1] === 'SYSTEM') return true;
+  if (words[0] === 'CREATE' && (words[1] === 'DATABASE' || words[1] === 'TABLESPACE')) return true;
+  if (words[0] === 'DROP' && (words[1] === 'DATABASE' || words[1] === 'TABLESPACE')) return true;
 
   if (words[0] === 'CREATE') {
     return (
@@ -324,6 +332,9 @@ export function isNonTransactionalStatement(sql: string, driver: DriverKind): bo
     const objectType = new Set(['INDEX', 'TABLE', 'SCHEMA', 'DATABASE', 'SYSTEM']);
     return words[1] === 'CONCURRENTLY' ||
       (objectType.has(words[1] ?? '') && words[2] === 'CONCURRENTLY');
+  }
+  if (words[0] === 'REFRESH') {
+    return words[1] === 'MATERIALIZED' && words[2] === 'VIEW' && words[3] === 'CONCURRENTLY';
   }
   return false;
 }

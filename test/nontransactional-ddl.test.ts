@@ -51,6 +51,12 @@ test('PostgreSQL non-transactional statements bypass the transaction wrapper', a
     'CREATE UNIQUE INDEX CONCURRENTLY idx_unique ON users (email)',
     'DROP INDEX CONCURRENTLY idx',
     'REINDEX INDEX CONCURRENTLY idx',
+    'ALTER SYSTEM SET work_mem = 64MB',
+    'CREATE DATABASE app_db',
+    'DROP DATABASE app_db',
+    'CREATE TABLESPACE app_ts LOCATION \'/var/lib/postgresql/data\'',
+    'DROP TABLESPACE app_ts',
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY app_mv',
   ]) {
     const calls: string[] = [];
     const driver = makePgDriver(calls);

@@ -252,7 +252,10 @@ export class ExecutionEngine {
     const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     const isDdl = classification.kind === 'ddl';
-    const nonTransactional = isDdl && isNonTransactionalStatement(bound.sql, driver.kind);
+    // The classifier deliberately leaves PRAGMA as unknown because it may
+    // write. The driver still needs to bypass its transaction wrapper for
+    // approved non-transactional forms such as SQLite journal_mode changes.
+    const nonTransactional = isNonTransactionalStatement(bound.sql, driver.kind);
 
     try {
       if (readLike) {
@@ -534,6 +537,9 @@ function rollbackNote(
   driver: import('./types.js').DriverKind,
   nonTransactional: boolean,
 ): string {
+  if (nonTransactional && !isDdl) {
+    return 'statement executed without a transaction; failures are not rolled back.';
+  }
   if (isDdl) {
     if (nonTransactional) {
       return 'DDL executed without a transaction; failures are not rolled back, and the schema snapshot cache has been invalidated.';

@@ -175,6 +175,20 @@ test('SQLite VACUUM runs outside the write transaction wrapper', async () => {
   assert.doesNotMatch(result.note, /inside a transaction/i);
 });
 
+test('SQLite write PRAGMAs run outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'PRAGMA journal_mode = WAL', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'write');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.affectedRows, 0);
+  assert.match(result.note, /without a transaction/i);
+  assert.doesNotMatch(result.note, /inside a transaction/i);
+});
+
 test('failed write rolls back (no partial rows survive)', async () => {
   const h = await setup();
   // Updating id=2 to a duplicate email violates the UNIQUE constraint.
