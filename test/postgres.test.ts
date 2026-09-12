@@ -128,7 +128,11 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
         ('orders_local_fk', 'public', 'customer_region', 2, 2),
         ('orders_local_fk', 'public', 'customer_id', 1, 1),
         ('orders_legacy_fk', 'public', 'legacy_region', 2, 2),
-        ('orders_legacy_fk', 'public', 'legacy_id', 1, 1)
+        ('orders_legacy_fk', 'public', 'legacy_id', 1, 1),
+        ('customers_pkey', 'public', 'id', 1, NULL),
+        ('customers_pkey', 'public', 'region', 2, NULL),
+        ('customers_pkey', 'legacy', 'id', 1, NULL),
+        ('customers_pkey', 'legacy', 'region', 2, NULL)
     `);
     catalog.exec(`
       INSERT INTO fixture_constraint_column_usage VALUES
@@ -152,7 +156,7 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
         // preserving the query structure under test.
         const executableText = query.text!
           .replace(
-            /array_agg\((kcu|x)\.column_name( ORDER BY \1\.ordinal_position)?\)/g,
+            /array_agg\((kcu|x|rku)\.column_name( ORDER BY (kcu|x|rku)\.ordinal_position)?\)/g,
             (_match: string, alias: string, orderBy: string | undefined) =>
               `json_group_array(${alias}.column_name${orderBy ?? ''})`,
           )
@@ -192,11 +196,14 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
       assert.ok(legacy);
       assert.deepEqual(local.columns, ['customer_id', 'customer_region']);
       assert.deepEqual(legacy.columns, ['legacy_id', 'legacy_region']);
+      assert.deepEqual(local.referencedColumns, ['id', 'region']);
+      assert.deepEqual(legacy.referencedColumns, ['id', 'region']);
       assert.equal(local.referencedTable, 'customers');
       assert.equal(legacy.referencedTable, 'legacy_customers');
 
       assert.equal(captured.length, 1);
       assert.match(captured[0]!.text!, /array_agg\(kcu\.column_name ORDER BY kcu\.ordinal_position\)/);
+      assert.match(captured[0]!.text!, /array_agg\(rku\.column_name ORDER BY kcu\.ordinal_position\)/);
       assert.match(captured[0]!.text!, /ccu\.constraint_schema = rc\.unique_constraint_schema/);
       assert.doesNotMatch(captured[0]!.text!, /WHERE constraint_schema = \$1\s*\) AS ccu/s);
     } finally {

@@ -398,16 +398,17 @@ const QUERIES = {
        tc.table_name,
        array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS column_names,
        ccu.table_name AS referenced_table,
-       (SELECT array_agg(x.column_name ORDER BY x.ordinal_position)
-          FROM information_schema.key_column_usage x
-         WHERE x.constraint_name = rc.constraint_name AND x.constraint_schema = $1
-           AND x.position_in_unique_constraint IS NOT NULL) AS referenced_columns,
+       array_agg(rku.column_name ORDER BY kcu.ordinal_position) AS referenced_columns,
        rc.update_rule AS on_update, rc.delete_rule AS on_delete
        FROM information_schema.referential_constraints AS rc
        JOIN information_schema.table_constraints AS tc
          ON tc.constraint_name = rc.constraint_name AND tc.constraint_schema = $1
        JOIN information_schema.key_column_usage AS kcu
          ON kcu.constraint_name = rc.constraint_name AND kcu.constraint_schema = $1
+       JOIN information_schema.key_column_usage AS rku
+         ON rku.constraint_name = rc.unique_constraint_name
+        AND rku.constraint_schema = rc.unique_constraint_schema
+        AND rku.ordinal_position = kcu.position_in_unique_constraint
        JOIN (
          SELECT DISTINCT constraint_schema, constraint_name, table_name
            FROM information_schema.constraint_column_usage
