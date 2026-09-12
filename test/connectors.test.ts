@@ -6,7 +6,8 @@
 import { strict as assert } from 'node:assert';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { DbConnectorError } from '../dist/errors.js';
+import { DbConnectorError, ErrorCode } from '../dist/errors.js';
+import type { DriverApi } from '../dist/drivers/driver.js';
 import { makeHarness } from './helpers.ts';
 
 test('list is empty initially; define+open shows connected', async () => {
@@ -100,3 +101,45 @@ test('sqlite connections persist state across engines lifecycle', async () => {
   assert.deepEqual(rows, [['kept']]);
 });
 
+test('open reconnects an existing driver after a dropped connection', async () => {
+  const h = makeHarness();
+  h.connectors.define({ name: 'mysql', driver: 'mysql', database: 'test' });
+
+  let connected = false;
+  let connectCalls = 0;
+  const driver: DriverApi = {
+    kind: 'mysql',
+    connect: async () => {
+      connectCalls += 1;
+      connected = true;
+    },
+    read: async () => {
+      if (!connected) {
+        throw new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection dropped');
+      }
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    write: async (_sql, _params, isDdl) => ({ affectedRows: 0, isDdl }),
+    introspect: async () => ({
+      tables: [],
+      views: [],
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    }),
+    close: async () => {
+      connected = false;
+    },
+  };
+  const record = (h.connectors as unknown as {
+    map: Map<string, { driver: DriverApi | null; status: string }>;
+  }).map.get('mysql');
+  assert.ok(record);
+  record.driver = driver;
+  record.status = 'connected';
+
+  const reopened = await h.connectors.open('mysql');
+  assert.equal(reopened, driver);
+  assert.equal(connectCalls, 1);
+  await reopened.read('SELECT 1', [], new AbortController().signal);
+});
