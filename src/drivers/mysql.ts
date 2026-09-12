@@ -13,6 +13,11 @@ import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
+  execute(options: {
+    sql: string;
+    values?: unknown[];
+    rowsAsArray?: boolean;
+  }): Promise<[unknown, unknown]>;
   query(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
@@ -119,15 +124,15 @@ export class MysqlDriver implements DriverApi {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
       try {
-        const [rows] = await conn.execute(sql, params);
+        const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
         await conn.query('ROLLBACK');
-        return rows;
+        return { rows, fields };
       } catch (err) {
         await conn.query('ROLLBACK').catch(() => {});
         throw err;
       }
     }, signal);
-    return outcomeOf(result as Array<Record<string, unknown>>);
+    return outcomeOf(result as MysqlReadResult);
   }
 
   async write(
@@ -249,9 +254,14 @@ export class MysqlDriver implements DriverApi {
   }
 }
 
-function outcomeOf(rows: Array<Record<string, unknown>>): ReadOutcome {
-  const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
-  const aligned = rows.map((r) => columns.map((c) => r[c] ?? null));
+interface MysqlReadResult {
+  rows: unknown[][];
+  fields: Array<{ name: string }>;
+}
+
+function outcomeOf(result: MysqlReadResult): ReadOutcome {
+  const columns = result.fields.map((field) => field.name);
+  const aligned = result.rows.map((row) => row.map((value) => value ?? null));
   return { columns, rows: aligned, rowCount: aligned.length };
 }
 

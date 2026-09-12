@@ -31,6 +31,31 @@ test('db query returns columns, JSON-safe rows, and an audit id', async () => {
   assert.ok(result.durationMs >= 0);
 });
 
+test('empty query results retain column metadata', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    {
+      connection: 'sample',
+      sql: 'SELECT id, email, NULL AS marker FROM users WHERE 1 = 0',
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.deepEqual(result.columns, ['id', 'email', 'marker']);
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.rowCount, 0);
+});
+
+test('duplicate query labels retain values for each selected expression', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT id AS value, age AS value FROM users WHERE id = 1', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.columns, ['value', 'value']);
+  assert.deepEqual(result.rows, [[1, 30]]);
+});
+
 test('read-only gate rejects writes through db_query and records a denial', async () => {
   const h = await setup();
   await assert.rejects(

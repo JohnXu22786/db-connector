@@ -38,7 +38,7 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
     end: async () => {},
   };
   const secondConnection: FakeConnection = {
-    execute: async () => [[{ id: 2 }], []],
+    execute: async () => [[[2]], [{ name: 'id' }]],
     query: async () => [[], []],
     beginTransaction: async () => {},
     commit: async () => {},

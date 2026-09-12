@@ -43,11 +43,10 @@ const db = new DatabaseSync(database);
 
 function runQuery(req: Request): unknown {
   const stmt = db.prepare(req.sql ?? '');
-  const rows = stmt.all(...(req.params ?? []) as never[]);
-  const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
-  const data = rows.map((r) =>
-    columns.map((c) => (r as Record<string, unknown>)[c] ?? null),
-  );
+  const columns = stmt.columns().map((column) => column.name);
+  stmt.setReturnArrays(true);
+  const rows = stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][];
+  const data = rows.map((row) => row.map((value) => value ?? null));
   return { columns, rows: data, rowCount: data.length };
 }
 
