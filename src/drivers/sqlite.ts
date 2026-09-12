@@ -102,6 +102,7 @@ export class SqliteDriver implements DriverApi {
     const child = fork(entry, {
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       env: { ...process.env, [DB_ENV]: this.database },
+      serialization: 'advanced',
     });
     child.unref(); // see refAdd/refDrop
     child.on('message', (msg: ReplyMessage) => {

@@ -242,6 +242,41 @@ test('parameterized values cannot inject SQL', async () => {
   assert.equal(n[0]![0], 3);
 });
 
+test('SQLite binary parameters survive child IPC and results serialize as base64', async () => {
+  const h = await setup();
+  const buffer = Buffer.from([0, 1, 2, 254, 255]);
+  const bytes = Uint8Array.from([255, 254, 2, 1, 0]);
+
+  await h.engine.exec(
+    {
+      connection: 'sample',
+      sql: 'CREATE TABLE blobs(id INTEGER PRIMARY KEY, value BLOB)',
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  await h.engine.exec(
+    {
+      connection: 'sample',
+      sql: 'INSERT INTO blobs(value) VALUES(?), (?)',
+      params: [buffer, bytes],
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT value FROM blobs ORDER BY id', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [
+    [buffer.toString('base64')],
+    [Buffer.from(bytes).toString('base64')],
+  ]);
+});
+
 test('named parameters bind in order', async () => {
   const h = await setup();
   const result = await h.engine.query(
