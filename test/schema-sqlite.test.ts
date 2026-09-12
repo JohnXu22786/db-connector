@@ -5,6 +5,8 @@
 
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
+import type { DriverApi, Introspection } from '../dist/drivers/driver.js';
+import { SchemaService } from '../dist/schema.js';
 import { freshSignal, makeHarness, seedSqlite } from './helpers.ts';
 
 test('schema snapshot lists tables, columns, indexes, foreign keys', async () => {
@@ -94,4 +96,49 @@ test('schema result is credential-free JSON', async () => {
   const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
   const text = JSON.stringify(s);
   assert.ok(!text.includes('password'));
+});
+
+test('concurrent refreshes keep the newer snapshot in the cache', async () => {
+  let calls = 0;
+  let releaseOlder!: (raw: Introspection) => void;
+  const older = new Promise<Introspection>((resolve) => {
+    releaseOlder = resolve;
+  });
+  const snapshot = (table: string): Introspection => ({
+    tables: [{ name: table }],
+    views: [],
+    columns: [],
+    indexes: [],
+    foreignKeys: [],
+  });
+  const driver: DriverApi = {
+    kind: 'sqlite',
+    connect: async () => {},
+    read: async () => ({ columns: [], rows: [], rowCount: 0 }),
+    write: async () => ({ affectedRows: 0, isDdl: false }),
+    introspect: () => {
+      calls += 1;
+      return calls === 1 ? older : Promise.resolve(snapshot('newer'));
+    },
+    close: async () => {},
+  };
+  const service = new SchemaService(600_000);
+
+  const olderRefresh = service.get(driver, 'sample', {
+    refresh: true,
+    signal: freshSignal(),
+  });
+  const newerRefresh = await service.get(driver, 'sample', {
+    refresh: true,
+    signal: freshSignal(),
+  });
+  releaseOlder(snapshot('older'));
+  await olderRefresh;
+
+  const cached = await service.get(driver, 'sample', {
+    signal: freshSignal(),
+  });
+  assert.equal(newerRefresh.tables[0]?.name, 'newer');
+  assert.equal(cached.fromCache, true);
+  assert.deepEqual(cached.tables.map((table) => table.name), ['newer']);
 });
