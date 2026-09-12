@@ -239,7 +239,7 @@ host:port / 库名与 `auth=env|credentials|inline|none`；错误信息只报环
 ## 驱动说明
 
 - **SQLite** — 内置 `node:sqlite`，零安装。每个连接持有独立子进程，因此超时可**硬终止**一条失控的同步语句（卡在原生 SQLite 代码里的 worker 线程无法 join，会把宿主挂死）。文件型库在超时拆解后可重生恢复；`:memory:` 连接意在测试、尽力而为。
-- **PostgreSQL** — `npm i pg`（可选 peer）。读走 `BEGIN TRANSACTION READ ONLY … ROLLBACK`，写走 `BEGIN/COMMIT/ROLLBACK`，全部以 `$1..$n` 参数化；AbortSignal 透传给客户端。
+- **PostgreSQL** — `npm i pg`（可选 peer）。读走 `BEGIN TRANSACTION READ ONLY … ROLLBACK`，写走 `BEGIN/COMMIT/ROLLBACK`，全部以 `$1..$n` 参数化；AbortSignal 取消通过 pg 的查询取消 API 处理。
 - **MySQL** — `npm i mysql2`（可选 peer）。读走 `READ ONLY` 事务；写走 `beginTransaction/commit/rollback`，使用服务端预处理语句；取消时销毁连接并在下次使用时重连。
 
 ---

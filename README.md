@@ -282,9 +282,10 @@ working directory; `DSH_DB_CONNECTOR_AUDIT_PATH` / `${VAR}` work here too).
   testing.
 - **PostgreSQL** — `npm i pg` (peer, optional). Reads run inside
   `BEGIN TRANSACTION READ ONLY … ROLLBACK`, writes inside
-  `BEGIN/COMMIT/ROLLBACK`, all parameterized with `$1..$n`. AbortSignal is
-  forwarded to the client. Note: the JSONB `?` operator is indistinguishable
-  from a `?` placeholder; prefer `#>`, `->`, or `@>` for JSONB expressions.
+  `BEGIN/COMMIT/ROLLBACK`, all parameterized with `$1..$n`. AbortSignal
+  cancellation uses pg's query cancellation API. Note: the JSONB `?` operator
+  is indistinguishable from a `?` placeholder; prefer `#>`, `->`, or `@>` for
+  JSONB expressions.
 - **MySQL** — `npm i mysql2` (peer, optional). Reads run inside a
   `READ ONLY` transaction; writes inside `beginTransaction/commit/rollback`,
   using server-side prepared statements. Cancellation destroys the connection;
