@@ -102,9 +102,16 @@ export class Connectors {
       );
     }
     if (rec.driver) {
+      const driver = rec.driver;
+      const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
+      try {
+        await opening;
+      } finally {
+        if (rec.opening === opening) rec.opening = null;
+      }
       rec.lastUsedAt = new Date().toISOString();
       rec.status = 'connected';
-      return rec.driver;
+      return driver;
     }
     if (rec.opening) return rec.opening;
 
