@@ -316,6 +316,20 @@ test('named parameters bind in order', async () => {
   assert.deepEqual(result.rows, [['a@x.com']]);
 });
 
+test('named parameters bind case-insensitively', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    {
+      connection: 'sample',
+      sql: 'SELECT email FROM users WHERE age >= :MIN AND age < :MAX',
+      namedParams: { min: 26, max: 40 },
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [['a@x.com']]);
+});
+
 test('parameter arity mismatch is a friendly INVALID_PARAMS', async () => {
   const h = await setup();
   await assert.rejects(
