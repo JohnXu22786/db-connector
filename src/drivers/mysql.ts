@@ -95,6 +95,7 @@ export class MysqlDriver implements DriverApi {
       };
       const onAbort = () => {
         conn.destroy(); // kills the in-flight query server-side
+        if (this.conn === conn) this.conn = null;
         fail(cancelError(signal));
       };
       if (signal.aborted) {
@@ -312,4 +313,3 @@ const QUERIES = {
        ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`,
   },
 };
-
