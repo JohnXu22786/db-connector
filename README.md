@@ -28,7 +28,7 @@ cover.
 | **Credentials** | Secrets come from **environment variables** (`${VAR}` placeholders, `passwordEnv`) or the **dsh credentials service** (`passwordRef`). Never written to logs or audit records. |
 | **Schema introspection** | Tables, views, columns (name/type/nullable/default/primary key), indexes, foreign keys; per-connection snapshot cache with TTL, `refresh` and `filter`. |
 | **Read-only queries** | `db_query` runs **only** SELECT / EXPLAIN-style statements. Everything else is rejected *before* it touches a database. Row caps, SELECT guard-LIMIT, JSON-safe results. |
-| **Write approval gate** | INSERT / UPDATE / DELETE / DDL require an explicit `allowWrite: true` confirmation. Writes run inside a transaction: COMMIT on success, ROLLBACK on failure. |
+| **Write approval gate** | INSERT / UPDATE / DELETE / DDL require an explicit `allowWrite: true` confirmation. Writes use transaction protection where supported; statements that require autocommit execute directly. |
 | **SQL audit** | Every call (including denials and failures) appends one JSONL record: time, connection, statement digest + summary, kind, rows, duration, status, error, and who asked (`tool`/`command`/`cli`). |
 | **Injection safety** | Values are always bound as parameters (`?` or `:name`), never interpolated into SQL text. |
 | **Timeouts** | Per-statement AbortSignal deadlines with real termination, even for synchronous SQLite (child-process isolation). |
@@ -212,9 +212,11 @@ anything the classifier can't read).
 - The **write approval gate** is ON by default: you must pass
   `"allowWrite": true` — the explicit confirmation — for anything that is not a
   pure read. Otherwise it is denied with `WRITE_NOT_ALLOWED` and audited.
-- The statement runs inside a transaction: **COMMIT on success, ROLLBACK on
-  failure** (no partial rows survive an error). The result includes affected
-  rows and a rollback explanation.
+- The statement uses transaction protection where supported: **COMMIT on
+  success, ROLLBACK on failure**. Statements that require autocommit (such as
+  `VACUUM` or `CREATE/DROP INDEX CONCURRENTLY`) execute directly and cannot be
+  rolled back by this wrapper. The result includes affected rows and a
+  transaction-mode explanation.
 - DDL invalidates that connection's schema cache automatically.
 
 ```json
@@ -281,10 +283,12 @@ working directory; `DSH_DB_CONNECTOR_AUDIT_PATH` / `${VAR}` work here too).
   timeout teardown; `:memory:` connections are intentionally best-effort for
   testing.
 - **PostgreSQL** — `npm i pg` (peer, optional). Reads run inside
-  `BEGIN TRANSACTION READ ONLY … ROLLBACK`, writes inside
-  `BEGIN/COMMIT/ROLLBACK`, all parameterized with `$1..$n`. AbortSignal is
-  forwarded to the client. Note: the JSONB `?` operator is indistinguishable
-  from a `?` placeholder; prefer `#>`, `->`, or `@>` for JSONB expressions.
+  `BEGIN TRANSACTION READ ONLY … ROLLBACK`; transactional writes use
+  `BEGIN/COMMIT/ROLLBACK`, while `VACUUM` and concurrent index operations run
+  directly because PostgreSQL rejects them inside a transaction. All values are
+  parameterized with `$1..$n`. AbortSignal is forwarded to the client. Note:
+  the JSONB `?` operator is indistinguishable from a `?` placeholder; prefer
+  `#>`, `->`, or `@>` for JSONB expressions.
 - **MySQL** — `npm i mysql2` (peer, optional). Reads run inside a
   `READ ONLY` transaction; writes inside `beginTransaction/commit/rollback`,
   using server-side prepared statements. Cancellation destroys the connection;

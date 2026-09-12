@@ -14,7 +14,8 @@
  * connections are intentionally best-effort).
  *
  * Read-only enforcement is the classifier's gate in the executor plus
- * transaction wrapping for writes on this same serial connection; server
+ * transaction wrapping for transactional writes on this same serial connection;
+ * non-transactional DDL runs directly; server
  * drivers additionally get READ ONLY transactions for reads.
  */
 

@@ -264,8 +264,8 @@ Uses "timeoutMs" or the default deadline; aborts on timeout.`,
   const exec: DshTool = {
     name: 'db_exec',
     description: `Execute a statement that may write data: INSERT / UPDATE / DELETE / DDL (and unknown statements).
-The write approval gate is ON by default: you MUST pass "allowWrite":true to run anything that is not a pure read — this is the explicit confirmation. The statement runs inside a transaction: COMMIT on success, ROLLBACK on failure (no partial rows).
-Reads routed here simply execute read-only. Returns affected rows and a rollback explanation. Every call is audited.`,
+The write approval gate is ON by default: you MUST pass "allowWrite":true to run anything that is not a pure read — this is the explicit confirmation. The statement uses transaction protection where supported: COMMIT on success, ROLLBACK on failure. Statements that require autocommit execute directly and cannot be rolled back by this wrapper.
+Reads routed here simply execute read-only. Returns affected rows and a transaction-mode explanation. Every call is audited.`,
     parameters: EXEC_PARAMS,
     output: OUTPUT,
     async execute(args, execCtx) {

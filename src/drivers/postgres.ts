@@ -6,7 +6,7 @@
  */
 
 import { ErrorCode, DbConnectorError } from '../errors.js';
-import { scan, toDollarPlaceholders } from '../sql.js';
+import { isNonTransactionalStatement, toDollarPlaceholders } from '../sql.js';
 import type { ResolvedConnectionSpec } from '../types.js';
 import type { DriverApi, DriverLogger, Introspection, ReadOutcome, WriteOutcome } from './driver.js';
 import { importOptional, redactSpecMessage } from './driver.js';
@@ -55,6 +55,7 @@ export class PgDriver implements DriverApi {
   readonly kind = 'postgres' as const;
   private client: PgClientLike | null = null;
   private closed = false;
+  private operationTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly spec: ResolvedConnectionSpec,
@@ -62,26 +63,42 @@ export class PgDriver implements DriverApi {
   ) {}
 
   async connect(): Promise<void> {
-    if (this.client) return;
-    const { Client } = await loadPgModule();
-    const client = new Client({
-      host: this.spec.host,
-      port: this.spec.port,
-      user: this.spec.user,
-      password: this.spec.password || undefined,
-      database: this.spec.database || 'postgres',
-      ssl: normalizeSsl(this.spec.ssl),
-      connectionString: this.spec.connectionString,
-      ...this.spec.options,
-    } as never);
+    await this.withOperationLock(async () => {
+      if (this.client) return;
+      const { Client } = await loadPgModule();
+      const client = new Client({
+        host: this.spec.host,
+        port: this.spec.port,
+        user: this.spec.user,
+        password: this.spec.password || undefined,
+        database: this.spec.database || 'postgres',
+        ssl: normalizeSsl(this.spec.ssl),
+        connectionString: this.spec.connectionString,
+        ...this.spec.options,
+      } as never);
+      try {
+        await client.connect();
+        await client.query('SELECT 1');
+      } catch (err) {
+        void client.end().catch(() => {});
+        throw toConnectorError(this.spec, err);
+      }
+      this.client = client;
+    });
+  }
+
+  private async withOperationLock<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.operationTail;
+    let release!: () => void;
+    this.operationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
     try {
-      await client.connect();
-      await client.query('SELECT 1');
-    } catch (err) {
-      void client.end().catch(() => {});
-      throw toConnectorError(this.spec, err);
+      return await operation();
+    } finally {
+      release();
     }
-    this.client = client;
   }
 
   private ensure(): PgClientLike {
@@ -95,6 +112,14 @@ export class PgDriver implements DriverApi {
   }
 
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
+    return this.withOperationLock(() => this.readUnlocked(sql, params, signal));
+  }
+
+  private async readUnlocked(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+  ): Promise<ReadOutcome> {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql);
     try {
@@ -124,11 +149,20 @@ export class PgDriver implements DriverApi {
     isDdl: boolean,
     signal: AbortSignal,
   ): Promise<WriteOutcome> {
+    return this.withOperationLock(() => this.writeUnlocked(sql, params, isDdl, signal));
+  }
+
+  private async writeUnlocked(
+    sql: string,
+    params: unknown[],
+    isDdl: boolean,
+    signal: AbortSignal,
+  ): Promise<WriteOutcome> {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql);
     try {
-      // PostgreSQL rejects VACUUM and CREATE INDEX CONCURRENTLY in a transaction.
-      if (isNonTransactionalStatement(sql)) {
+      // PostgreSQL rejects VACUUM and concurrent-index operations in a transaction.
+      if (isNonTransactionalStatement(sql, 'postgres')) {
         const result: PgQueryResult = await client.query({
           text: converted.sql,
           values: params,
@@ -156,6 +190,10 @@ export class PgDriver implements DriverApi {
   }
 
   async introspect(signal: AbortSignal): Promise<Introspection> {
+    return this.withOperationLock(() => this.introspectUnlocked(signal));
+  }
+
+  private async introspectUnlocked(signal: AbortSignal): Promise<Introspection> {
     const client = this.ensure();
     const schema = this.spec.schema || 'public';
     const signalOpts = { signal } as const;
@@ -215,21 +253,12 @@ export class PgDriver implements DriverApi {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    const client = this.client;
-    this.client = null;
-    if (client) await client.end().catch(() => {});
+    await this.withOperationLock(async () => {
+      const client = this.client;
+      this.client = null;
+      if (client) await client.end().catch(() => {});
+    });
   }
-}
-
-function isNonTransactionalStatement(sql: string): boolean {
-  const words = scan(sql)
-    .filter((token) => token.type === 'word' && token.depth === 0)
-    .map((token) => token.value.toUpperCase());
-  if (words[0] === 'VACUUM') return true;
-  return words[0] === 'CREATE' && (
-    (words[1] === 'INDEX' && words[2] === 'CONCURRENTLY') ||
-    (words[1] === 'UNIQUE' && words[2] === 'INDEX' && words[3] === 'CONCURRENTLY')
-  );
 }
 
 function outcomeOf(result: PgQueryResult): ReadOutcome {
