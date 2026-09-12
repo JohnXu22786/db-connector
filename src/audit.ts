@@ -8,7 +8,7 @@
  * concurrent tool calls cannot interleave partial lines.
  */
 
-import { appendFile, mkdir, readFile } from 'node:fs/promises';
+import { mkdir, open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { ErrorCode, DbConnectorError } from './errors.js';
 import type { AuditRecord, WayKind } from './types.js';
@@ -77,17 +77,25 @@ export class AuditLog {
     }
 
     const line = `${JSON.stringify(record)}\n`;
-    // The write itself is chained (not just its resolution): mkdir+appendFile
+    // The write itself is chained (not just its resolution): mkdir+open+write
     // for this record starts only after every earlier write settles, so
     // concurrent appends stay byte-ordered and can never interleave lines.
-    const write = (): Promise<unknown> =>
-      mkdir(dirname(this.path), { recursive: true })
-        .then(() => appendFile(this.path, line, { encoding: 'utf8', mode: FILE_MODE }))
-        .catch((err: unknown) => {
-          this.failed += 1;
-          this.lastError = err;
-          return undefined;
-        });
+    const write = async (): Promise<unknown> => {
+      try {
+        await mkdir(dirname(this.path), { recursive: true });
+        const handle = await open(this.path, 'a', FILE_MODE);
+        try {
+          await handle.chmod(FILE_MODE);
+          await handle.appendFile(line, { encoding: 'utf8' });
+        } finally {
+          await handle.close();
+        }
+      } catch (err: unknown) {
+        this.failed += 1;
+        this.lastError = err;
+      }
+      return undefined;
+    };
     const previous = this.chain;
     this.chain = previous.then(write).then(() => undefined);
     await this.chain;
@@ -121,7 +129,8 @@ export class AuditLog {
     const limit =
       opts.limit === undefined || !Number.isFinite(opts.limit)
         ? 200
-        : Math.max(1, Math.floor(opts.limit));
+        : Math.max(0, Math.floor(opts.limit));
+    const since = opts.since ? Date.parse(opts.since) : undefined;
     const out: AuditRecord[] = [];
     for (const line of text.split('\n')) {
       const trimmed = line.trim();
@@ -134,7 +143,10 @@ export class AuditLog {
       }
       if (opts.connection && rec.connection !== opts.connection) continue;
       if (opts.kind && rec.kind !== opts.kind) continue;
-      if (opts.since && rec.ts < opts.since) continue;
+      if (since !== undefined && Number.isFinite(since)) {
+        const recordTime = Date.parse(rec.ts);
+        if (Number.isFinite(recordTime) && recordTime < since) continue;
+      }
       out.push(rec);
     }
     out.reverse();
