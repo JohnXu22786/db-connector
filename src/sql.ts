@@ -350,20 +350,59 @@ export function isReadStatement(sql: string): boolean {
 
 /**
  * Assert the input holds exactly one top-level statement. Semicolons inside
- * strings, quoted identifiers, and comments are ignored by the scanner.
+ * strings, quoted identifiers, comments, and trigger bodies are ignored.
  */
 export function assertSingleStatement(sql: string): void {
   const tokens = scan(sql);
+  const meaningful = tokens
+    .map((t, idx) => ({ t, idx }))
+    .filter(({ t }) => t.type !== 'space' && t.type !== 'comment');
+  const isWord = (
+    entry: { t: Token; idx: number } | undefined,
+    word: string,
+  ): boolean => entry?.t.type === 'word' && entry.t.value.toUpperCase() === word;
+  let triggerBodyStart: number | undefined;
+  let triggerBodyEnd: number | undefined;
+  if (isWord(meaningful[0], 'CREATE')) {
+    let triggerIndex = 1;
+    if (isWord(meaningful[triggerIndex], 'TEMP') || isWord(meaningful[triggerIndex], 'TEMPORARY')) {
+      triggerIndex += 1;
+    }
+    if (isWord(meaningful[triggerIndex], 'TRIGGER')) {
+      const bodyStart = meaningful.findIndex(
+        (entry, idx) => idx > triggerIndex && entry.t.depth === 0 && isWord(entry, 'BEGIN'),
+      );
+      if (bodyStart !== -1) {
+        const bodyEnd = meaningful.findIndex(
+          (entry, idx) =>
+            idx > bodyStart &&
+            entry.t.depth === 0 &&
+            isWord(entry, 'END') &&
+            meaningful[idx - 1]?.t.type === 'symbol' &&
+            meaningful[idx - 1]?.t.value === ';',
+        );
+        if (bodyEnd !== -1) {
+          triggerBodyStart = meaningful[bodyStart]!.idx;
+          triggerBodyEnd = meaningful[bodyEnd]!.idx;
+        }
+      }
+    }
+  }
   const separator = tokens
     .map((t, idx) => ({ t, idx }))
-    .filter(({ t }) => t.type === 'symbol' && t.value === ';')
+    .filter(({ t, idx }) =>
+      t.type === 'symbol' &&
+      t.value === ';' &&
+      !(triggerBodyStart !== undefined && triggerBodyEnd !== undefined &&
+        idx > triggerBodyStart && idx < triggerBodyEnd),
+    )
     .map(({ idx }) => idx);
   if (separator.length === 0) return;
   const last = separator[separator.length - 1]!;
   const tail = tokens.slice(last + 1).filter(
     (t) => t.type !== 'space' && t.type !== 'comment',
   );
-  if (tail.length > 0) {
+  if (separator.length > 1 || tail.length > 0) {
     throw new DbConnectorError(
       ErrorCode.MultiStatements,
       'multiple statements in one call are not supported; send them one at a time',

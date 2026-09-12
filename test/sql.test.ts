@@ -142,10 +142,20 @@ test('single-statement enforcement ignores semicolons in strings/comments', () =
   assert.doesNotThrow(() => assertSingleStatement("SELECT ';' AS x"));
   assert.doesNotThrow(() => assertSingleStatement('SELECT 1; -- trailing comment only'));
   assert.throws(() => assertSingleStatement('SELECT 1; SELECT 2'), DbConnectorError);
+  assert.throws(() => assertSingleStatement('SELECT 1; SELECT 2;'), DbConnectorError);
   assert.throws(() => assertSingleStatement('SELECT 1; DROP TABLE t'), (e) => {
     assert.equal((e as DbConnectorError).code, 'MULTI_STATEMENTS');
     return true;
   });
+});
+
+test('single-statement enforcement allows semicolons inside CREATE TRIGGER bodies', () => {
+  assert.doesNotThrow(() => assertSingleStatement(
+    'CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); UPDATE t SET x = 1 WHERE id = new.id; END;',
+  ));
+  assert.throws(() => assertSingleStatement(
+    'CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); END; SELECT 1;',
+  ), DbConnectorError);
 });
 
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
