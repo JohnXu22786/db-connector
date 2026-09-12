@@ -449,7 +449,7 @@ export function rewriteNamedToPositional(
   sql: string,
   provided: string[],
 ): { sql: string; order: string[] } {
-  const known = new Set(provided.map((n) => n.toUpperCase()));
+  const known = new Map(provided.map((n) => [n.toUpperCase(), n]));
   const order: string[] = [];
   const state = rewritePlaceholders(sql, (s, t) => {
     if (!t.value.startsWith(':')) {
@@ -458,13 +458,14 @@ export function rewriteNamedToPositional(
       return;
     }
     const name = t.value.slice(1);
-    if (!known.has(name.toUpperCase())) {
+    const providedName = known.get(name.toUpperCase());
+    if (providedName === undefined) {
       throw new DbConnectorError(
         ErrorCode.InvalidParams,
         `named parameter ":${name}" was not provided in "namedParams"`,
       );
     }
-    order.push(name);
+    order.push(providedName);
     s.count += 1;
     s.out += '?';
   });
