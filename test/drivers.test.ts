@@ -64,17 +64,17 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     { fields: [{ name: 'id' }, { name: 'label' }], rows: [], rowCount: 0 },
     { fields: [{ name: 'value' }, { name: 'value' }], rows: [[1, 2]], rowCount: 1 },
   ];
-  (driver as unknown as { client: PgClientFake }).client = {
-    async query(query) {
-      if (typeof query === 'string') {
-        return { fields: [], rows: [], rowCount: null };
-      }
-      queryConfigs.push(query);
-      return results.shift()!;
-    },
-    async connect() {},
-    async end() {},
+  const client = new PgClientFake(queryConfigs, results);
+  const internals = driver as unknown as {
+    client: PgClientFake;
+    clientConstructor: typeof PgClientFake;
+    queryConstructor: typeof PgQueryFake;
+    clientConfig: Record<string, unknown>;
   };
+  internals.client = client;
+  internals.clientConstructor = PgClientFake;
+  internals.queryConstructor = PgQueryFake;
+  internals.clientConfig = {};
 
   const empty = await driver.read('SELECT id, label FROM t WHERE false', [], signal());
   assert.deepEqual(empty, {
@@ -99,7 +99,7 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
       { text: 'SELECT 1 AS value, 2 AS value', values: [], rowMode: 'array' },
     ],
   );
-  assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+  assert.equal(queryConfigs.every((query) => !('signal' in (query as object))), true);
 });
 
 interface MysqlClientFake {
@@ -118,10 +118,56 @@ interface PgResultFake {
   rowCount: number | null;
 }
 
-interface PgClientFake {
-  query(query: unknown): Promise<PgResultFake>;
-  connect(): Promise<void>;
-  end(): Promise<void>;
+class PgQueryFake {
+  readonly config: { text: string; values?: unknown[]; rowMode?: string };
+  readonly callback: (err: Error | null, result?: PgResultFake) => void;
+
+  constructor(
+    config: { text: string; values?: unknown[]; rowMode?: string },
+    _values: unknown[] | undefined,
+    callback: (err: Error | null, result?: PgResultFake) => void,
+  ) {
+    this.config = config;
+    this.callback = callback;
+  }
+}
+
+class PgClientFake {
+  private readonly queryConfigs: unknown[];
+  private readonly results: PgResultFake[];
+  activeQuery: PgQueryFake | undefined;
+
+  constructor(
+    queryConfigs: unknown[],
+    results: PgResultFake[],
+  ) {
+    this.queryConfigs = queryConfigs;
+    this.results = results;
+  }
+
+  query(query: string | PgQueryFake): Promise<PgResultFake> | PgQueryFake {
+    if (typeof query === 'string') {
+      return Promise.resolve({ fields: [], rows: [], rowCount: null });
+    }
+    this.queryConfigs.push(query.config);
+    this.activeQuery = query;
+    const result = this.results.shift()!;
+    queueMicrotask(() => {
+      if (this.activeQuery === query) this.activeQuery = undefined;
+      query.callback(null, result);
+    });
+    return query;
+  }
+
+  cancel(_client: PgClientFake, query: PgQueryFake): void {
+    if (this.activeQuery !== query) return;
+    this.activeQuery = undefined;
+    query.callback(new Error('cancelled'));
+  }
+
+  async connect(): Promise<void> {}
+
+  async end(): Promise<void> {}
 }
 
 function signal(): AbortSignal {

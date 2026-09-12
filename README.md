@@ -286,7 +286,8 @@ working directory; `DSH_DB_CONNECTOR_AUDIT_PATH` / `${VAR}` work here too).
   `BEGIN TRANSACTION READ ONLY … ROLLBACK`; transactional writes use
   `BEGIN/COMMIT/ROLLBACK`, while `VACUUM` and concurrent index operations run
   directly because PostgreSQL rejects them inside a transaction. All values are
-  parameterized with `$1..$n`. AbortSignal is forwarded to the client. Note:
+  parameterized with `$1..$n`. AbortSignal cancellation uses pg's query
+  cancellation API, preserving TLS and Unix-socket transport settings. Note:
   the JSONB `?` operator is indistinguishable from a `?` placeholder; prefer
   `#>`, `->`, or `@>` for JSONB expressions.
 - **MySQL** — `npm i mysql2` (peer, optional). Reads run inside a

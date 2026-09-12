@@ -15,13 +15,30 @@ import type { DriverApi, Introspection } from '../dist/drivers/driver.js';
 interface QueryConfig {
   text: string;
   values?: unknown[];
-  signal?: AbortSignal;
 }
 
 interface QueryResult {
   fields: Array<{ name: string }>;
   rows: Array<Record<string, unknown>>;
   rowCount: number | null;
+}
+
+class QueryHandle {
+  readonly config: QueryConfig;
+  readonly callback: (err: Error | null, result?: QueryResult) => void;
+
+  constructor(
+    config: QueryConfig,
+    _values: unknown[] | undefined,
+    callback: (err: Error | null, result?: QueryResult) => void,
+  ) {
+    this.config = config;
+    this.callback = callback;
+  }
+}
+
+class ClientConstructor {
+  constructor(_config?: Record<string, unknown>) {}
 }
 
 function makePgDriver(
@@ -35,12 +52,44 @@ function makePgDriver(
   const spec = resolveConnectionSpec({ name: 'pg', driver: 'postgres', database: 'test' });
   const driver = new PgDriver(spec, { debug() {}, info() {}, warn() {} });
   const client = {
-    query(query: string | QueryConfig) {
-      calls.push(typeof query === 'string' ? query : query.text);
-      return handle(query);
+    activeQuery: undefined as QueryHandle | undefined,
+    query(query: string | QueryHandle) {
+      if (typeof query === 'string') {
+        calls.push(query);
+        return handle(query);
+      }
+      calls.push(query.config.text);
+      client.activeQuery = query;
+      void Promise.resolve().then(() => handle(query.config)).then(
+        (result) => {
+          if (client.activeQuery === query) client.activeQuery = undefined;
+          query.callback(null, result);
+        },
+        (err: unknown) => {
+          if (client.activeQuery === query) client.activeQuery = undefined;
+          query.callback(err instanceof Error ? err : new Error(String(err)));
+        },
+      );
+      return query;
     },
+    cancel(_client: unknown, query: QueryHandle) {
+      if (client.activeQuery !== query) return;
+      client.activeQuery = undefined;
+      query.callback(new Error('cancelled'));
+    },
+    async connect() {},
+    async end() {},
   };
-  (driver as unknown as { client: typeof client }).client = client;
+  const internals = driver as unknown as {
+    client: typeof client;
+    clientConstructor: typeof ClientConstructor;
+    queryConstructor: typeof QueryHandle;
+    clientConfig: Record<string, unknown>;
+  };
+  internals.client = client;
+  internals.clientConstructor = ClientConstructor;
+  internals.queryConstructor = QueryHandle;
+  internals.clientConfig = {};
   return driver;
 }
 
