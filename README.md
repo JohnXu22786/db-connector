@@ -94,6 +94,7 @@ overriding row id `db-connector`).
 - insert:
     - id: db-connector
       name: 'dsh-db-connector'
+      inject: [tools, commands]
       config:
         # Connections pre-registered at boot; each is opened lazily.
         connections:

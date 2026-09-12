@@ -81,6 +81,7 @@ npm install dsh-db-connector      # 或作为本地依赖加入
 - insert:
     - id: db-connector
       name: 'dsh-db-connector'
+      inject: [tools, commands]
       config:
         # 启动时预注册的连接；各自惰性打开。
         connections:

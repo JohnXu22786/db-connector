@@ -4,6 +4,8 @@
     # this row (by id) from a later patch layer / the profile's own patch.
     - id: db-connector
       name: 'dsh-db-connector'
+      # Patch entries must declare every service accessed through Cordis's strict ctx proxy.
+      inject: [tools, commands]
       config:
         # Pre-registered connections. Each value references credentials by
         # environment-variable NAME (or a `${VAR}` placeholder in any field) —
