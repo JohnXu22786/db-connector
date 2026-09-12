@@ -33,8 +33,7 @@ interface ConnectorRecord {
   executions: number;
   opening: Promise<DriverApi> | null;
   closing: boolean;
-  closeSignal: Promise<void>;
-  signalClose: () => void;
+  openWaiters: Set<() => void>;
   closingPromise: Promise<void> | null;
 }
 
@@ -54,10 +53,6 @@ export class Connectors {
         `a connection named "${resolved.name}" already exists`,
       );
     }
-    let signalClose!: () => void;
-    const closeSignal = new Promise<void>((resolve) => {
-      signalClose = resolve;
-    });
     this.map.set(resolved.name, {
       spec: resolved,
       driver: null,
@@ -67,8 +62,7 @@ export class Connectors {
       executions: 0,
       opening: null,
       closing: false,
-      closeSignal,
-      signalClose,
+      openWaiters: new Set(),
       closingPromise: null,
     });
     return this.statusOf(resolved.name, this.map.get(resolved.name)!);
@@ -119,6 +113,7 @@ export class Connectors {
       const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
       try {
         await this.waitForOpen(rec, opening);
+        if (rec.closing) throw this.connectionClosingError(name);
       } finally {
         if (rec.opening === opening) rec.opening = null;
       }
@@ -126,7 +121,11 @@ export class Connectors {
       rec.status = 'connected';
       return driver;
     }
-    if (rec.opening) return this.waitForOpen(rec, rec.opening);
+    if (rec.opening) {
+      const driver = await this.waitForOpen(rec, rec.opening);
+      if (rec.closing) throw this.connectionClosingError(name);
+      return driver;
+    }
 
     const opening = (async () => {
       let spec = rec.spec;
@@ -151,7 +150,9 @@ export class Connectors {
     rec.opening = opening;
 
     try {
-      return await this.waitForOpen(rec, opening);
+      const driver = await this.waitForOpen(rec, opening);
+      if (rec.closing) throw this.connectionClosingError(name);
+      return driver;
     } finally {
       if (rec.opening === opening) rec.opening = null;
     }
@@ -161,12 +162,28 @@ export class Connectors {
     rec: ConnectorRecord,
     opening: Promise<DriverApi>,
   ): Promise<DriverApi> {
-    const result = await Promise.race([
-      opening.then((driver) => ({ driver })),
-      rec.closeSignal.then(() => null),
-    ]);
-    if (result === null || rec.closing) throw this.connectionClosingError(rec.spec.name);
-    return result.driver;
+    if (rec.closing) throw this.connectionClosingError(rec.spec.name);
+    return new Promise<DriverApi>((resolve, reject) => {
+      const cancel = () => {
+        if (!rec.openWaiters.delete(cancel)) return;
+        reject(this.connectionClosingError(rec.spec.name));
+      };
+      rec.openWaiters.add(cancel);
+      opening.then(
+        (driver) => {
+          if (!rec.openWaiters.delete(cancel)) return;
+          if (rec.closing) {
+            reject(this.connectionClosingError(rec.spec.name));
+          } else {
+            resolve(driver);
+          }
+        },
+        (error) => {
+          if (!rec.openWaiters.delete(cancel)) return;
+          reject(error);
+        },
+      );
+    });
   }
 
   private connectionClosingError(name: string): DbConnectorError {
@@ -196,7 +213,7 @@ export class Connectors {
     if (rec.closingPromise) return rec.closingPromise;
     const opening = rec.opening;
     rec.closing = true;
-    rec.signalClose();
+    for (const cancel of rec.openWaiters) cancel();
     const closing = (async () => {
       await this.closeRecord(rec, opening);
       if (this.map.get(name) === rec) this.map.delete(name);

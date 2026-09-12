@@ -48,6 +48,12 @@ function installDriver(h: ReturnType<typeof makeHarness>, driver: DriverApi): vo
   }).buildDriver = () => driver;
 }
 
+function getOpenWaiters(h: ReturnType<typeof makeHarness>, name: string): Set<() => void> {
+  return (h.connectors as unknown as {
+    map: Map<string, { openWaiters: Set<() => void> }>;
+  }).map.get(name)!.openWaiters;
+}
+
 test('list is empty initially; define+open shows connected', async () => {
   const h = makeHarness();
   assert.deepEqual(h.connectors.list(), []);
@@ -205,6 +211,60 @@ test('open cannot return a driver while closeAll is in progress', async () => {
   releaseClose.resolve();
   await Promise.all([closing, concurrentOpen]);
   assert.equal(closeCalls, 1);
+});
+
+test('open rejects when close starts after its waiter resolves', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  const closeInvoked = deferred<void>();
+  let closePromise: Promise<void> | null = null;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+
+  const connectors = h.connectors as unknown as {
+    waitForOpen(
+      rec: unknown,
+      opening: Promise<DriverApi>,
+    ): Promise<DriverApi>;
+  };
+  const originalWaitForOpen = connectors.waitForOpen;
+  connectors.waitForOpen = (rec, opening) => {
+    const waited = originalWaitForOpen.call(h.connectors, rec, opening);
+    waited.then(() => {
+      closePromise = h.connectors.close('a');
+      closeInvoked.resolve();
+    });
+    return waited;
+  };
+
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  const opening = h.connectors.open('a');
+  await assert.rejects(
+    opening,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  await closeInvoked.promise;
+  await closeStarted.promise;
+  releaseClose.resolve();
+  const teardown = closePromise;
+  assert.ok(teardown);
+  await teardown;
+  assert.equal(h.connectors.has('a'), false);
+});
+
+test('settled opens do not retain teardown waiters', async () => {
+  const h = makeHarness();
+  installDriver(h, makeFakeDriver());
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const waiters = getOpenWaiters(h, 'a');
+  assert.equal(waiters.size, 0);
+  for (let i = 0; i < 100; i += 1) await h.connectors.open('a');
+  assert.equal(waiters.size, 0);
 });
 
 test('close reserves the name and shares in-progress teardown', async () => {
