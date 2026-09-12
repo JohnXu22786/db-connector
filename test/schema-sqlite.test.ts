@@ -4,6 +4,7 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { DriverApi, Introspection } from '../dist/drivers/driver.js';
 import { SchemaService } from '../dist/schema.js';
@@ -124,6 +125,34 @@ test('schema snapshots are cached within TTL and refreshable', async () => {
 
   const fresh = await h.engine.schema({ connection: 'sample', refresh: true, way: 'cli' }, freshSignal());
   assert.equal(fresh.fromCache, false);
+});
+
+test('schema cache is invalidated when a connection name is rebound', async () => {
+  const h = makeHarness({ schema: { ttlMs: 600000 } });
+  const firstDb = join(h.dir, 'first.sqlite');
+  const secondDb = join(h.dir, 'second.sqlite');
+
+  await h.engine.connect({ name: 'second-seed', driver: 'sqlite', database: secondDb });
+  await h.engine.exec(
+    { connection: 'second-seed', sql: 'CREATE TABLE second_table (id INTEGER PRIMARY KEY)', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  await h.engine.close('second-seed');
+
+  await h.engine.connect({ name: 'app', driver: 'sqlite', database: firstDb });
+  await h.engine.exec(
+    { connection: 'app', sql: 'CREATE TABLE first_table (id INTEGER PRIMARY KEY)', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  const first = await h.engine.schema({ connection: 'app', way: 'cli' }, freshSignal());
+  assert.deepEqual(first.tables.map((table) => table.name), ['first_table']);
+
+  await h.engine.close('app');
+  await h.engine.connect({ name: 'app', driver: 'sqlite', database: secondDb });
+
+  const rebound = await h.engine.schema({ connection: 'app', way: 'cli' }, freshSignal());
+  assert.equal(rebound.fromCache, false);
+  assert.deepEqual(rebound.tables.map((table) => table.name), ['second_table']);
 });
 
 test('schema filter narrows to matching tables and their objects', async () => {
