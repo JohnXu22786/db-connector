@@ -268,7 +268,7 @@ const QUERIES = {
        array_agg(
          CASE WHEN k.attnum = 0
               THEN pg_get_indexdef(idx.indexrelid, k.ord::integer, true)
-              ELSE a.attname
+              ELSE a.attname::text
           END ORDER BY k.ord
        ) AS column_names
        FROM pg_index idx
@@ -304,6 +304,3 @@ const QUERIES = {
        ORDER BY tc.table_name, rc.constraint_name`,
   },
 };
-
-/** The index query is exported for focused PostgreSQL introspection tests. */
-export const POSTGRES_INDEXES_QUERY = QUERIES.indexes;
