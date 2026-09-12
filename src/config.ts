@@ -270,7 +270,7 @@ function normalizeConnections(raw: unknown): Record<string, import('./types.js')
   const out: Record<string, import('./types.js').ConnectionSpec> = {};
   for (const [name, fields] of Object.entries(raw as Record<string, unknown>)) {
     if (fields && typeof fields === 'object' && !Array.isArray(fields)) {
-      out[name] = { name, ...(fields as Record<string, unknown>) } as import('./types.js').ConnectionSpec;
+      out[name] = { ...(fields as Record<string, unknown>), name } as import('./types.js').ConnectionSpec;
     }
   }
   return out;

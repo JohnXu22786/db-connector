@@ -153,3 +153,12 @@ test('normalizeConfig keeps pre-registered connections', () => {
   assert.equal(local.driver, 'sqlite');
   assert.equal(local.name, 'local');
 });
+
+test('normalizeConfig preserves the connection-map key over a nested name', () => {
+  const cfg = normalizeConfig(
+    { connections: { alias: { name: 'configured-name', driver: 'sqlite' } } },
+    {},
+  );
+
+  assert.equal(cfg.connections.alias?.name, 'alias');
+});
