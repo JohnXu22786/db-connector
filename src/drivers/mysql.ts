@@ -177,31 +177,7 @@ export class MysqlDriver implements DriverApi {
       else tablesOut.push(entry);
     }
 
-    // group index rows (statistics yields one row per column)
-    const indexMap = new Map<string, {
-      table: string; unique: boolean; primary: boolean; columns: string[];
-    }>();
-    for (const s of statRows) {
-      const key = `${String(s.table_name)}:${String(s.index_name)}`;
-      let entry = indexMap.get(key);
-      if (!entry) {
-        entry = {
-          table: String(s.table_name),
-          unique: Number(s.non_unique) === 0,
-          primary: String(s.index_name) === 'PRIMARY',
-          columns: [],
-        };
-        indexMap.set(key, entry);
-      }
-      entry.columns.push(String(s.column_name));
-    }
-    const indexesOut = [...indexMap.values()].map((e) => ({
-      name: `${e.primary ? 'PRIMARY' : 'idx'}_${e.table}`,
-      table: e.table,
-      columns: e.columns,
-      unique: e.unique,
-      primary: e.primary,
-    }));
+    const indexesOut = indexesFromStatistics(statRows);
 
     const fkMap = new Map<string, {
       name: string; table: string; columns: string[];
@@ -257,6 +233,39 @@ export class MysqlDriver implements DriverApi {
 interface MysqlReadResult {
   rows: unknown[][];
   fields: Array<{ name: string }>;
+}
+
+export function indexesFromStatistics(
+  statRows: ReadonlyArray<Record<string, unknown>>,
+): Introspection['indexes'] {
+  // group index rows (statistics yields one row per column)
+  const indexMap = new Map<string, {
+    name: string; table: string; unique: boolean; primary: boolean; columns: string[];
+  }>();
+  for (const s of statRows) {
+    const table = String(s.table_name);
+    const name = String(s.index_name);
+    const key = JSON.stringify([table, name]);
+    let entry = indexMap.get(key);
+    if (!entry) {
+      entry = {
+        name,
+        table,
+        unique: Number(s.non_unique) === 0,
+        primary: name === 'PRIMARY',
+        columns: [],
+      };
+      indexMap.set(key, entry);
+    }
+    entry.columns.push(String(s.column_name));
+  }
+  return [...indexMap.values()].map((e) => ({
+    name: e.name,
+    table: e.table,
+    columns: e.columns,
+    unique: e.unique,
+    primary: e.primary,
+  }));
 }
 
 function outcomeOf(result: MysqlReadResult): ReadOutcome {
