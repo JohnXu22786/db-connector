@@ -265,13 +265,18 @@ const QUERIES = {
     name: 'dsh-db-connector.indexes',
     text: `SELECT i.relname AS index_name, t.relname AS table_name,
        idx.indisunique AS is_unique, idx.indisprimary AS is_primary,
-       array_agg(a.attname ORDER BY k.ord) AS column_names
+       array_agg(
+         CASE WHEN k.attnum = 0
+              THEN pg_get_indexdef(idx.indexrelid, k.ord::integer, true)
+              ELSE a.attname::text
+          END ORDER BY k.ord
+       ) AS column_names
        FROM pg_index idx
        JOIN pg_class t ON t.oid = idx.indrelid
        JOIN pg_class i ON i.oid = idx.indexrelid
        JOIN pg_namespace n ON n.oid = t.relnamespace
        JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
-       JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
+       LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
        WHERE n.nspname = $1 AND t.relkind = 'r'
        GROUP BY i.relname, t.relname, idx.indisunique, idx.indisprimary
        ORDER BY t.relname, i.relname`,
@@ -299,5 +304,3 @@ const QUERIES = {
        ORDER BY tc.table_name, rc.constraint_name`,
   },
 };
-
-
