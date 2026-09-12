@@ -32,6 +32,9 @@ interface ConnectorRecord {
   lastUsedAt: string | null;
   executions: number;
   opening: Promise<DriverApi> | null;
+  closing: boolean;
+  openWaiters: Set<() => void>;
+  closingPromise: Promise<void> | null;
 }
 
 const DEFAULT_LOGGER: DriverLogger = { debug() {}, info() {}, warn() {} };
@@ -58,6 +61,9 @@ export class Connectors {
       lastUsedAt: null,
       executions: 0,
       opening: null,
+      closing: false,
+      openWaiters: new Set(),
+      closingPromise: null,
     });
     return this.statusOf(resolved.name, this.map.get(resolved.name)!);
   }
@@ -101,11 +107,13 @@ export class Connectors {
         `connection "${name}" is not defined; run db_connect first`,
       );
     }
+    if (rec.closing) throw this.connectionClosingError(name);
     if (rec.driver) {
       const driver = rec.driver;
       const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
       try {
-        await opening;
+        await this.waitForOpen(rec, opening);
+        if (rec.closing) throw this.connectionClosingError(name);
       } finally {
         if (rec.opening === opening) rec.opening = null;
       }
@@ -113,9 +121,13 @@ export class Connectors {
       rec.status = 'connected';
       return driver;
     }
-    if (rec.opening) return rec.opening;
+    if (rec.opening) {
+      const driver = await this.waitForOpen(rec, rec.opening);
+      if (rec.closing) throw this.connectionClosingError(name);
+      return driver;
+    }
 
-    rec.opening = (async () => {
+    const opening = (async () => {
       let spec = rec.spec;
       if (spec.passwordRef && resolveCredentials) {
         spec = (await applyCredentialPassword(spec, resolveCredentials)) as ResolvedConnectionSpec;
@@ -135,12 +147,50 @@ export class Connectors {
       this.logger.info('db-connector: connected %s', summarizeSpec(spec));
       return driver;
     })();
+    rec.opening = opening;
 
     try {
-      return await rec.opening;
+      const driver = await this.waitForOpen(rec, opening);
+      if (rec.closing) throw this.connectionClosingError(name);
+      return driver;
     } finally {
-      rec.opening = null;
+      if (rec.opening === opening) rec.opening = null;
     }
+  }
+
+  private async waitForOpen(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi>,
+  ): Promise<DriverApi> {
+    if (rec.closing) throw this.connectionClosingError(rec.spec.name);
+    return new Promise<DriverApi>((resolve, reject) => {
+      const cancel = () => {
+        if (!rec.openWaiters.delete(cancel)) return;
+        reject(this.connectionClosingError(rec.spec.name));
+      };
+      rec.openWaiters.add(cancel);
+      opening.then(
+        (driver) => {
+          if (!rec.openWaiters.delete(cancel)) return;
+          if (rec.closing) {
+            reject(this.connectionClosingError(rec.spec.name));
+          } else {
+            resolve(driver);
+          }
+        },
+        (error) => {
+          if (!rec.openWaiters.delete(cancel)) return;
+          reject(error);
+        },
+      );
+    });
+  }
+
+  private connectionClosingError(name: string): DbConnectorError {
+    return new DbConnectorError(
+      ErrorCode.ConnectionNotFound,
+      `connection "${name}" is closing`,
+    );
   }
 
   /** Mark a connection as just executed against (stats only, never secrets). */
@@ -151,21 +201,41 @@ export class Connectors {
     rec.lastUsedAt = new Date().toISOString();
   }
 
+  private async closeRecord(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi> | null,
+  ): Promise<void> {
+    await opening?.catch(() => {});
+    await rec.driver?.close().catch(() => {});
+  }
+
+  private startClose(name: string, rec: ConnectorRecord): Promise<void> {
+    if (rec.closingPromise) return rec.closingPromise;
+    const opening = rec.opening;
+    rec.closing = true;
+    for (const cancel of rec.openWaiters) cancel();
+    const closing = (async () => {
+      await this.closeRecord(rec, opening);
+      if (this.map.get(name) === rec) this.map.delete(name);
+    })();
+    rec.closingPromise = closing;
+    return closing;
+  }
+
   /** Close and forget a connection. Unknown names are a no-op. */
   async close(name: string): Promise<void> {
     const rec = this.map.get(name);
     if (!rec) return;
-    await rec.driver?.close().catch(() => {});
-    this.map.delete(name);
-    this.logger.info('db-connector: closed connection %s', name);
+    const alreadyClosing = rec.closingPromise !== null;
+    await this.startClose(name, rec);
+    if (!alreadyClosing) this.logger.info('db-connector: closed connection %s', name);
   }
 
   /** Close every open connection (plugin teardown). */
   async closeAll(): Promise<void> {
     const pending: Promise<void>[] = [];
     for (const [name, rec] of this.map) {
-      if (rec.driver) pending.push(rec.driver.close().catch(() => {}));
-      this.map.delete(name);
+      pending.push(this.startClose(name, rec));
     }
     await Promise.all(pending);
   }

@@ -10,6 +10,50 @@ import { DbConnectorError, ErrorCode } from '../dist/errors.js';
 import type { DriverApi } from '../dist/drivers/driver.js';
 import { makeHarness } from './helpers.ts';
 
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+function makeFakeDriver(
+  onConnect: () => Promise<void> = async () => {},
+  onClose: () => Promise<void> = async () => {},
+): DriverApi {
+  return {
+    kind: 'sqlite',
+    connect: onConnect,
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write() {
+      return { affectedRows: 0, isDdl: false };
+    },
+    async introspect() {
+      return { tables: [], views: [], columns: [], indexes: [], foreignKeys: [] };
+    },
+    close: onClose,
+  };
+}
+
+function installDriver(h: ReturnType<typeof makeHarness>, driver: DriverApi): void {
+  (h.connectors as unknown as {
+    buildDriver(spec: unknown): DriverApi;
+  }).buildDriver = () => driver;
+}
+
+function getOpenWaiters(h: ReturnType<typeof makeHarness>, name: string): Set<() => void> {
+  return (h.connectors as unknown as {
+    map: Map<string, { openWaiters: Set<() => void> }>;
+  }).map.get(name)!.openWaiters;
+}
+
 test('list is empty initially; define+open shows connected', async () => {
   const h = makeHarness();
   assert.deepEqual(h.connectors.list(), []);
@@ -56,6 +100,237 @@ test('close removes the connection; closeAll clears everything', async () => {
   await h.connectors.closeAll();
   assert.deepEqual(h.connectors.list(), []);
   assert.equal(h.connectors.has('b'), false);
+});
+
+test('close cancels a pending open waiter and closes its driver', async () => {
+  const h = makeHarness();
+  const openingStarted = deferred<void>();
+  const releaseOpening = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {
+    openingStarted.resolve();
+    await releaseOpening.promise;
+  }, async () => {
+    closeCalls += 1;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  const opening = h.connectors.open('a');
+  await openingStarted.promise;
+
+  let closeFinished = false;
+  const closing = h.connectors.close('a').then(() => {
+    closeFinished = true;
+  });
+  const openingRejected = assert.rejects(
+    opening,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  await openingRejected;
+  assert.equal(closeFinished, false);
+  releaseOpening.resolve();
+  await closing;
+  assert.equal(closeCalls, 1);
+  assert.equal(h.connectors.has('a'), false);
+});
+
+test('closeAll cancels a pending open waiter and closes its driver', async () => {
+  const h = makeHarness();
+  const openingStarted = deferred<void>();
+  const releaseOpening = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {
+    openingStarted.resolve();
+    await releaseOpening.promise;
+  }, async () => {
+    closeCalls += 1;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  const opening = h.connectors.open('a');
+  await openingStarted.promise;
+
+  let closeAllFinished = false;
+  const closing = h.connectors.closeAll().then(() => {
+    closeAllFinished = true;
+  });
+  const openingRejected = assert.rejects(
+    opening,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  await openingRejected;
+  assert.equal(closeAllFinished, false);
+  releaseOpening.resolve();
+  await closing;
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(h.connectors.list(), []);
+});
+
+test('open cannot return a driver while close is in progress', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const pendingOpen = h.connectors.open('a');
+  const concurrentOpen = assert.rejects(
+    pendingOpen,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  const closing = h.connectors.close('a');
+  await closeStarted.promise;
+
+  releaseClose.resolve();
+  await Promise.all([closing, concurrentOpen]);
+});
+
+test('open cannot return a driver while closeAll is in progress', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeCalls += 1;
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const pendingOpen = h.connectors.open('a');
+  const concurrentOpen = assert.rejects(
+    pendingOpen,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  const closing = h.connectors.closeAll();
+  await closeStarted.promise;
+
+  releaseClose.resolve();
+  await Promise.all([closing, concurrentOpen]);
+  assert.equal(closeCalls, 1);
+});
+
+test('open rejects when close starts after its waiter resolves', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  const closeInvoked = deferred<void>();
+  let closePromise: Promise<void> | null = null;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+
+  const connectors = h.connectors as unknown as {
+    waitForOpen(
+      rec: unknown,
+      opening: Promise<DriverApi>,
+    ): Promise<DriverApi>;
+  };
+  const originalWaitForOpen = connectors.waitForOpen;
+  connectors.waitForOpen = (rec, opening) => {
+    const waited = originalWaitForOpen.call(h.connectors, rec, opening);
+    waited.then(() => {
+      closePromise = h.connectors.close('a');
+      closeInvoked.resolve();
+    });
+    return waited;
+  };
+
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  const opening = h.connectors.open('a');
+  await assert.rejects(
+    opening,
+    (e: DbConnectorError) => e.code === 'CONNECTION_NOT_FOUND',
+  );
+  await closeInvoked.promise;
+  await closeStarted.promise;
+  releaseClose.resolve();
+  const teardown = closePromise;
+  assert.ok(teardown);
+  await teardown;
+  assert.equal(h.connectors.has('a'), false);
+});
+
+test('settled opens do not retain teardown waiters', async () => {
+  const h = makeHarness();
+  installDriver(h, makeFakeDriver());
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const waiters = getOpenWaiters(h, 'a');
+  assert.equal(waiters.size, 0);
+  for (let i = 0; i < 100; i += 1) await h.connectors.open('a');
+  assert.equal(waiters.size, 0);
+});
+
+test('close reserves the name and shares in-progress teardown', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeCalls += 1;
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const firstClose = h.connectors.close('a');
+  await closeStarted.promise;
+  assert.throws(
+    () => h.connectors.define({ name: 'a', driver: 'sqlite' }),
+    (e: DbConnectorError) => e.code === 'CONNECTION_EXISTS',
+  );
+
+  let secondFinished = false;
+  const secondClose = h.connectors.close('a').then(() => {
+    secondFinished = true;
+  });
+  await nextTurn();
+  assert.equal(secondFinished, false);
+
+  releaseClose.resolve();
+  await Promise.all([firstClose, secondClose]);
+  assert.equal(closeCalls, 1);
+  assert.equal(h.connectors.has('a'), false);
+});
+
+test('closeAll reserves names and shares in-progress teardown', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeCalls += 1;
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const firstCloseAll = h.connectors.closeAll();
+  await closeStarted.promise;
+  assert.throws(
+    () => h.connectors.define({ name: 'a', driver: 'sqlite' }),
+    (e: DbConnectorError) => e.code === 'CONNECTION_EXISTS',
+  );
+
+  let secondFinished = false;
+  const secondCloseAll = h.connectors.closeAll().then(() => {
+    secondFinished = true;
+  });
+  await nextTurn();
+  assert.equal(secondFinished, false);
+
+  releaseClose.resolve();
+  await Promise.all([firstCloseAll, secondCloseAll]);
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(h.connectors.list(), []);
 });
 
 test('touch increments the execution counter and updates last-used', async () => {
