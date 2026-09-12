@@ -58,3 +58,39 @@ test('MySQL schema introspection preserves actual names for multiple indexes', (
     },
   ]);
 });
+
+test('MySQL schema introspection keeps colon-containing names distinct', () => {
+  const indexes = indexesFromStatistics([
+    {
+      table_name: 'a:b',
+      index_name: 'c',
+      non_unique: 1,
+      seq_in_index: 1,
+      column_name: 'first_column',
+    },
+    {
+      table_name: 'a',
+      index_name: 'b:c',
+      non_unique: 1,
+      seq_in_index: 1,
+      column_name: 'second_column',
+    },
+  ]);
+
+  assert.deepEqual(indexes, [
+    {
+      name: 'c',
+      table: 'a:b',
+      columns: ['first_column'],
+      unique: false,
+      primary: false,
+    },
+    {
+      name: 'b:c',
+      table: 'a',
+      columns: ['second_column'],
+      unique: false,
+      primary: false,
+    },
+  ]);
+});

@@ -243,14 +243,16 @@ export function indexesFromStatistics(
     name: string; table: string; unique: boolean; primary: boolean; columns: string[];
   }>();
   for (const s of statRows) {
-    const key = `${String(s.table_name)}:${String(s.index_name)}`;
+    const table = String(s.table_name);
+    const name = String(s.index_name);
+    const key = JSON.stringify([table, name]);
     let entry = indexMap.get(key);
     if (!entry) {
       entry = {
-        name: String(s.index_name),
-        table: String(s.table_name),
+        name,
+        table,
         unique: Number(s.non_unique) === 0,
-        primary: String(s.index_name) === 'PRIMARY',
+        primary: name === 'PRIMARY',
         columns: [],
       };
       indexMap.set(key, entry);
