@@ -274,6 +274,39 @@ class PureJsClientStub implements PgClient {
   async end(): Promise<void> {}
 }
 
+class AsyncErrorReportingClientStub extends EventEmitter implements PgClient {
+  activeQuery: PgQuery | undefined;
+  processID = 123;
+  secretKey = 456;
+  destroyedError: Error | undefined;
+  private streamDestroyed = false;
+  readonly connection = {
+    stream: {
+      destroy: (error?: Error) => {
+        this.destroyedError = error;
+        this.activeQuery = undefined;
+        if (this.streamDestroyed) return;
+        this.streamDestroyed = true;
+        queueMicrotask(() => this.emit('error', error));
+      },
+    },
+  };
+
+  async connect(): Promise<void> {}
+
+  query(input: unknown): unknown {
+    if (typeof input === 'string') {
+      return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+    }
+    this.activeQuery = input as PgQuery;
+    return input;
+  }
+
+  cancel(_client: PgClient, _query: object): void {}
+
+  async end(): Promise<void> {}
+}
+
 class FailingCancellationClient extends EventEmitter implements PgClient {
   static lastConfig: Record<string, unknown> | undefined;
   readonly connection = new EventEmitter();
@@ -557,6 +590,36 @@ test('pure-JS cancellation preserves transport options and reports connection fa
     assert.ok(client.destroyedError, 'cancellation failure should destroy the active client');
     assert.deepEqual(client.statements, ['BEGIN TRANSACTION READ ONLY']);
   } finally {
+    await driver.close();
+  }
+});
+
+test('cancellation failure handles an asynchronous client stream error', async () => {
+  const client = new AsyncErrorReportingClientStub();
+  const driver = driverWithClient(client, FailingCancellationClient, pg.Query);
+  const controller = new AbortController();
+  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+  let uncaught: unknown;
+  const onUncaught = (error: unknown) => {
+    uncaught = error;
+  };
+
+  try {
+    await waitForQuery(() => client.activeQuery);
+    process.once('uncaughtException', onUncaught);
+    controller.abort(new Error('query timeout'));
+    await assert.rejects(
+      pending,
+      (err: unknown) =>
+        err instanceof DbConnectorError &&
+        err.code === ErrorCode.QueryFailed &&
+        err.message.includes('cancel connection failed'),
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(uncaught, undefined);
+    assert.ok(client.listenerCount('error') > 0, 'the client should retain a safe error handler');
+  } finally {
+    process.removeListener('uncaughtException', onUncaught);
     await driver.close();
   }
 });

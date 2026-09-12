@@ -112,6 +112,7 @@ export class PgDriver implements DriverApi {
   private clientConstructor: PgClientConstructor | null = null;
   private queryConstructor: PgQueryConstructor | null = null;
   private clientConfig: PgClientConfig | null = null;
+  private readonly clientErrorListeners = new WeakMap<PgClientLike, PgEventListener>();
   private closed = false;
   private operationTail: Promise<void> = Promise.resolve();
 
@@ -135,6 +136,7 @@ export class PgDriver implements DriverApi {
         ...this.spec.options,
       };
       const client = new Client(clientConfig);
+      this.attachClientErrorHandler(client);
       try {
         await client.connect();
         await client.query('SELECT 1');
@@ -182,16 +184,31 @@ export class PgDriver implements DriverApi {
         `connection "${this.spec.name}" is not connected`,
       );
     }
+    this.attachClientErrorHandler(this.client);
     return this.client;
   }
 
-  private invalidateClient(client: PgClientLike, cause: unknown): void {
+  private attachClientErrorHandler(client: PgClientLike): void {
+    if (this.clientErrorListeners.has(client)) return;
+    const events = client as unknown as PgEventSource;
+    if (typeof events.on !== 'function') return;
+    const listener: PgEventListener = (err) => {
+      // A stream error may be delivered after cancellation has already
+      // invalidated this client. Keep the listener attached so that delayed
+      // EventEmitter errors cannot become uncaught process errors.
+      if (this.client === client) this.invalidateClient(client, err, false);
+    };
+    events.on('error', listener);
+    this.clientErrorListeners.set(client, listener);
+  }
+
+  private invalidateClient(client: PgClientLike, cause: unknown, destroy = true): void {
     if (this.client !== client) return;
     this.client = null;
     this.clientConstructor = null;
     this.queryConstructor = null;
     this.clientConfig = null;
-    destroyPgClientConnection(client, cause);
+    if (destroy) destroyPgClientConnection(client, cause);
     void client.end().catch(() => {});
   }
 
