@@ -108,14 +108,14 @@ function runSchema(): unknown {
 
   const quote = (name: string): string => name.replaceAll('"', '""');
 
-  for (const table of tables) {
+  const readColumns = (object: { name: string; sql?: string }): void => {
     const cols = db
-      .prepare(`PRAGMA table_info("${quote(table.name)}")`)
+      .prepare(`PRAGMA table_info("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
-    const hasAutoincrement = /AUTOINCREMENT/i.test(table.sql ?? '');
+    const hasAutoincrement = /AUTOINCREMENT/i.test(object.sql ?? '');
     for (const c of cols) {
       columns.push({
-        table: table.name,
+        table: object.name,
         name: c.name,
         type: c.type || 'ANY',
         nullable: c.notnull === 0 && c.pk === 0,
@@ -125,6 +125,10 @@ function runSchema(): unknown {
         extra: c.pk > 0 && hasAutoincrement ? 'AUTOINCREMENT' : undefined,
       });
     }
+  };
+
+  for (const table of tables) {
+    readColumns(table);
 
     const idxRows = db
       .prepare(`PRAGMA index_list("${quote(table.name)}")`)
@@ -173,6 +177,8 @@ function runSchema(): unknown {
     }
     foreignKeys.push(...grouped.values());
   }
+
+  for (const view of views) readColumns(view);
 
   return { tables, views, columns, indexes, foreignKeys };
 }
