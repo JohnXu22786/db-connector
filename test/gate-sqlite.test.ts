@@ -148,6 +148,17 @@ test('write approval allows with allowWrite and returns affected rows + note', a
   assert.equal(result.note.includes('roll'), true);
 });
 
+test('SQLite VACUUM runs outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'VACUUM', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'ddl');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+});
+
 test('failed write rolls back (no partial rows survive)', async () => {
   const h = await setup();
   // Updating id=2 to a duplicate email violates the UNIQUE constraint.
@@ -356,4 +367,3 @@ test('an audit write failure never breaks the executed statement', async () => {
   assert.deepEqual(q.rows, [['kept']]);
   assert.ok(h.audit.failed > 0);
 });
-

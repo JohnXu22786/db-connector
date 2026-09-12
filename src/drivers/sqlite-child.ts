@@ -13,6 +13,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { scan } from '../sql.js';
 
 interface Request {
   id: number;
@@ -51,6 +52,13 @@ function runQuery(req: Request): unknown {
 }
 
 function runWrite(req: Request): unknown {
+  // SQLite's VACUUM command cannot run while a transaction is active.
+  if (isNonTransactionalStatement(req.sql ?? '')) {
+    const stmt = db.prepare(req.sql ?? '');
+    const result = stmt.run(...(req.params ?? []) as never[]);
+    return { affectedRows: Number(result.changes), isDdl: req.isDdl === true };
+  }
+
   db.exec('BEGIN');
   try {
     const stmt = db.prepare(req.sql ?? '');
@@ -61,6 +69,11 @@ function runWrite(req: Request): unknown {
     db.exec('ROLLBACK');
     throw err;
   }
+}
+
+function isNonTransactionalStatement(sql: string): boolean {
+  const first = scan(sql).find((token) => token.type === 'word');
+  return first?.value.toUpperCase() === 'VACUUM';
 }
 
 function runSchema(): unknown {

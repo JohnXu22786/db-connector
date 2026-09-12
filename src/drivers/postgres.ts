@@ -2,11 +2,11 @@
  * PostgreSQL driver over the optional `pg` package (peer dependency). Uses
  * prepared-style parameterized queries (`$1..$n`) so values never touch SQL
  * text, tracks cancellation through pg's query-level AbortSignal, and wraps
- * writes in an explicit transaction (COMMIT / ROLLBACK).
+ * transactional writes in an explicit transaction (COMMIT / ROLLBACK).
  */
 
 import { ErrorCode, DbConnectorError } from '../errors.js';
-import { toDollarPlaceholders } from '../sql.js';
+import { scan, toDollarPlaceholders } from '../sql.js';
 import type { ResolvedConnectionSpec } from '../types.js';
 import type { DriverApi, DriverLogger, Introspection, ReadOutcome, WriteOutcome } from './driver.js';
 import { importOptional, redactSpecMessage } from './driver.js';
@@ -127,6 +127,16 @@ export class PgDriver implements DriverApi {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql);
     try {
+      // PostgreSQL rejects VACUUM and CREATE INDEX CONCURRENTLY in a transaction.
+      if (isNonTransactionalStatement(sql)) {
+        const result: PgQueryResult = await client.query({
+          text: converted.sql,
+          values: params,
+          signal,
+        } as never);
+        return { affectedRows: result.rowCount ?? 0, isDdl };
+      }
+
       await client.query('BEGIN');
       try {
         const result: PgQueryResult = await client.query({
@@ -209,6 +219,17 @@ export class PgDriver implements DriverApi {
     this.client = null;
     if (client) await client.end().catch(() => {});
   }
+}
+
+function isNonTransactionalStatement(sql: string): boolean {
+  const words = scan(sql)
+    .filter((token) => token.type === 'word' && token.depth === 0)
+    .map((token) => token.value.toUpperCase());
+  if (words[0] === 'VACUUM') return true;
+  return words[0] === 'CREATE' && (
+    (words[1] === 'INDEX' && words[2] === 'CONCURRENTLY') ||
+    (words[1] === 'UNIQUE' && words[2] === 'INDEX' && words[3] === 'CONCURRENTLY')
+  );
 }
 
 function outcomeOf(result: PgQueryResult): ReadOutcome {
@@ -299,5 +320,3 @@ const QUERIES = {
        ORDER BY tc.table_name, rc.constraint_name`,
   },
 };
-
-
