@@ -1,61 +1,297 @@
 import { strict as assert } from 'node:assert';
-import { EventEmitter } from 'node:events';
+import { createRequire } from 'node:module';
+import { EventEmitter, once } from 'node:events';
+import { createServer, type AddressInfo, type Server, type Socket } from 'node:net';
 import { test } from 'node:test';
 import { ErrorCode, DbConnectorError } from '../dist/errors.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
 import type { ResolvedConnectionSpec } from '../dist/types.js';
 
-interface FakeQueryResult {
+interface PgQueryResult {
   fields: Array<{ name: string }>;
   rows: Array<Record<string, unknown>>;
   rowCount: number | null;
 }
 
-type FakeQueryCallback = (err: Error | null, result?: FakeQueryResult) => void;
+interface PgQuery {
+  callback: (err: Error | null, result?: PgQueryResult) => void;
+}
 
-class FakeQuery {
-  readonly config: Record<string, unknown>;
-  readonly values: unknown[] | undefined;
-  readonly callback: FakeQueryCallback;
+interface ActiveQueryClient {
+  activeQuery: PgQuery | undefined;
+}
 
-  constructor(
-    config: Record<string, unknown>,
-    values: unknown[] | undefined,
-    callback: FakeQueryCallback,
-  ) {
-    this.config = config;
-    this.values = values;
-    this.callback = callback;
+interface PgClient {
+  query(input: unknown): unknown;
+  cancel(...args: unknown[]): unknown;
+  connect(): Promise<void>;
+  end(): Promise<void>;
+}
+
+interface PgModule {
+  Client: new (config?: Record<string, unknown>) => PgClient;
+  Query: new (config: Record<string, unknown>, values?: unknown[], callback?: PgQuery['callback']) => object;
+}
+
+interface PgNamespace extends PgModule {
+  native?: PgModule | null;
+}
+
+const require = createRequire(import.meta.url);
+const pg = require('pg') as PgNamespace;
+
+function loadNativePg(): { module: PgModule | null; reason: string } {
+  try {
+    const module = pg.native ?? null;
+    return {
+      module,
+      reason: module ? '' : 'pg-native is not installed',
+    };
+  } catch (err) {
+    return {
+      module: null,
+      reason: `pg-native is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
 }
 
-class TargetClient {
-  readonly host: string;
-  readonly port: number;
-  readonly ssl: unknown;
-  readonly processID = 123;
-  readonly secretKey = 456;
-  activeQuery: FakeQuery | undefined;
+const nativePgResult = loadNativePg();
+const nativePg = nativePgResult.module;
 
-  constructor(config: Record<string, unknown>) {
-    this.host = String(config.host ?? '127.0.0.1');
-    this.port = Number(config.port ?? 5432);
-    this.ssl = config.ssl;
+const spec: ResolvedConnectionSpec = {
+  name: 'pg-test',
+  driver: 'postgres',
+  database: 'db',
+  host: '127.0.0.1',
+  port: 5432,
+  user: 'user',
+  password: '',
+  passwordSource: 'none',
+  options: {},
+};
+
+function int16(value: number): Buffer {
+  const out = Buffer.alloc(2);
+  out.writeInt16BE(value, 0);
+  return out;
+}
+
+function int32(value: number): Buffer {
+  const out = Buffer.alloc(4);
+  out.writeInt32BE(value, 0);
+  return out;
+}
+
+function cstring(value: string): Buffer {
+  return Buffer.from(`${value}\0`);
+}
+
+function message(type: string, body: Buffer): Buffer {
+  return Buffer.concat([Buffer.from(type), int32(body.length + 4), body]);
+}
+
+class FakePostgresServer {
+  private readonly server: Server;
+  private readonly sockets = new Set<Socket>();
+  private mainSocket: Socket | null = null;
+  private longQueryResolve!: () => void;
+  readonly longQueryStarted = new Promise<void>((resolve) => {
+    this.longQueryResolve = resolve;
+  });
+  cancelRequests = 0;
+  mainConnections = 0;
+  port = 0;
+
+  constructor() {
+    this.server = createServer((socket) => this.accept(socket));
   }
 
-  query(input: string | FakeQuery): Promise<FakeQueryResult> | FakeQuery {
+  async listen(): Promise<void> {
+    this.server.listen(0, '127.0.0.1');
+    await once(this.server, 'listening');
+    this.port = (this.server.address() as AddressInfo).port;
+  }
+
+  async close(): Promise<void> {
+    for (const socket of this.sockets) socket.destroy();
+    await new Promise<void>((resolve, reject) => {
+      this.server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+
+  private accept(socket: Socket): void {
+    this.sockets.add(socket);
+    let buffer: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let startupHandled = false;
+    socket.on('data', (chunk: Buffer) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (!startupHandled) {
+        if (buffer.length < 8) return;
+        const length = buffer.readInt32BE(0);
+        if (buffer.length < length) return;
+        const code = buffer.readInt32BE(4);
+        if (length === 16 && code === 80877102) {
+          this.cancelRequests += 1;
+          socket.end();
+          this.cancelMainQuery();
+          return;
+        }
+
+        startupHandled = true;
+        buffer = buffer.subarray(length);
+        this.mainSocket = socket;
+        this.mainConnections += 1;
+        socket.write(Buffer.concat([
+          message('R', int32(0)),
+          message('K', Buffer.concat([int32(1234), int32(5678)])),
+          message('Z', Buffer.from('I')),
+        ]));
+      }
+      buffer = this.processMessages(socket, buffer);
+    });
+    socket.once('close', () => this.sockets.delete(socket));
+  }
+
+  private processMessages(socket: Socket, buffer: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> {
+    while (buffer.length >= 5) {
+      const length = buffer.readInt32BE(1);
+      const total = length + 1;
+      if (buffer.length < total) return buffer;
+      const type = String.fromCharCode(buffer[0]!);
+      const body = buffer.subarray(5, total);
+      buffer = buffer.subarray(total);
+      if (type === 'Q') this.handleQuery(socket, body.toString().replace(/\0$/, ''));
+    }
+    return buffer;
+  }
+
+  private handleQuery(socket: Socket, sql: string): void {
+    const normalized = sql.trim().toUpperCase();
+    if (normalized.includes('PG_SLEEP')) {
+      this.longQueryResolve();
+      return;
+    }
+    if (normalized === 'SELECT 1' || normalized === 'SELECT 42') {
+      this.sendSelect(socket, normalized === 'SELECT 1' ? '1' : '42');
+      return;
+    }
+    this.sendCommand(socket, normalized.split(/\s+/, 1)[0] || 'OK');
+  }
+
+  private sendCommand(socket: Socket, tag: string): void {
+    socket.write(Buffer.concat([
+      message('C', cstring(tag)),
+      message('Z', Buffer.from('I')),
+    ]));
+  }
+
+  private sendSelect(socket: Socket, value: string): void {
+    const field = Buffer.concat([
+      cstring('value'),
+      int32(0),
+      int16(0),
+      int32(23),
+      int16(4),
+      int32(-1),
+      int16(0),
+    ]);
+    const row = Buffer.concat([int16(1), int32(Buffer.byteLength(value)), Buffer.from(value)]);
+    socket.write(Buffer.concat([
+      message('T', Buffer.concat([int16(1), field])),
+      message('D', row),
+      message('C', cstring('SELECT 1')),
+      message('Z', Buffer.from('I')),
+    ]));
+  }
+
+  private cancelMainQuery(): void {
+    if (!this.mainSocket) return;
+    const error = Buffer.concat([
+      cstring('S'), cstring('ERROR'),
+      cstring('C'), cstring('57014'),
+      cstring('M'), cstring('canceling statement due to user request'),
+      Buffer.from([0]),
+    ]);
+    this.mainSocket.write(Buffer.concat([
+      message('E', error),
+      message('Z', Buffer.from('I')),
+    ]));
+  }
+}
+
+class NativeClientStub implements PgClient {
+  _activeQuery: PgQuery | undefined;
+  cancelled = 0;
+
+  async connect(): Promise<void> {}
+
+  query(input: unknown): unknown {
     if (typeof input === 'string') {
       return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
     }
-    this.activeQuery = input;
+    this._activeQuery = input as PgQuery;
     return input;
   }
 
-  cancel(_client: TargetClient, _query: FakeQuery): void {
-    throw new Error('the target client must not send the cancellation connection');
+  cancel(query: PgQuery): void {
+    if (this._activeQuery !== query) return;
+    this.cancelled += 1;
+    this._activeQuery = undefined;
+    query.callback(new Error('canceling statement due to user request'));
+  }
+
+  async end(): Promise<void> {}
+}
+
+class PureJsClientStub implements PgClient {
+  activeQuery: PgQuery | undefined;
+  processID = 123;
+  secretKey = 456;
+  readonly statements: string[] = [];
+  destroyedError: Error | undefined;
+  readonly connection = {
+    stream: {
+      destroy: (error?: Error) => {
+        this.destroyedError = error;
+        this.activeQuery = undefined;
+      },
+    },
+  };
+
+  async connect(): Promise<void> {}
+
+  query(input: unknown): unknown {
+    if (typeof input === 'string') {
+      this.statements.push(input);
+      return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+    }
+    this.activeQuery = input as PgQuery;
+    return input;
+  }
+
+  cancel(_client: PgClient, _query: object): void {}
+
+  async end(): Promise<void> {}
+}
+
+class FailingCancellationClient extends EventEmitter implements PgClient {
+  static lastConfig: Record<string, unknown> | undefined;
+  readonly connection = new EventEmitter();
+
+  constructor(config?: Record<string, unknown>) {
+    super();
+    FailingCancellationClient.lastConfig = config ?? {};
   }
 
   async connect(): Promise<void> {}
+
+  query(): unknown {
+    return undefined;
+  }
+
+  cancel(_client: PgClient, _query: object): void {
+    queueMicrotask(() => this.connection.emit('error', new Error('cancel connection failed')));
+  }
 
   async end(): Promise<void> {}
 }
@@ -66,12 +302,11 @@ class TlsCancellationConnection extends EventEmitter {
   cancelCalls = 0;
   cancelledProcessID: number | null = null;
   cancelledSecretKey: number | null = null;
+  private readonly client: ActiveQueryClient;
 
-  private readonly target: TargetClient;
-
-  constructor(target: TargetClient) {
+  constructor(client: ActiveQueryClient) {
     super();
-    this.target = target;
+    this.client = client;
   }
 
   connect(portOrPath: number | string, host?: string): void {
@@ -88,166 +323,430 @@ class TlsCancellationConnection extends EventEmitter {
     this.cancelCalls += 1;
     this.cancelledProcessID = processID;
     this.cancelledSecretKey = secretKey;
-    const query = this.target.activeQuery;
+    const query = this.client.activeQuery;
     assert.ok(query, 'TLS cancellation should target the active query');
-    this.target.activeQuery = undefined;
+    this.client.activeQuery = undefined;
     query.callback(new Error('canceling statement due to user request'));
   }
 }
 
-class TlsCancellationClient extends EventEmitter {
+class TlsCancellationClient extends EventEmitter implements PgClient {
   static lastInstance: TlsCancellationClient | undefined;
   readonly ssl = true;
-  readonly host: string;
-  readonly port: number;
+  readonly sslNegotiation: string;
+  readonly host: string | undefined;
+  readonly port: number | undefined;
   readonly connection: TlsCancellationConnection;
 
-  constructor(config: Record<string, unknown>) {
+  constructor(config?: Record<string, unknown>) {
     super();
-    assert.ok(cancellationTarget);
-    this.host = String(config.host);
-    this.port = Number(config.port);
-    this.connection = new TlsCancellationConnection(cancellationTarget);
+    this.sslNegotiation = String(config?.sslNegotiation ?? config?.sslnegotiation ?? 'postgres');
+    this.host = typeof config?.host === 'string' ? config.host : undefined;
+    this.port = typeof config?.port === 'number' ? config.port : undefined;
+    const target = tlsCancellationTarget;
+    assert.ok(target, 'TLS cancellation target should be configured');
+    this.connection = new TlsCancellationConnection(target);
     TlsCancellationClient.lastInstance = this;
   }
 
-  cancel(): void {
+  async connect(): Promise<void> {}
+
+  query(): unknown {
+    return undefined;
+  }
+
+  cancel(_client: PgClient, _query: object): void {
     throw new Error('TLS cancellation should use the configured connection');
   }
+
+  async end(): Promise<void> {}
 }
 
-class PlainCancellationClient extends EventEmitter {
-  readonly ssl = false;
-  readonly host: string;
-  readonly port: number;
-  static lastConfig: Record<string, unknown> | undefined;
+class QueuedPureJsClientStub implements PgClient {
+  activeQuery: PgQuery | undefined;
+  readonly queuedQueries: PgQuery[] = [];
+  cancelledQueuedQueries = 0;
+  processID = 123;
+  secretKey = 456;
 
-  constructor(config: Record<string, unknown>) {
-    super();
-    PlainCancellationClient.lastConfig = config;
-    this.host = String(config.host);
-    this.port = Number(config.port);
+  async connect(): Promise<void> {}
+
+  query(input: unknown): unknown {
+    if (typeof input === 'string') {
+      return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+    }
+    const query = input as PgQuery;
+    if (this.activeQuery) this.queuedQueries.push(query);
+    else this.activeQuery = query;
+    return query;
   }
 
-  cancel(_client: TargetClient, query: FakeQuery): void {
-    assert.ok(cancellationTarget?.activeQuery === query, 'cancellation should target the active query');
-    cancellationTarget!.activeQuery = undefined;
-    query.callback(new Error('canceling statement due to user request'));
+  cancel(_client: PgClient, query: PgQuery): void {
+    if (this.activeQuery === query) {
+      this.activeQuery = undefined;
+      query.callback(new Error('canceling statement due to user request'));
+      return;
+    }
+    const index = this.queuedQueries.indexOf(query);
+    if (index >= 0) {
+      this.queuedQueries.splice(index, 1);
+      this.cancelledQueuedQueries += 1;
+    }
   }
+
+  async end(): Promise<void> {}
 }
 
-const baseSpec: ResolvedConnectionSpec = {
-  name: 'postgres-cancellation-test',
-  driver: 'postgres',
-  database: 'db',
-  host: '127.0.0.1',
-  port: 5432,
-  user: 'user',
-  password: '',
-  passwordSource: 'none',
-  options: {},
-};
-
-let cancellationTarget: TargetClient | undefined;
+let tlsCancellationTarget: ActiveQueryClient | undefined;
 
 function driverWithClient(
-  client: TargetClient,
-  Client: new (config: Record<string, unknown>) => unknown,
-  clientConfig: Record<string, unknown>,
-  driverSpec: ResolvedConnectionSpec,
+  client: PgClient,
+  Client: PgModule['Client'],
+  Query: PgModule['Query'],
+  driverSpec: ResolvedConnectionSpec = spec,
+  clientConfig: Record<string, unknown> = {},
 ): PgDriver {
   const driver = new PgDriver(driverSpec, { debug() {}, info() {}, warn() {} });
   const internals = driver as unknown as {
-    client: TargetClient;
-    clientConstructor: new (config: Record<string, unknown>) => unknown;
-    queryConstructor: typeof FakeQuery;
+    client: PgClient;
+    clientConstructor: PgModule['Client'];
+    queryConstructor: PgModule['Query'];
     clientConfig: Record<string, unknown>;
   };
   internals.client = client;
   internals.clientConstructor = Client;
-  internals.queryConstructor = FakeQuery;
+  internals.queryConstructor = Query;
   internals.clientConfig = clientConfig;
   return driver;
 }
 
-async function waitForActiveQuery(client: TargetClient): Promise<void> {
-  for (let attempt = 0; attempt < 10 && !client.activeQuery; attempt += 1) {
+async function waitForQuery(getQuery: () => PgQuery | undefined): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !getQuery(); attempt += 1) {
     await Promise.resolve();
   }
-  assert.ok(client.activeQuery, 'the query should be active before cancellation');
+  assert.ok(getQuery(), 'the query should be active before cancellation');
 }
 
-test('TLS cancellation uses PostgreSQL Unix-socket path form', async () => {
-  const clientConfig = {
-    host: '/var/run/postgresql',
-    port: 6543,
-    ssl: true,
-  };
-  const client = new TargetClient(clientConfig);
-  cancellationTarget = client;
-  const driver = driverWithClient(
-    client,
-    TlsCancellationClient,
-    clientConfig,
-    { ...baseSpec, host: clientConfig.host, port: clientConfig.port, ssl: true },
-  );
-  const controller = new AbortController();
-  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
-
-  try {
-    await waitForActiveQuery(client);
-    controller.abort(new Error('query timeout'));
-
-    await assert.rejects(
-      pending,
-      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
-    );
-
-    const connection = TlsCancellationClient.lastInstance?.connection;
-    assert.ok(connection);
-    assert.deepEqual(connection.connectCalls, [['/var/run/postgresql/.s.PGSQL.6543', undefined]]);
-    assert.equal(connection.requestSslCalls, 1);
-    assert.equal(connection.cancelCalls, 1);
-    assert.equal(connection.cancelledProcessID, client.processID);
-    assert.equal(connection.cancelledSecretKey, client.secretKey);
-  } finally {
-    const connection = (driver as unknown as { client: TargetClient }).client;
-    await driver.close();
-    cancellationTarget = undefined;
-    assert.equal(connection.activeQuery, undefined);
-  }
-});
-
-test('pure-JavaScript cancellation uses a separate client and preserves timeout errors', async () => {
+test('pure-JS cancellation preserves transport options and reports connection failures', async () => {
+  const ssl = { rejectUnauthorized: false };
+  const stream = () => new EventEmitter();
+  const connection = new EventEmitter();
   const clientConfig = {
     host: 'db.example.test',
     port: 6543,
-    ssl: false,
+    ssl,
+    stream,
+    connection,
     customOption: 'preserved',
   };
-  const client = new TargetClient(clientConfig);
-  cancellationTarget = client;
+  const client = new PureJsClientStub();
+  const driver = driverWithClient(client, FailingCancellationClient, pg.Query, spec, clientConfig);
+  const controller = new AbortController();
+  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+
+  try {
+    await waitForQuery(() => client.activeQuery);
+    controller.abort(new Error('query timeout'));
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await assert.rejects(
+        Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('cancellation hung')), 1000);
+          }),
+        ]),
+        (err: unknown) =>
+          err instanceof DbConnectorError &&
+          err.code === ErrorCode.QueryFailed &&
+          err.message.includes('cancel connection failed'),
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    assert.equal(FailingCancellationClient.lastConfig?.ssl, ssl);
+    assert.equal(FailingCancellationClient.lastConfig?.stream, stream);
+    assert.equal(FailingCancellationClient.lastConfig?.connection, connection);
+    assert.equal(FailingCancellationClient.lastConfig?.customOption, 'preserved');
+    assert.ok(client.destroyedError, 'cancellation failure should destroy the active client');
+    assert.deepEqual(client.statements, ['BEGIN TRANSACTION READ ONLY']);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('transactional writes fail promptly when the cancellation connection fails', async () => {
+  const client = new PureJsClientStub();
+  const driver = driverWithClient(client, FailingCancellationClient, pg.Query);
+  const controller = new AbortController();
+  const pending = driver.write('INSERT INTO users VALUES (1)', [], false, controller.signal);
+
+  try {
+    await waitForQuery(() => client.activeQuery);
+    controller.abort(new Error('query timeout'));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await assert.rejects(
+        Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('cancellation hung')), 1000);
+          }),
+        ]),
+        (err: unknown) =>
+          err instanceof DbConnectorError &&
+          err.code === ErrorCode.QueryFailed &&
+          err.message.includes('cancel connection failed'),
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    assert.ok(client.destroyedError);
+    assert.deepEqual(client.statements, ['BEGIN']);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('TLS cancellation negotiates TLS before sending the CancelRequest', async () => {
+  const client = new PureJsClientStub();
+  tlsCancellationTarget = client;
   const driver = driverWithClient(
     client,
-    PlainCancellationClient,
-    clientConfig,
-    { ...baseSpec, host: clientConfig.host, port: clientConfig.port },
+    TlsCancellationClient,
+    pg.Query,
+    spec,
+    { host: 'db.example.test', port: 6543, ssl: true },
   );
   const controller = new AbortController();
   const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
 
   try {
-    await waitForActiveQuery(client);
+    await waitForQuery(() => client.activeQuery);
+    controller.abort(new Error('query timeout'));
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+
+    const cancellationConnection = TlsCancellationClient.lastInstance?.connection;
+    assert.ok(cancellationConnection);
+    assert.equal(cancellationConnection.requestSslCalls, 1);
+    assert.equal(cancellationConnection.cancelCalls, 1);
+    assert.equal(cancellationConnection.cancelledProcessID, client.processID);
+    assert.equal(cancellationConnection.cancelledSecretKey, client.secretKey);
+  } finally {
+    tlsCancellationTarget = undefined;
+    await driver.close();
+  }
+});
+
+test('TLS cancellation uses PostgreSQL Unix-socket path form', async () => {
+  const client = new PureJsClientStub();
+  tlsCancellationTarget = client;
+  const driver = driverWithClient(
+    client,
+    TlsCancellationClient,
+    pg.Query,
+    { ...spec, host: '/var/run/postgresql', port: 6543 },
+    { host: '/var/run/postgresql', port: 6543, ssl: true },
+  );
+  const controller = new AbortController();
+  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+
+  try {
+    await waitForQuery(() => client.activeQuery);
+    controller.abort(new Error('query timeout'));
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+
+    const cancellationConnection = TlsCancellationClient.lastInstance?.connection;
+    assert.ok(cancellationConnection);
+    assert.deepEqual(cancellationConnection.connectCalls, [
+      ['/var/run/postgresql/.s.PGSQL.6543', undefined],
+    ]);
+    assert.equal(cancellationConnection.cancelCalls, 1);
+  } finally {
+    tlsCancellationTarget = undefined;
+    await driver.close();
+  }
+});
+
+test('TLS cancellation honors direct SSL negotiation', async () => {
+  const client = new PureJsClientStub();
+  tlsCancellationTarget = client;
+  const driver = driverWithClient(
+    client,
+    TlsCancellationClient,
+    pg.Query,
+    spec,
+    { host: 'db.example.test', port: 6543, ssl: true, sslnegotiation: 'direct' },
+  );
+  const controller = new AbortController();
+  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+
+  try {
+    await waitForQuery(() => client.activeQuery);
+    controller.abort(new Error('query timeout'));
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+
+    const cancellationConnection = TlsCancellationClient.lastInstance?.connection;
+    assert.ok(cancellationConnection);
+    assert.equal(cancellationConnection.requestSslCalls, 0);
+    assert.equal(cancellationConnection.cancelCalls, 1);
+  } finally {
+    tlsCancellationTarget = undefined;
+    await driver.close();
+  }
+});
+
+test('queued TLS introspection queries are removed without sending extra CancelRequests', async () => {
+  const client = new QueuedPureJsClientStub();
+  tlsCancellationTarget = client;
+  const driver = driverWithClient(
+    client,
+    TlsCancellationClient,
+    pg.Query,
+    spec,
+    { host: 'db.example.test', port: 6543, ssl: true },
+  );
+  const controller = new AbortController();
+  const pending = driver.introspect(controller.signal);
+
+  try {
+    for (let attempt = 0; attempt < 10 && client.queuedQueries.length < 5; attempt += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(client.queuedQueries.length, 5);
+    controller.abort(new Error('query timeout'));
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+
+    const cancellationConnection = TlsCancellationClient.lastInstance?.connection;
+    assert.ok(cancellationConnection);
+    assert.equal(cancellationConnection.cancelCalls, 1);
+    assert.equal(client.cancelledQueuedQueries, 5);
+    assert.equal(client.queuedQueries.length, 0);
+  } finally {
+    tlsCancellationTarget = undefined;
+    await driver.close();
+  }
+});
+
+test('pure-JS pg 8.13 cancellation uses a separate connection and preserves recovery', async () => {
+  const server = new FakePostgresServer();
+  await server.listen();
+  const driver = new PgDriver(
+    { ...spec, port: server.port },
+    { debug() {}, info() {}, warn() {} },
+  );
+
+  try {
+    await driver.connect();
+    const controller = new AbortController();
+    const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+    await server.longQueryStarted;
     controller.abort(new Error('query timeout'));
 
     await assert.rejects(
       pending,
       (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
     );
-    assert.notEqual(PlainCancellationClient.lastConfig, clientConfig);
-    assert.equal(PlainCancellationClient.lastConfig?.customOption, 'preserved');
+    assert.equal(server.cancelRequests, 1);
+    assert.equal(server.mainConnections, 1);
+
+    const recovered = await driver.read('SELECT 42', [], new AbortController().signal);
+    assert.deepEqual(recovered.rows, [[42]]);
+    assert.equal(server.mainConnections, 1);
   } finally {
     await driver.close();
-    cancellationTarget = undefined;
+    await server.close();
+  }
+});
+
+test('native-shaped clients use cancel(query) and their active-query slot', async () => {
+  const client = new NativeClientStub();
+  class UnexpectedCancellationClient implements PgClient {
+    constructor() {
+      throw new Error('native cancellation must not create a second client');
+    }
+
+    async connect(): Promise<void> {}
+
+    query(): unknown {
+      return undefined;
+    }
+
+    cancel(): void {}
+
+    async end(): Promise<void> {}
+  }
+
+  const driver = driverWithClient(client, UnexpectedCancellationClient, pg.Query);
+  const controller = new AbortController();
+  const pending = driver.read('SELECT pg_sleep(30)', [], controller.signal);
+  await waitForQuery(() => client._activeQuery);
+  controller.abort(new Error('query timeout'));
+
+  await assert.rejects(
+    pending,
+    (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+  );
+  assert.equal(client.cancelled, 1);
+  await driver.close();
+});
+
+test('pg-native cancellation cancels an active query and preserves recovery', {
+  skip: nativePg ? false : nativePgResult.reason,
+}, async () => {
+  if (!nativePg) return;
+
+  const server = new FakePostgresServer();
+  await server.listen();
+  const client = new nativePg.Client({
+    host: '127.0.0.1',
+    port: server.port,
+    user: 'user',
+    database: 'db',
+  });
+  let driver: PgDriver | undefined;
+
+  try {
+    await client.connect();
+    driver = driverWithClient(
+      client,
+      nativePg.Client,
+      nativePg.Query,
+      { ...spec, port: server.port },
+      { host: '127.0.0.1', port: server.port, user: 'user', database: 'db' },
+    );
+    const controller = new AbortController();
+    // NativeQuery treats an empty values array as a parameterized query. The
+    // protocol fixture only needs a simple query for this cancellation test.
+    const pending = driver.read('SELECT pg_sleep(30)', undefined as unknown as [], controller.signal);
+    await server.longQueryStarted;
+    controller.abort(new Error('query timeout'));
+
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+    assert.equal(server.cancelRequests, 1);
+
+    const recovered = await driver.read('SELECT 42', undefined as unknown as [], new AbortController().signal);
+    assert.deepEqual(recovered.rows, [[42]]);
+  } finally {
+    if (driver) await driver.close();
+    else await client.end();
+    await server.close();
   }
 });
