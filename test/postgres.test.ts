@@ -116,6 +116,7 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
     catalog.exec(`
       INSERT INTO fixture_referential_constraints VALUES
         ('orders_local_fk', 'public', 'public', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
+        ('orders_local_fk', 'archive', 'legacy', 'customers_pkey', 'CASCADE', 'NO ACTION'),
         ('orders_legacy_fk', 'public', 'legacy', 'customers_pkey', 'NO ACTION', 'NO ACTION')
     `);
     catalog.exec(`
@@ -188,6 +189,7 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
     try {
       const introspection = await driver.introspect(new AbortController().signal);
       const foreignKeys = new Map(introspection.foreignKeys.map((foreignKey) => [foreignKey.name, foreignKey]));
+      assert.equal(introspection.foreignKeys.length, 2, 'unrelated constraint schemas must not join source-schema rows');
       assert.equal(foreignKeys.size, 2, 'same-schema and cross-schema foreign keys should both be returned');
 
       const local = foreignKeys.get('orders_local_fk');
@@ -204,6 +206,7 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
       assert.equal(captured.length, 1);
       assert.match(captured[0]!.text!, /array_agg\(kcu\.column_name ORDER BY kcu\.ordinal_position\)/);
       assert.match(captured[0]!.text!, /array_agg\(rku\.column_name ORDER BY kcu\.ordinal_position\)/);
+      assert.match(captured[0]!.text!, /rc\.constraint_schema = \$1/);
       assert.match(captured[0]!.text!, /ccu\.constraint_schema = rc\.unique_constraint_schema/);
       assert.doesNotMatch(captured[0]!.text!, /WHERE constraint_schema = \$1\s*\) AS ccu/s);
     } finally {

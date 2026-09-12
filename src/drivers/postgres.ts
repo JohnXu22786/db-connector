@@ -415,6 +415,7 @@ const QUERIES = {
        ) AS ccu
          ON ccu.constraint_name = rc.unique_constraint_name
         AND ccu.constraint_schema = rc.unique_constraint_schema
+       WHERE rc.constraint_schema = $1
        GROUP BY rc.constraint_name, tc.table_name, rc.update_rule, rc.delete_rule, ccu.table_name
        ORDER BY tc.table_name, rc.constraint_name`,
   },
