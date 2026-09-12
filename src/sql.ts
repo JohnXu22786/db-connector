@@ -211,6 +211,30 @@ function isFetchCountToken(token: Token, next?: Token): boolean {
   );
 }
 
+function skipFetchCount(tokens: Token[], start: number): number {
+  const first = tokens[start];
+  if (first?.type === 'symbol' && first.value === '(' && first.depth === 1) {
+    let depth = 0;
+    for (let cursor = start; cursor < tokens.length; cursor += 1) {
+      const token = tokens[cursor]!;
+      if (token.type !== 'symbol') continue;
+      if (token.value === '(') depth += 1;
+      else if (token.value === ')') {
+        depth -= 1;
+        if (depth === 0) return cursor + 1;
+      }
+    }
+    return start;
+  }
+
+  let cursor = start;
+  while (
+    cursor < tokens.length &&
+    isFetchCountToken(tokens[cursor]!, tokens[cursor + 1])
+  ) cursor += 1;
+  return cursor;
+}
+
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
 function firstDataKeyword(sql: string): Token | undefined {
   const tokens = meaningful(sql);
@@ -554,11 +578,7 @@ export function ensureSelectLimit(
       return false;
     }
 
-    let cursor = index + 2;
-    while (
-      cursor < tokens.length &&
-      isFetchCountToken(tokens[cursor]!, tokens[cursor + 1])
-    ) cursor += 1;
+    const cursor = skipFetchCount(tokens, index + 2);
     const row = tokens[cursor];
     if (
       row?.type !== 'word' ||
