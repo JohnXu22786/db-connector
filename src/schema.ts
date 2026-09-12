@@ -97,10 +97,12 @@ export class SchemaService {
   /** Drop a connection's cached snapshot (e.g. after DDL). */
   invalidate(connection: string): void {
     this.cache.delete(connection);
+    this.latestIntrospection.delete(connection);
   }
 
   clear(): void {
     this.cache.clear();
+    this.latestIntrospection.clear();
   }
 }
 

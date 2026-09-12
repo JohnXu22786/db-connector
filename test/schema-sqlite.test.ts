@@ -9,6 +9,53 @@ import type { DriverApi, Introspection } from '../dist/drivers/driver.js';
 import { SchemaService } from '../dist/schema.js';
 import { freshSignal, makeHarness, seedSqlite } from './helpers.ts';
 
+async function assertInvalidationRevokesRefresh(
+  revoke: (service: SchemaService) => void,
+): Promise<void> {
+  let calls = 0;
+  let releaseStale!: (raw: Introspection) => void;
+  const stale = new Promise<Introspection>((resolve) => {
+    releaseStale = resolve;
+  });
+  const snapshot = (table: string): Introspection => ({
+    tables: [{ name: table }],
+    views: [],
+    columns: [],
+    indexes: [],
+    foreignKeys: [],
+  });
+  const driver: DriverApi = {
+    kind: 'sqlite',
+    connect: async () => {},
+    read: async () => ({ columns: [], rows: [], rowCount: 0 }),
+    write: async () => ({ affectedRows: 0, isDdl: false }),
+    introspect: () => {
+      calls += 1;
+      if (calls === 1) return Promise.resolve(snapshot('before'));
+      if (calls === 2) return stale;
+      return Promise.resolve(snapshot('fresh'));
+    },
+    close: async () => {},
+  };
+  const service = new SchemaService(600_000);
+
+  await service.get(driver, 'sample', { signal: freshSignal() });
+  const preInvalidation = service.get(driver, 'sample', {
+    refresh: true,
+    signal: freshSignal(),
+  });
+  revoke(service);
+  releaseStale(snapshot('stale'));
+  await preInvalidation;
+
+  const after = await service.get(driver, 'sample', {
+    signal: freshSignal(),
+  });
+  assert.equal(calls, 3);
+  assert.equal(after.fromCache, false);
+  assert.deepEqual(after.tables.map((table) => table.name), ['fresh']);
+}
+
 test('schema snapshot lists tables, columns, indexes, foreign keys', async () => {
   const h = makeHarness();
   await seedSqlite(h);
@@ -142,3 +189,11 @@ test('concurrent refreshes keep the newer snapshot in the cache', async () => {
   assert.equal(cached.fromCache, true);
   assert.deepEqual(cached.tables.map((table) => table.name), ['newer']);
 });
+
+test('invalidate revokes in-flight introspection cache writes', () =>
+  assertInvalidationRevokesRefresh((service) => service.invalidate('sample')),
+);
+
+test('clear revokes in-flight introspection cache writes', () =>
+  assertInvalidationRevokesRefresh((service) => service.clear()),
+);
