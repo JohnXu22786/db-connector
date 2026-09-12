@@ -5,6 +5,25 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 
+/** Serialize asynchronous work while preserving request order. */
+export class AsyncMutex {
+  private tail = Promise.resolve();
+
+  async runExclusive<T>(work: () => Promise<T>): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+}
+
 /** sha256 hex digest of a string (used for audit statement digests). */
 export function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');

@@ -8,6 +8,7 @@
 import { ErrorCode, DbConnectorError } from '../errors.js';
 import { toDollarPlaceholders } from '../sql.js';
 import type { ResolvedConnectionSpec } from '../types.js';
+import { AsyncMutex } from '../util.js';
 import type { DriverApi, DriverLogger, Introspection, ReadOutcome, WriteOutcome } from './driver.js';
 import { importOptional, redactSpecMessage } from './driver.js';
 
@@ -55,6 +56,7 @@ export class PgDriver implements DriverApi {
   readonly kind = 'postgres' as const;
   private client: PgClientLike | null = null;
   private closed = false;
+  private readonly transactionMutex = new AsyncMutex();
 
   constructor(
     private readonly spec: ResolvedConnectionSpec,
@@ -98,21 +100,23 @@ export class PgDriver implements DriverApi {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql);
     try {
-      // Server-side read-only backstop: even a statement that slips past the
-      // classifier cannot mutate data inside a READ ONLY transaction.
-      await client.query('BEGIN TRANSACTION READ ONLY');
-      try {
-        const result: PgQueryResult = await client.query({
-          text: converted.sql,
-          values: params,
-          signal,
-        } as never);
-        await client.query('ROLLBACK');
-        return outcomeOf(result);
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      }
+      return await this.transactionMutex.runExclusive(async () => {
+        // Server-side read-only backstop: even a statement that slips past the
+        // classifier cannot mutate data inside a READ ONLY transaction.
+        await client.query('BEGIN TRANSACTION READ ONLY');
+        try {
+          const result: PgQueryResult = await client.query({
+            text: converted.sql,
+            values: params,
+            signal,
+          } as never);
+          await client.query('ROLLBACK');
+          return outcomeOf(result);
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      });
     } catch (err) {
       throw toConnectorError(this.spec, err);
     }
@@ -127,19 +131,21 @@ export class PgDriver implements DriverApi {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql);
     try {
-      await client.query('BEGIN');
-      try {
-        const result: PgQueryResult = await client.query({
-          text: converted.sql,
-          values: params,
-          signal,
-        } as never);
-        await client.query('COMMIT');
-        return { affectedRows: result.rowCount ?? 0, isDdl };
-      } catch (err) {
-        await client.query('ROLLBACK').catch(() => {});
-        throw err;
-      }
+      return await this.transactionMutex.runExclusive(async () => {
+        await client.query('BEGIN');
+        try {
+          const result: PgQueryResult = await client.query({
+            text: converted.sql,
+            values: params,
+            signal,
+          } as never);
+          await client.query('COMMIT');
+          return { affectedRows: result.rowCount ?? 0, isDdl };
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => {});
+          throw err;
+        }
+      });
     } catch (err) {
       throw toConnectorError(this.spec, err);
     }
@@ -299,5 +305,4 @@ const QUERIES = {
        ORDER BY tc.table_name, rc.constraint_name`,
   },
 };
-
 

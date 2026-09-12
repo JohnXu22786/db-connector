@@ -8,6 +8,7 @@
 
 import { ErrorCode, DbConnectorError } from '../errors.js';
 import type { ResolvedConnectionSpec } from '../types.js';
+import { AsyncMutex } from '../util.js';
 import type { DriverApi, DriverLogger, Introspection, ReadOutcome, WriteOutcome } from './driver.js';
 import { importOptional, redactSpecMessage } from './driver.js';
 
@@ -40,6 +41,7 @@ export class MysqlDriver implements DriverApi {
   readonly kind = 'mysql' as const;
   private conn: MysqlConnection | null = null;
   private closed = false;
+  private readonly transactionMutex = new AsyncMutex();
 
   constructor(
     private readonly spec: ResolvedConnectionSpec,
@@ -84,34 +86,42 @@ export class MysqlDriver implements DriverApi {
     signal: AbortSignal,
   ): Promise<unknown> {
     const conn = this.ensure();
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const cleanup = () => signal.removeEventListener('abort', onAbort);
-      const fail = (err: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        reject(toConnectorError(this.spec, err));
-      };
-      const onAbort = () => {
-        conn.destroy(); // kills the in-flight query server-side
-        fail(cancelError(signal));
-      };
-      if (signal.aborted) {
-        fail(cancelError(signal));
-        return;
-      }
-      signal.addEventListener('abort', onAbort, { once: true });
-      fn(conn).then(
-        (value) => {
+    return this.transactionMutex.runExclusive(
+      () => new Promise((resolve, reject) => {
+        let settled = false;
+        let abortError: DbConnectorError | undefined;
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        const succeed = (value: unknown) => {
           if (settled) return;
           settled = true;
           cleanup();
           resolve(value);
-        },
-        (err) => fail(err),
-      );
-    });
+        };
+        const fail = (err: unknown) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          reject(toConnectorError(this.spec, err));
+        };
+        const onAbort = () => {
+          if (settled || abortError) return;
+          conn.destroy(); // kills the in-flight query server-side
+          abortError = cancelError(signal);
+        };
+        if (signal.aborted) {
+          fail(cancelError(signal));
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+        fn(conn).then(
+          (value) => {
+            if (abortError) fail(abortError);
+            else succeed(value);
+          },
+          (err) => fail(abortError ?? err),
+        );
+      }),
+    );
   }
 
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
@@ -312,4 +322,3 @@ const QUERIES = {
        ORDER BY kcu.table_name, kcu.constraint_name, kcu.ordinal_position`,
   },
 };
-
