@@ -68,11 +68,42 @@ export function scan(sql: string): Token[] {
       continue;
     }
 
-    // -- line comment
-    if (c === '-' && sql[i + 1] === '-') {
+    // -- line comment (MySQL requires whitespace/control after the dashes)
+    if (
+      c === '-' &&
+      sql[i + 1] === '-' &&
+      (sql[i + 2] === undefined || sql[i + 2]!.charCodeAt(0) <= 0x20)
+    ) {
       i += 2;
       while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // MySQL executable comments are active SQL, not comments. Scan their
+    // body as code while preserving the original delimiters and positions.
+    if (c === '/' && sql[i + 1] === '*' && sql[i + 2] === '!') {
+      const bodyStart = i + 3;
+      const close = sql.indexOf('*/', bodyStart);
+      const bodyEnd = close === -1 ? n : close;
+      const bodyTokens = scan(sql.slice(bodyStart, bodyEnd));
+      const bodyDepth = depth;
+      tokens.push({ type: 'symbol', value: '/*!', pos: at, depth });
+      for (const token of bodyTokens) {
+        tokens.push({
+          ...token,
+          pos: bodyStart + token.pos,
+          depth: bodyDepth + token.depth,
+        });
+        if (token.type === 'symbol' && token.value === '(') depth += 1;
+        else if (token.type === 'symbol' && token.value === ')') depth = Math.max(0, depth - 1);
+      }
+      if (close === -1) {
+        i = n;
+        continue;
+      }
+      tokens.push({ type: 'symbol', value: '*/', pos: close, depth });
+      i = close + 2;
       continue;
     }
 

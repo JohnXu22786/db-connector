@@ -110,6 +110,18 @@ test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement('DELETE /* c */ FROM t').kind, 'write');
 });
 
+test('MySQL comments cannot hide SELECT writes from classification', () => {
+  for (const sql of [
+    "SELECT 1--2 INTO OUTFILE '/tmp/x'",
+    "SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */",
+  ]) {
+    assert.equal(classifyStatement(sql).kind, 'write', sql);
+    assert.equal(isReadStatement(sql), false, sql);
+  }
+
+  assert.equal(classifyStatement('SELECT /*! SQL_NO_CACHE */ 1').kind, 'select');
+});
+
 test('CTE (WITH) statements resolve to their real data statement', () => {
   assert.equal(classifyStatement('WITH c AS (SELECT 1) SELECT * FROM c').kind, 'select');
   assert.equal(
