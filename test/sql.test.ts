@@ -149,6 +149,15 @@ test('single-statement enforcement ignores semicolons in strings/comments', () =
   });
 });
 
+test('single-statement enforcement allows semicolons inside CREATE TRIGGER bodies', () => {
+  assert.doesNotThrow(() => assertSingleStatement(
+    'CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); UPDATE t SET x = 1 WHERE id = new.id; END;',
+  ));
+  assert.throws(() => assertSingleStatement(
+    'CREATE TRIGGER trg AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.id); END; SELECT 1;',
+  ), DbConnectorError);
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',
