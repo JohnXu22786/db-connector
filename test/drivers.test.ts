@@ -301,3 +301,69 @@ test('MySQL rejects an aborted queued request without starting a transaction', a
 
   assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'SELECT first', 'ROLLBACK']);
 });
+
+test('MySQL invalidates an active connection abort before a queued request runs', async () => {
+  const events: string[] = [];
+  const statement = deferred<[unknown, unknown]>();
+  const started = deferred<void>();
+  let destroyed = false;
+  const destroyedError = () => {
+    throw new Error('connection destroyed');
+  };
+  const conn: MysqlConnectionStub = {
+    execute: async (sql) => {
+      if (destroyed) return destroyedError();
+      events.push(sql);
+      if (sql === 'SELECT first') {
+        started.resolve();
+        return statement.promise;
+      }
+      return [{ affectedRows: 1 }, []];
+    },
+    query: async (sql) => {
+      if (destroyed) return destroyedError();
+      events.push(sql);
+      return [[], []];
+    },
+    beginTransaction: async () => {
+      if (destroyed) return destroyedError();
+      events.push('BEGIN');
+    },
+    commit: async () => {
+      if (destroyed) return destroyedError();
+      events.push('COMMIT');
+    },
+    rollback: async () => {
+      if (destroyed) return destroyedError();
+      events.push('ROLLBACK');
+    },
+    destroy: () => {
+      destroyed = true;
+      events.push('DESTROY');
+    },
+    end: async () => {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), {
+    debug() {},
+    info() {},
+    warn() {},
+  });
+  installMysqlConnection(driver, conn);
+
+  const activeAbort = new AbortController();
+  const active = driver.read('SELECT first', [], activeAbort.signal);
+  await started.promise;
+  const queued = driver.write('UPDATE second', [], false, new AbortController().signal);
+
+  activeAbort.abort(new Error('query timeout'));
+  statement.resolve([[{ value: 1 }], []]);
+
+  const activeError = await active.then(() => undefined, (err: unknown) => err);
+  const queuedError = await queued.then(() => undefined, (err: unknown) => err);
+
+  assert.ok(activeError instanceof DbConnectorError);
+  assert.equal((activeError as DbConnectorError).code, ErrorCode.Timeout);
+  assert.ok(queuedError instanceof DbConnectorError);
+  assert.equal((queuedError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+  assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'SELECT first', 'DESTROY']);
+});

@@ -85,42 +85,45 @@ export class MysqlDriver implements DriverApi {
     fn: (conn: MysqlConnection) => Promise<unknown>,
     signal: AbortSignal,
   ): Promise<unknown> {
-    const conn = this.ensure();
     return this.transactionMutex.runExclusive(
-      () => new Promise((resolve, reject) => {
-        let settled = false;
-        let abortError: DbConnectorError | undefined;
-        const cleanup = () => signal.removeEventListener('abort', onAbort);
-        const succeed = (value: unknown) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          resolve(value);
-        };
-        const fail = (err: unknown) => {
-          if (settled) return;
-          settled = true;
-          cleanup();
-          reject(toConnectorError(this.spec, err));
-        };
-        const onAbort = () => {
-          if (settled || abortError) return;
-          conn.destroy(); // kills the in-flight query server-side
-          abortError = cancelError(signal);
-        };
-        if (signal.aborted) {
-          fail(cancelError(signal));
-          return;
-        }
-        signal.addEventListener('abort', onAbort, { once: true });
-        fn(conn).then(
-          (value) => {
-            if (abortError) fail(abortError);
-            else succeed(value);
-          },
-          (err) => fail(abortError ?? err),
-        );
-      }),
+      () => {
+        const conn = this.ensure();
+        return new Promise((resolve, reject) => {
+          let settled = false;
+          let abortError: DbConnectorError | undefined;
+          const cleanup = () => signal.removeEventListener('abort', onAbort);
+          const succeed = (value: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(value);
+          };
+          const fail = (err: unknown) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(toConnectorError(this.spec, err));
+          };
+          const onAbort = () => {
+            if (settled || abortError) return;
+            if (this.conn === conn) this.conn = null;
+            conn.destroy(); // kills the in-flight query server-side
+            abortError = cancelError(signal);
+          };
+          if (signal.aborted) {
+            fail(cancelError(signal));
+            return;
+          }
+          signal.addEventListener('abort', onAbort, { once: true });
+          fn(conn).then(
+            (value) => {
+              if (abortError) fail(abortError);
+              else succeed(value);
+            },
+            (err) => fail(abortError ?? err),
+          );
+        });
+      },
       {
         signal,
         onAbort: () => cancelError(signal),
