@@ -30,6 +30,7 @@ interface CacheEntry {
 
 export class SchemaService {
   private readonly cache = new Map<string, CacheEntry>();
+  private readonly latestIntrospection = new Map<string, symbol>();
 
   constructor(private readonly ttlMs: number) {}
 
@@ -42,12 +43,22 @@ export class SchemaService {
     const fresh = Boolean(
       !req.refresh && cached && Date.now() - cached.at < this.ttlMs,
     );
-    const base = fresh
-      ? cached!.snapshot
-      : buildSnapshot(connection, await driver.introspect(req.signal));
-
-    if (!fresh) {
-      this.cache.set(connection, { at: Date.now(), snapshot: base });
+    let base: Omit<SchemaResult, 'fromCache'>;
+    if (fresh) {
+      base = cached!.snapshot;
+    } else {
+      const request = Symbol();
+      this.latestIntrospection.set(connection, request);
+      try {
+        base = buildSnapshot(connection, await driver.introspect(req.signal));
+        if (this.latestIntrospection.get(connection) === request) {
+          this.cache.set(connection, { at: Date.now(), snapshot: base });
+        }
+      } finally {
+        if (this.latestIntrospection.get(connection) === request) {
+          this.latestIntrospection.delete(connection);
+        }
+      }
     }
 
     const filter = normalizeFilter(req.filter);
@@ -86,10 +97,12 @@ export class SchemaService {
   /** Drop a connection's cached snapshot (e.g. after DDL). */
   invalidate(connection: string): void {
     this.cache.delete(connection);
+    this.latestIntrospection.delete(connection);
   }
 
   clear(): void {
     this.cache.clear();
+    this.latestIntrospection.clear();
   }
 }
 
