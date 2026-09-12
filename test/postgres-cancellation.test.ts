@@ -296,6 +296,12 @@ class FailingCancellationClient extends EventEmitter implements PgClient {
   async end(): Promise<void> {}
 }
 
+class DelayedFailingCancellationClient extends FailingCancellationClient {
+  override cancel(_client: PgClient, _query: object): void {
+    setTimeout(() => this.connection.emit('error', new Error('cancel connection failed')), 10);
+  }
+}
+
 class TlsCancellationConnection extends EventEmitter {
   readonly connectCalls: Array<[number | string, string | undefined]> = [];
   requestSslCalls = 0;
@@ -364,10 +370,24 @@ class TlsCancellationClient extends EventEmitter implements PgClient {
 
 class QueuedPureJsClientStub implements PgClient {
   activeQuery: PgQuery | undefined;
-  readonly queuedQueries: PgQuery[] = [];
+  readonly _queryQueue: PgQuery[] = [];
   cancelledQueuedQueries = 0;
   processID = 123;
   secretKey = 456;
+  destroyedError: Error | undefined;
+  readonly connection = {
+    stream: {
+      destroy: (error?: Error) => {
+        this.destroyedError = error;
+        this.activeQuery = undefined;
+        this._queryQueue.length = 0;
+      },
+    },
+  };
+
+  get queuedQueries(): PgQuery[] {
+    return this._queryQueue;
+  }
 
   async connect(): Promise<void> {}
 
@@ -376,7 +396,7 @@ class QueuedPureJsClientStub implements PgClient {
       return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
     }
     const query = input as PgQuery;
-    if (this.activeQuery) this.queuedQueries.push(query);
+    if (this.activeQuery) this._queryQueue.push(query);
     else this.activeQuery = query;
     return query;
   }
@@ -387,11 +407,75 @@ class QueuedPureJsClientStub implements PgClient {
       query.callback(new Error('canceling statement due to user request'));
       return;
     }
-    const index = this.queuedQueries.indexOf(query);
+    const index = this._queryQueue.indexOf(query);
     if (index >= 0) {
-      this.queuedQueries.splice(index, 1);
+      this._queryQueue.splice(index, 1);
       this.cancelledQueuedQueries += 1;
     }
+  }
+
+  async end(): Promise<void> {}
+}
+
+class PipelinedClientStub extends EventEmitter implements PgClient {
+  _activeQuery: PgQuery | undefined;
+  readonly _queryQueue: PgQuery[] = [];
+  readonly _sentQueryQueue: PgQuery[] = [];
+  readonly pipeline = true;
+  sentCancelled = 0;
+  allowNewQueries = false;
+  objectQueryCount = 0;
+
+  async connect(): Promise<void> {}
+
+  query(input: unknown): unknown {
+    if (typeof input === 'string') {
+      return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+    }
+
+    const query = input as PgQuery;
+    this.objectQueryCount += 1;
+    if (this._activeQuery) this._sentQueryQueue.push(query);
+    else this._activeQuery = query;
+
+    if (this.allowNewQueries) {
+      queueMicrotask(() => {
+        if (this._activeQuery === query) this._activeQuery = undefined;
+        query.callback(null, { fields: [], rows: [], rowCount: 0 });
+        this.emit('drain');
+      });
+    }
+    return query;
+  }
+
+  cancel(query: PgQuery): void {
+    if (this._activeQuery === query) {
+      this._activeQuery = undefined;
+      query.callback(new Error('canceling statement due to user request'));
+      return;
+    }
+    const queueIndex = this._queryQueue.indexOf(query);
+    if (queueIndex >= 0) {
+      this._queryQueue.splice(queueIndex, 1);
+      return;
+    }
+    const sentIndex = this._sentQueryQueue.indexOf(query);
+    if (sentIndex >= 0) {
+      this.sentCancelled += 1;
+    }
+  }
+
+  completeSentQueries(): void {
+    const sentQueries = this._sentQueryQueue.splice(0);
+    this.allowNewQueries = true;
+    for (const query of sentQueries) {
+      query.callback(null, { fields: [], rows: [], rowCount: 0 });
+    }
+  }
+
+  releaseSentQueries(): void {
+    this.completeSentQueries();
+    this.emit('drain');
   }
 
   async end(): Promise<void> {}
@@ -505,6 +589,81 @@ test('transactional writes fail promptly when the cancellation connection fails'
     }
     assert.ok(client.destroyedError);
     assert.deepEqual(client.statements, ['BEGIN']);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('introspection waits for an active cancellation failure before releasing its dead client', async () => {
+  const client = new QueuedPureJsClientStub();
+  const driver = driverWithClient(client, DelayedFailingCancellationClient, pg.Query);
+  const controller = new AbortController();
+  const pending = driver.introspect(controller.signal);
+
+  try {
+    for (let attempt = 0; attempt < 10 && client._queryQueue.length < 5; attempt += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(client._queryQueue.length, 5);
+    controller.abort(new Error('query timeout'));
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await assert.rejects(
+        Promise.race([
+          pending,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error('cancellation hung')), 1000);
+          }),
+        ]),
+        (err: unknown) =>
+          err instanceof DbConnectorError &&
+          err.code === ErrorCode.QueryFailed &&
+          err.message.includes('cancel connection failed'),
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+
+    assert.ok(client.destroyedError, 'active cancellation failure should destroy the client');
+    assert.equal((driver as unknown as { client: PgClient | null }).client, null);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('pipeline cancellation waits for sent queries but removes queued queries', async () => {
+  const client = new PipelinedClientStub();
+  const driver = driverWithClient(client, PipelinedClientStub, pg.Query);
+  const controller = new AbortController();
+  const pending = driver.introspect(controller.signal);
+
+  try {
+    for (let attempt = 0; attempt < 10 && client._sentQueryQueue.length < 5; attempt += 1) {
+      await Promise.resolve();
+    }
+    assert.equal(client._sentQueryQueue.length, 5);
+    controller.abort(new Error('query timeout'));
+    const rejected = assert.rejects(
+      pending,
+      (err: unknown) => err instanceof DbConnectorError && err.code === ErrorCode.Timeout,
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(client.sentCancelled, 5);
+
+    const next = driver.read('SELECT 42', [], new AbortController().signal);
+    await Promise.resolve();
+    assert.equal(client.objectQueryCount, 6, 'later work must wait for the sent pipeline queries');
+
+    client.completeSentQueries();
+    await Promise.resolve();
+    assert.equal(client.objectQueryCount, 6, 'query callbacks must not release the lock before drain');
+    client.releaseSentQueries();
+    await rejected;
+    const result = await next;
+    assert.deepEqual(result.rows, []);
   } finally {
     await driver.close();
   }
