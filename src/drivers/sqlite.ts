@@ -14,7 +14,8 @@
  * connections are intentionally best-effort).
  *
  * Read-only enforcement is the classifier's gate in the executor plus
- * transaction wrapping for writes on this same serial connection; server
+ * transaction wrapping for transactional writes on this same serial connection;
+ * non-transactional DDL runs directly; server
  * drivers additionally get READ ONLY transactions for reads.
  */
 
@@ -101,6 +102,7 @@ export class SqliteDriver implements DriverApi {
     const child = fork(entry, {
       stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
       env: { ...process.env, [DB_ENV]: this.database },
+      serialization: 'advanced',
     });
     child.unref(); // see refAdd/refDrop
     child.on('message', (msg: ReplyMessage) => {
@@ -233,6 +235,7 @@ export class SqliteDriver implements DriverApi {
   }
 
   async connect(): Promise<void> {
+    if (this.child && !this.closed) return;
     // Verify the database opens and is queryable; surface failures loudly.
     await this.request('query', new AbortController().signal, { sql: 'SELECT 1' });
   }

@@ -10,6 +10,7 @@ import {
   classifyStatement,
   ensureSelectLimit,
   isReadStatement,
+  isNonTransactionalStatement,
   normalizeText,
   rewriteNamedToPositional,
   summarizeSql,
@@ -43,6 +44,23 @@ test('PRAGMA is never trusted on the read path (it can write)', () => {
   assert.equal(classifyStatement('PRAGMA journal_mode = WAL').kind, 'unknown');
   assert.equal(classifyStatement('PRAGMA user_version = 99').kind, 'unknown');
   assert.equal(isReadStatement('PRAGMA journal_mode = WAL'), false);
+});
+
+test('non-transactional statement detection covers SQLite PRAGMAs and PostgreSQL commands', () => {
+  assert.equal(isNonTransactionalStatement('PRAGMA journal_mode = WAL', 'sqlite'), true);
+  assert.equal(isNonTransactionalStatement('PRAGMA user_version = 99', 'sqlite'), true);
+  assert.equal(isNonTransactionalStatement('PRAGMA journal_mode = WAL', 'postgres'), false);
+
+  for (const sql of [
+    'ALTER SYSTEM SET work_mem = 64MB',
+    'CREATE DATABASE app_db',
+    'DROP DATABASE app_db',
+    'CREATE TABLESPACE app_ts LOCATION \'/var/lib/postgresql/data\'',
+    'DROP TABLESPACE app_ts',
+    'REFRESH MATERIALIZED VIEW CONCURRENTLY app_mv',
+  ]) {
+    assert.equal(isNonTransactionalStatement(sql, 'postgres'), true, sql);
+  }
 });
 
 test('EXPLAIN ANALYZE classifies by its real statement', () => {

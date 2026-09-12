@@ -101,22 +101,19 @@ export class Connectors {
         `connection "${name}" is not defined; run db_connect first`,
       );
     }
-    if (rec.opening) return rec.opening;
     if (rec.driver) {
       const driver = rec.driver;
-      const opening = (async () => {
-        await driver.connect();
-        rec.status = 'connected';
-        rec.lastUsedAt = new Date().toISOString();
-        return driver;
-      })();
-      rec.opening = opening;
+      const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
       try {
-        return await opening;
+        await opening;
       } finally {
         if (rec.opening === opening) rec.opening = null;
       }
+      rec.lastUsedAt = new Date().toISOString();
+      rec.status = 'connected';
+      return driver;
     }
+    if (rec.opening) return rec.opening;
 
     rec.opening = (async () => {
       let spec = rec.spec;

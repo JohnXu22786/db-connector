@@ -31,6 +31,31 @@ test('db query returns columns, JSON-safe rows, and an audit id', async () => {
   assert.ok(result.durationMs >= 0);
 });
 
+test('empty query results retain column metadata', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    {
+      connection: 'sample',
+      sql: 'SELECT id, email, NULL AS marker FROM users WHERE 1 = 0',
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.deepEqual(result.columns, ['id', 'email', 'marker']);
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.rowCount, 0);
+});
+
+test('duplicate query labels retain values for each selected expression', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT id AS value, age AS value FROM users WHERE id = 1', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.columns, ['value', 'value']);
+  assert.deepEqual(result.rows, [[1, 30]]);
+});
+
 test('read-only gate rejects writes through db_query and records a denial', async () => {
   const h = await setup();
   await assert.rejects(
@@ -48,6 +73,19 @@ test('read-only gate rejects writes through db_query and records a denial', asyn
   assert.equal(stillThere[0]![0], 2);
   const { records } = await h.engine.audit({});
   assert.ok(records.some((r) => r.kind === 'denied' && r.status === 'denied'));
+});
+
+test('write approval message allows for statements that need autocommit', async () => {
+  const h = await setup();
+  await assert.rejects(
+    h.engine.exec({ connection: 'sample', sql: 'VACUUM', way: 'cli' }, freshSignal()),
+    (e: DbConnectorError) => {
+      assert.equal(e.code, 'WRITE_NOT_ALLOWED');
+      assert.match(e.message, /transaction protection is used where supported/i);
+      assert.doesNotMatch(e.message, /execution is wrapped in a transaction/i);
+      return true;
+    },
+  );
 });
 
 test('read-only gate rejects DDL and unknown statements too', async () => {
@@ -148,6 +186,34 @@ test('write approval allows with allowWrite and returns affected rows + note', a
   assert.equal(result.note.includes('roll'), true);
 });
 
+test('SQLite VACUUM runs outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'VACUUM', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'ddl');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.affectedRows, 0);
+  assert.match(result.note, /without a transaction/i);
+  assert.doesNotMatch(result.note, /inside a transaction/i);
+});
+
+test('SQLite write PRAGMAs run outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'PRAGMA journal_mode = WAL', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'write');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.affectedRows, 0);
+  assert.match(result.note, /without a transaction/i);
+  assert.doesNotMatch(result.note, /inside a transaction/i);
+});
+
 test('failed write rolls back (no partial rows survive)', async () => {
   const h = await setup();
   // Updating id=2 to a duplicate email violates the UNIQUE constraint.
@@ -199,6 +265,41 @@ test('parameterized values cannot inject SQL', async () => {
     freshSignal(),
   );
   assert.equal(n[0]![0], 3);
+});
+
+test('SQLite binary parameters survive child IPC and results serialize as base64', async () => {
+  const h = await setup();
+  const buffer = Buffer.from([0, 1, 2, 254, 255]);
+  const bytes = Uint8Array.from([255, 254, 2, 1, 0]);
+
+  await h.engine.exec(
+    {
+      connection: 'sample',
+      sql: 'CREATE TABLE blobs(id INTEGER PRIMARY KEY, value BLOB)',
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  await h.engine.exec(
+    {
+      connection: 'sample',
+      sql: 'INSERT INTO blobs(value) VALUES(?), (?)',
+      params: [buffer, bytes],
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT value FROM blobs ORDER BY id', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [
+    [buffer.toString('base64')],
+    [Buffer.from(bytes).toString('base64')],
+  ]);
 });
 
 test('named parameters bind in order', async () => {
@@ -356,4 +457,3 @@ test('an audit write failure never breaks the executed statement', async () => {
   assert.deepEqual(q.rows, [['kept']]);
   assert.ok(h.audit.failed > 0);
 });
-

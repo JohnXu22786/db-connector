@@ -13,6 +13,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { isNonTransactionalStatement } from '../sql.js';
 
 interface Request {
   id: number;
@@ -42,15 +43,21 @@ const db = new DatabaseSync(database);
 
 function runQuery(req: Request): unknown {
   const stmt = db.prepare(req.sql ?? '');
-  const rows = stmt.all(...(req.params ?? []) as never[]);
-  const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
-  const data = rows.map((r) =>
-    columns.map((c) => (r as Record<string, unknown>)[c] ?? null),
-  );
+  const columns = stmt.columns().map((column) => column.name);
+  stmt.setReturnArrays(true);
+  const rows = stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][];
+  const data = rows.map((row) => row.map((value) => value ?? null));
   return { columns, rows: data, rowCount: data.length };
 }
 
 function runWrite(req: Request): unknown {
+  // SQLite's VACUUM command cannot run while a transaction is active.
+  if (isNonTransactionalStatement(req.sql ?? '', 'sqlite')) {
+    const stmt = db.prepare(req.sql ?? '');
+    stmt.run(...(req.params ?? []) as never[]);
+    return { affectedRows: 0, isDdl: req.isDdl === true };
+  }
+
   db.exec('BEGIN');
   try {
     const stmt = db.prepare(req.sql ?? '');
@@ -108,14 +115,14 @@ function runSchema(): unknown {
 
   const quote = (name: string): string => name.replaceAll('"', '""');
 
-  for (const table of tables) {
+  const readColumns = (object: { name: string; sql?: string }): void => {
     const cols = db
-      .prepare(`PRAGMA table_info("${quote(table.name)}")`)
+      .prepare(`PRAGMA table_info("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
-    const hasAutoincrement = /AUTOINCREMENT/i.test(table.sql ?? '');
+    const hasAutoincrement = /AUTOINCREMENT/i.test(object.sql ?? '');
     for (const c of cols) {
       columns.push({
-        table: table.name,
+        table: object.name,
         name: c.name,
         type: c.type || 'ANY',
         nullable: c.notnull === 0 && c.pk === 0,
@@ -125,6 +132,10 @@ function runSchema(): unknown {
         extra: c.pk > 0 && hasAutoincrement ? 'AUTOINCREMENT' : undefined,
       });
     }
+  };
+
+  for (const table of tables) {
+    readColumns(table);
 
     const idxRows = db
       .prepare(`PRAGMA index_list("${quote(table.name)}")`)
@@ -173,6 +184,8 @@ function runSchema(): unknown {
     }
     foreignKeys.push(...grouped.values());
   }
+
+  for (const view of views) readColumns(view);
 
   return { tables, views, columns, indexes, foreignKeys };
 }

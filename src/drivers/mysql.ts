@@ -14,6 +14,11 @@ import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
+  execute(options: {
+    sql: string;
+    values?: unknown[];
+    rowsAsArray?: boolean;
+  }): Promise<[unknown, unknown]>;
   query(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   beginTransaction(): Promise<void>;
   commit(): Promise<void>;
@@ -135,15 +140,15 @@ export class MysqlDriver implements DriverApi {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
       try {
-        const [rows] = await conn.execute(sql, params);
+        const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
         await conn.query('ROLLBACK');
-        return rows;
+        return { rows, fields };
       } catch (err) {
         await conn.query('ROLLBACK').catch(() => {});
         throw err;
       }
     }, signal);
-    return outcomeOf(result as Array<Record<string, unknown>>);
+    return outcomeOf(result as MysqlReadResult);
   }
 
   async write(
@@ -188,31 +193,7 @@ export class MysqlDriver implements DriverApi {
       else tablesOut.push(entry);
     }
 
-    // group index rows (statistics yields one row per column)
-    const indexMap = new Map<string, {
-      table: string; unique: boolean; primary: boolean; columns: string[];
-    }>();
-    for (const s of statRows) {
-      const key = `${String(s.table_name)}:${String(s.index_name)}`;
-      let entry = indexMap.get(key);
-      if (!entry) {
-        entry = {
-          table: String(s.table_name),
-          unique: Number(s.non_unique) === 0,
-          primary: String(s.index_name) === 'PRIMARY',
-          columns: [],
-        };
-        indexMap.set(key, entry);
-      }
-      entry.columns.push(String(s.column_name));
-    }
-    const indexesOut = [...indexMap.values()].map((e) => ({
-      name: `${e.primary ? 'PRIMARY' : 'idx'}_${e.table}`,
-      table: e.table,
-      columns: e.columns,
-      unique: e.unique,
-      primary: e.primary,
-    }));
+    const indexesOut = indexesFromStatistics(statRows);
 
     const fkMap = new Map<string, {
       name: string; table: string; columns: string[];
@@ -265,9 +246,47 @@ export class MysqlDriver implements DriverApi {
   }
 }
 
-function outcomeOf(rows: Array<Record<string, unknown>>): ReadOutcome {
-  const columns = rows.length > 0 ? Object.keys(rows[0]!) : [];
-  const aligned = rows.map((r) => columns.map((c) => r[c] ?? null));
+interface MysqlReadResult {
+  rows: unknown[][];
+  fields: Array<{ name: string }>;
+}
+
+export function indexesFromStatistics(
+  statRows: ReadonlyArray<Record<string, unknown>>,
+): Introspection['indexes'] {
+  // group index rows (statistics yields one row per column)
+  const indexMap = new Map<string, {
+    name: string; table: string; unique: boolean; primary: boolean; columns: string[];
+  }>();
+  for (const s of statRows) {
+    const table = String(s.table_name);
+    const name = String(s.index_name);
+    const key = JSON.stringify([table, name]);
+    let entry = indexMap.get(key);
+    if (!entry) {
+      entry = {
+        name,
+        table,
+        unique: Number(s.non_unique) === 0,
+        primary: name === 'PRIMARY',
+        columns: [],
+      };
+      indexMap.set(key, entry);
+    }
+    entry.columns.push(String(s.column_name));
+  }
+  return [...indexMap.values()].map((e) => ({
+    name: e.name,
+    table: e.table,
+    columns: e.columns,
+    unique: e.unique,
+    primary: e.primary,
+  }));
+}
+
+function outcomeOf(result: MysqlReadResult): ReadOutcome {
+  const columns = result.fields.map((field) => field.name);
+  const aligned = result.rows.map((row) => row.map((value) => value ?? null));
   return { columns, rows: aligned, rowCount: aligned.length };
 }
 

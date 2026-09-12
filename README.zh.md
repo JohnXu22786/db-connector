@@ -32,7 +32,7 @@
 
 ## 最低要求
 
-- Node.js **≥ 22.13**（使用内置、无需 flag 的 `node:sqlite`）。
+- Node.js **≥ 22.16**（使用内置、无需 flag 的 `node:sqlite`）。
 - 一个运行中的 `dsh` profile，工具才会出现在 `ctx.tools` 上。
 - **可选** 服务器驱动（peer 依赖，仅在需要相应引擎时装）：
   - PostgreSQL：`npm i pg`
@@ -239,7 +239,7 @@ host:port / 库名与 `auth=env|credentials|inline|none`；错误信息只报环
 ## 驱动说明
 
 - **SQLite** — 内置 `node:sqlite`，零安装。每个连接持有独立子进程，因此超时可**硬终止**一条失控的同步语句（卡在原生 SQLite 代码里的 worker 线程无法 join，会把宿主挂死）。文件型库在超时拆解后可重生恢复；`:memory:` 连接意在测试、尽力而为。
-- **PostgreSQL** — `npm i pg`（可选 peer）。读走 `BEGIN TRANSACTION READ ONLY … ROLLBACK`，写走 `BEGIN/COMMIT/ROLLBACK`，全部以 `$1..$n` 参数化；AbortSignal 透传给客户端。
+- **PostgreSQL** — `npm i pg`（可选 peer）。读走 `BEGIN TRANSACTION READ ONLY … ROLLBACK`；事务型写操作走 `BEGIN/COMMIT/ROLLBACK`，`VACUUM` 和并发索引操作因 PostgreSQL 不允许在事务中执行而直接运行；全部以 `$1..$n` 参数化；AbortSignal 透传给客户端。
 - **MySQL** — `npm i mysql2`（可选 peer）。读走 `READ ONLY` 事务；写走 `beginTransaction/commit/rollback`，使用服务端预处理语句；取消时销毁连接并在下次使用时重连。
 
 ---

@@ -31,7 +31,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.16.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -58,6 +58,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.13.0",
     "typescript": "^5.9.0"
   },
   "author": "JohnXu22786",
