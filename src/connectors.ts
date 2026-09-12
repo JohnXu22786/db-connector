@@ -35,6 +35,7 @@ interface ConnectorRecord {
   closing: boolean;
   closeSignal: Promise<void>;
   signalClose: () => void;
+  closingPromise: Promise<void> | null;
 }
 
 const DEFAULT_LOGGER: DriverLogger = { debug() {}, info() {}, warn() {} };
@@ -68,6 +69,7 @@ export class Connectors {
       closing: false,
       closeSignal,
       signalClose,
+      closingPromise: null,
     });
     return this.statusOf(resolved.name, this.map.get(resolved.name)!);
   }
@@ -190,27 +192,33 @@ export class Connectors {
     await rec.driver?.close().catch(() => {});
   }
 
+  private startClose(name: string, rec: ConnectorRecord): Promise<void> {
+    if (rec.closingPromise) return rec.closingPromise;
+    const opening = rec.opening;
+    rec.closing = true;
+    rec.signalClose();
+    const closing = (async () => {
+      await this.closeRecord(rec, opening);
+      if (this.map.get(name) === rec) this.map.delete(name);
+    })();
+    rec.closingPromise = closing;
+    return closing;
+  }
+
   /** Close and forget a connection. Unknown names are a no-op. */
   async close(name: string): Promise<void> {
     const rec = this.map.get(name);
     if (!rec) return;
-    const opening = rec.opening;
-    rec.closing = true;
-    rec.signalClose();
-    this.map.delete(name);
-    await this.closeRecord(rec, opening);
-    this.logger.info('db-connector: closed connection %s', name);
+    const alreadyClosing = rec.closingPromise !== null;
+    await this.startClose(name, rec);
+    if (!alreadyClosing) this.logger.info('db-connector: closed connection %s', name);
   }
 
   /** Close every open connection (plugin teardown). */
   async closeAll(): Promise<void> {
     const pending: Promise<void>[] = [];
     for (const [name, rec] of this.map) {
-      const opening = rec.opening;
-      rec.closing = true;
-      rec.signalClose();
-      this.map.delete(name);
-      pending.push(this.closeRecord(rec, opening));
+      pending.push(this.startClose(name, rec));
     }
     await Promise.all(pending);
   }

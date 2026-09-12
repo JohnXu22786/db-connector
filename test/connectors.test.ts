@@ -18,6 +18,10 @@ function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
   return { promise, resolve };
 }
 
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 function makeFakeDriver(
   onConnect: () => Promise<void> = async () => {},
   onClose: () => Promise<void> = async () => {},
@@ -201,6 +205,72 @@ test('open cannot return a driver while closeAll is in progress', async () => {
   releaseClose.resolve();
   await Promise.all([closing, concurrentOpen]);
   assert.equal(closeCalls, 1);
+});
+
+test('close reserves the name and shares in-progress teardown', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeCalls += 1;
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const firstClose = h.connectors.close('a');
+  await closeStarted.promise;
+  assert.throws(
+    () => h.connectors.define({ name: 'a', driver: 'sqlite' }),
+    (e: DbConnectorError) => e.code === 'CONNECTION_EXISTS',
+  );
+
+  let secondFinished = false;
+  const secondClose = h.connectors.close('a').then(() => {
+    secondFinished = true;
+  });
+  await nextTurn();
+  assert.equal(secondFinished, false);
+
+  releaseClose.resolve();
+  await Promise.all([firstClose, secondClose]);
+  assert.equal(closeCalls, 1);
+  assert.equal(h.connectors.has('a'), false);
+});
+
+test('closeAll reserves names and shares in-progress teardown', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  let closeCalls = 0;
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeCalls += 1;
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const firstCloseAll = h.connectors.closeAll();
+  await closeStarted.promise;
+  assert.throws(
+    () => h.connectors.define({ name: 'a', driver: 'sqlite' }),
+    (e: DbConnectorError) => e.code === 'CONNECTION_EXISTS',
+  );
+
+  let secondFinished = false;
+  const secondCloseAll = h.connectors.closeAll().then(() => {
+    secondFinished = true;
+  });
+  await nextTurn();
+  assert.equal(secondFinished, false);
+
+  releaseClose.resolve();
+  await Promise.all([firstCloseAll, secondCloseAll]);
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(h.connectors.list(), []);
 });
 
 test('touch increments the execution counter and updates last-used', async () => {
