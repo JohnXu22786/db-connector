@@ -128,3 +128,40 @@ test('MysqlDriver uses the URI host and port for mysql2 connections', async (t) 
 
   assert.deepEqual(target, { host: 'db.example.test', port: 3307 });
 });
+
+test('MysqlDriver uses the URI database for schema introspection', async () => {
+  const schemas: unknown[] = [];
+  const connection = {
+    async query(sql: string, values?: unknown[]) {
+      const database = values?.[0];
+      schemas.push(database);
+      if (sql.includes('information_schema.tables') && database === 'app_db') {
+        return [[{ table_name: 'users', table_type: 'BASE TABLE' }], []];
+      }
+      return [[], []];
+    },
+    async execute() {
+      return [[], []];
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const spec = resolveConnectionSpec(
+    {
+      name: 'uri-schema',
+      driver: 'mysql',
+      connectionString: 'mysql://uri-user:uri-pass@db.example.test:3307/app_db',
+    },
+    {},
+  );
+  const driver = new MysqlDriver(spec, { debug() {}, info() {}, warn() {} });
+  (driver as unknown as { conn: unknown }).conn = connection;
+
+  const introspection = await driver.introspect(new AbortController().signal);
+
+  assert.deepEqual(schemas, ['app_db', 'app_db', 'app_db', 'app_db']);
+  assert.deepEqual(introspection.tables, [{ name: 'users' }]);
+});

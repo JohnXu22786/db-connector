@@ -12,6 +12,7 @@ import type { DriverApi, DriverLogger, Introspection, ReadOutcome, WriteOutcome 
 import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
+  config?: { database?: string };
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   execute(options: {
     sql: string;
@@ -158,7 +159,11 @@ export class MysqlDriver implements DriverApi {
   }
 
   async introspect(signal: AbortSignal): Promise<Introspection> {
-    const schema = this.spec.database ?? '';
+    const schema =
+      this.spec.database ||
+      databaseFromConnectionString(this.spec.connectionString) ||
+      this.conn?.config?.database ||
+      '';
     const [tables, columns, stats, fks] = (await Promise.all([
       this.run(async (conn) => conn.query(QUERIES.tables.text, [schema]), signal),
       this.run(async (conn) => conn.query(QUERIES.columns.text, [schema]), signal),
@@ -279,6 +284,16 @@ function outcomeOf(result: MysqlReadResult): ReadOutcome {
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function databaseFromConnectionString(connectionString: string | undefined): string | undefined {
+  if (!connectionString) return undefined;
+  try {
+    const database = decodeURIComponent(new URL(connectionString).pathname.slice(1));
+    return database || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function cancelError(signal: AbortSignal): DbConnectorError {
