@@ -16,7 +16,7 @@ export interface ReadOutcome {
   rowCount: number;
 }
 
-/** Result of a write / DDL statement executed inside a transaction. */
+/** Result of a write / DDL statement, transactional where supported. */
 export interface WriteOutcome {
   affectedRows: number;
   /** Schema objects created/altered by DDL don't report a row count. */
@@ -65,8 +65,8 @@ export interface DriverApi {
    */
   read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome>;
   /**
-   * Execute a write or DDL statement inside a transaction: COMMIT on success,
-   * ROLLBACK on failure. Must observe `signal`.
+   * Execute a write or DDL statement with transaction protection where
+   * supported: COMMIT on success, ROLLBACK on failure. Must observe `signal`.
    */
   write(sql: string, params: unknown[], isDdl: boolean, signal: AbortSignal): Promise<WriteOutcome>;
   /** Full schema introspection (used by the schema snapshot service). */

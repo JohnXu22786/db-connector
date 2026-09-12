@@ -7,7 +7,7 @@
  *   3. classify the statement; enforce the read-only / write-approval gates
  *   4. bind parameters (positional `?` or named `:param`), never interpolated
  *   5. apply the SELECT guard limit + row cap + deadline (AbortSignal)
- *   6. execute through the driver (writes are transaction-wrapped by drivers)
+ *   6. execute through the driver (transaction protection where supported)
  *   7. write one durable audit record (ok / error / denied) for every call
  *
  * The engine never sees credentials and never logs them; only the sanitized
@@ -19,6 +19,7 @@ import {
   assertSingleStatement,
   classifyStatement,
   ensureSelectLimit,
+  isNonTransactionalStatement,
   isReadStatement,
   rewriteNamedToPositional,
   scan,
@@ -227,8 +228,8 @@ export class ExecutionEngine {
   /**
    * Write-capable executor. INSERT/UPDATE/DELETE/DDL (and anything the
    * classifier cannot read) require the approval gate: `allowWrite` on the
-   * call or the plugin-level `defaultAllowWrite`. Drivers run the statement
-   * inside a transaction — COMMIT on success, ROLLBACK on failure.
+   * call or the plugin-level `defaultAllowWrite`. Drivers use transaction
+   * protection where supported; some statements must run outside a transaction.
    */
   async exec(opts: ExecOptions, signal: AbortSignal): Promise<ExecResult> {
     assertSingleStatement(opts.sql);
@@ -241,7 +242,7 @@ export class ExecutionEngine {
         await this.auditDenied(opts.connection, opts.sql, classification.kind, ErrorCode.WriteNotAllowed, opts.way);
         throw new DbConnectorError(
           ErrorCode.WriteNotAllowed,
-          `write approval gate: "${classification.firstWord || 'statement'}" is a write; pass allowWrite=true to confirm (execution is wrapped in a transaction)`,
+          `write approval gate: "${classification.firstWord || 'statement'}" is a write; pass allowWrite=true to confirm (transaction protection is used where supported; some statements must execute outside a transaction)`,
         );
       }
     }
@@ -251,6 +252,10 @@ export class ExecutionEngine {
     const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     const isDdl = classification.kind === 'ddl';
+    // The classifier deliberately leaves PRAGMA as unknown because it may
+    // write. The driver still needs to bypass its transaction wrapper for
+    // approved non-transactional forms such as SQLite journal_mode changes.
+    const nonTransactional = isNonTransactionalStatement(bound.sql, driver.kind);
 
     try {
       if (readLike) {
@@ -303,10 +308,11 @@ export class ExecutionEngine {
         rolledBack: false,
         durationMs: duration,
         auditId,
-        note: rollbackNote(isDdl, outcome.affectedRows, driver.kind),
+        note: rollbackNote(isDdl, outcome.affectedRows, driver.kind, nonTransactional),
       };
     } catch (err) {
-      const dbErr = wrapWriteError(err, isDdl);
+      if (nonTransactional) this.schemaService.invalidate(opts.connection);
+      const dbErr = wrapWriteError(err, isDdl, nonTransactional);
       const duration = hrtimeMs(started);
       await this.auditFail(opts.connection, opts.sql, isDdl ? 'ddl' : 'write', duration, opts.way, dbErr);
       throw dbErr;
@@ -529,8 +535,15 @@ function rollbackNote(
   isDdl: boolean,
   affectedRows: number,
   driver: import('./types.js').DriverKind,
+  nonTransactional: boolean,
 ): string {
+  if (nonTransactional && !isDdl) {
+    return 'statement executed without a transaction; failures are not rolled back.';
+  }
   if (isDdl) {
+    if (nonTransactional) {
+      return 'DDL executed without a transaction; failures are not rolled back, and the schema snapshot cache has been invalidated.';
+    }
     return driver === 'mysql'
       ? 'DDL ran inside a transaction wrapper, but MySQL DDL implicitly commits — a later failure cannot undo structural changes. The schema snapshot cache has been invalidated.'
       : 'DDL executed inside a transaction (transactional DDL on SQLite/PostgreSQL); a failure rolls back any partially-completed structural change, and the schema snapshot cache has been invalidated.';
@@ -538,17 +551,21 @@ function rollbackNote(
   return `statement executed inside an explicit transaction (${affectedRows} row(s) affected); the transaction commits on success and rolls back on failure — no partial rows survive an error.`;
 }
 
-function wrapWriteError(err: unknown, isDdl: boolean): DbConnectorError {
+function wrapWriteError(err: unknown, isDdl: boolean, nonTransactional: boolean): DbConnectorError {
   if (err instanceof DbConnectorError) {
     if (err.code === ErrorCode.QueryFailed || err.code === ErrorCode.Timeout || err.code === ErrorCode.Cancelled) {
-      // Surface the rollback fact to the caller without leaking internals.
+      // Surface the transaction outcome to the caller without leaking internals.
       const prefix = isDdl ? 'DDL' : 'write';
+      if (nonTransactional) {
+        return new DbConnectorError(err.code, `${prefix} failed without a transaction; partial changes were not rolled back: ${err.message}`, err.details);
+      }
       return new DbConnectorError(err.code, `${prefix} failed and the transaction was rolled back: ${err.message}`, err.details);
     }
     return err;
   }
   const message = err instanceof Error ? err.message : String(err);
+  if (nonTransactional) {
+    return new DbConnectorError(ErrorCode.QueryFailed, `${isDdl ? 'DDL' : 'write'} failed without a transaction; partial changes were not rolled back: ${message}`);
+  }
   return new DbConnectorError(ErrorCode.QueryFailed, `write failed and the transaction was rolled back: ${message}`);
 }
-
-

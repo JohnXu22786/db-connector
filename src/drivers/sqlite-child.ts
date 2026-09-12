@@ -13,6 +13,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
+import { isNonTransactionalStatement } from '../sql.js';
 
 interface Request {
   id: number;
@@ -51,6 +52,13 @@ function runQuery(req: Request): unknown {
 }
 
 function runWrite(req: Request): unknown {
+  // SQLite's VACUUM command cannot run while a transaction is active.
+  if (isNonTransactionalStatement(req.sql ?? '', 'sqlite')) {
+    const stmt = db.prepare(req.sql ?? '');
+    stmt.run(...(req.params ?? []) as never[]);
+    return { affectedRows: 0, isDdl: req.isDdl === true };
+  }
+
   db.exec('BEGIN');
   try {
     const stmt = db.prepare(req.sql ?? '');

@@ -14,6 +14,7 @@
 
 import { ErrorCode, DbConnectorError } from './errors.js';
 import { sha256, truncateMiddle } from './util.js';
+import type { DriverKind } from './types.js';
 
 export type TokenType =
   | 'word'
@@ -295,6 +296,47 @@ export function classifyStatement(sql: string): {
   if (DDL.has(word)) return { kind: 'ddl', firstWord: word };
 
   return { kind: 'unknown', firstWord: word };
+}
+
+/**
+ * Return whether a statement must be sent outside an explicit transaction for
+ * the target database. Only statements known to have that requirement are
+ * included; all other writes retain transaction protection.
+ */
+export function isNonTransactionalStatement(sql: string, driver: DriverKind): boolean {
+  const words = scan(sql)
+    .filter((token) => token.type === 'word' && token.depth === 0)
+    .map((token) => token.value.toUpperCase());
+
+  if (words[0] === 'VACUUM') return driver === 'sqlite' || driver === 'postgres';
+  // SQLite PRAGMAs are intentionally opaque to the read classifier. Some
+  // write forms, notably `PRAGMA journal_mode = WAL`, cannot run inside an
+  // explicit transaction, so execute all PRAGMAs directly once approved.
+  if (words[0] === 'PRAGMA') return driver === 'sqlite';
+  if (driver !== 'postgres') return false;
+
+  if (words[0] === 'ALTER' && words[1] === 'SYSTEM') return true;
+  if (words[0] === 'CREATE' && (words[1] === 'DATABASE' || words[1] === 'TABLESPACE')) return true;
+  if (words[0] === 'DROP' && (words[1] === 'DATABASE' || words[1] === 'TABLESPACE')) return true;
+
+  if (words[0] === 'CREATE') {
+    return (
+      (words[1] === 'INDEX' && words[2] === 'CONCURRENTLY') ||
+      (words[1] === 'UNIQUE' && words[2] === 'INDEX' && words[3] === 'CONCURRENTLY')
+    );
+  }
+  if (words[0] === 'DROP') {
+    return words[1] === 'INDEX' && words[2] === 'CONCURRENTLY';
+  }
+  if (words[0] === 'REINDEX') {
+    const objectType = new Set(['INDEX', 'TABLE', 'SCHEMA', 'DATABASE', 'SYSTEM']);
+    return words[1] === 'CONCURRENTLY' ||
+      (objectType.has(words[1] ?? '') && words[2] === 'CONCURRENTLY');
+  }
+  if (words[0] === 'REFRESH') {
+    return words[1] === 'MATERIALIZED' && words[2] === 'VIEW' && words[3] === 'CONCURRENTLY';
+  }
+  return false;
 }
 
 /**

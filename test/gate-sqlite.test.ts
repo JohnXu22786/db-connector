@@ -50,6 +50,19 @@ test('read-only gate rejects writes through db_query and records a denial', asyn
   assert.ok(records.some((r) => r.kind === 'denied' && r.status === 'denied'));
 });
 
+test('write approval message allows for statements that need autocommit', async () => {
+  const h = await setup();
+  await assert.rejects(
+    h.engine.exec({ connection: 'sample', sql: 'VACUUM', way: 'cli' }, freshSignal()),
+    (e: DbConnectorError) => {
+      assert.equal(e.code, 'WRITE_NOT_ALLOWED');
+      assert.match(e.message, /transaction protection is used where supported/i);
+      assert.doesNotMatch(e.message, /execution is wrapped in a transaction/i);
+      return true;
+    },
+  );
+});
+
 test('read-only gate rejects DDL and unknown statements too', async () => {
   const h = await setup();
   await assert.rejects(
@@ -146,6 +159,34 @@ test('write approval allows with allowWrite and returns affected rows + note', a
   assert.equal(result.rolledBack, false);
   assert.ok(result.note.includes('transaction'));
   assert.equal(result.note.includes('roll'), true);
+});
+
+test('SQLite VACUUM runs outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'VACUUM', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'ddl');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.affectedRows, 0);
+  assert.match(result.note, /without a transaction/i);
+  assert.doesNotMatch(result.note, /inside a transaction/i);
+});
+
+test('SQLite write PRAGMAs run outside the write transaction wrapper', async () => {
+  const h = await setup();
+  const result = await h.engine.exec(
+    { connection: 'sample', sql: 'PRAGMA journal_mode = WAL', allowWrite: true, way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.kind, 'write');
+  assert.equal(result.committed, true);
+  assert.equal(result.rolledBack, false);
+  assert.equal(result.affectedRows, 0);
+  assert.match(result.note, /without a transaction/i);
+  assert.doesNotMatch(result.note, /inside a transaction/i);
 });
 
 test('failed write rolls back (no partial rows survive)', async () => {
@@ -356,4 +397,3 @@ test('an audit write failure never breaks the executed statement', async () => {
   assert.deepEqual(q.rows, [['kept']]);
   assert.ok(h.audit.failed > 0);
 });
-
