@@ -4,7 +4,7 @@
 
 import { strict as assert } from 'node:assert';
 import { mkdtempSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -88,6 +88,47 @@ test('query filters by connection, kind, since, and limit (newest first)', async
   assert.equal(limited.length, 2);
   // newest first: last append (denied b) is first
   assert.equal(limited[0]!.kind, 'denied');
+});
+
+test('query with a zero limit returns no records', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input());
+
+  assert.deepEqual(await log.query({ limit: 0 }), []);
+});
+
+test('since filtering compares ISO timestamps by instant', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: 'SELECT before' }));
+  await log.append(input({ sql: 'SELECT after' }));
+  await log.flush();
+
+  const records = (await readFile(log.path, 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { ts: string; statement: { summary: string } });
+  records[0]!.ts = '2024-01-01T00:00:00+02:00';
+  records[1]!.ts = '2024-01-01T00:30:00Z';
+  await writeFile(log.path, `${records.map((record) => JSON.stringify(record)).join('\n')}\n`);
+
+  const result = await log.query({ since: '2023-12-31T23:00:00Z' });
+  assert.equal(result.length, 1);
+  assert.equal(result[0]!.statement.summary, 'SELECT after');
+});
+
+test('appending to an existing audit file enforces mode 0600', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input());
+  await log.flush();
+  await chmod(log.path, 0o644);
+
+  assert.equal((await stat(log.path)).mode & 0o777, 0o644);
+
+  await log.append(input({ connection: 'c2' }));
+  await log.flush();
+
+  assert.equal((await stat(log.path)).mode & 0o777, 0o600);
+  assert.equal((await log.query({})).length, 2);
 });
 
 test('missing log file returns an empty list', async () => {
