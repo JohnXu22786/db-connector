@@ -396,7 +396,7 @@ const QUERIES = {
     name: 'dsh-db-connector.foreign-keys',
     text: `SELECT rc.constraint_name,
        tc.table_name,
-       array_agg(kcu.column_name) AS column_names,
+       array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS column_names,
        ccu.table_name AS referenced_table,
        (SELECT array_agg(x.column_name ORDER BY x.ordinal_position)
           FROM information_schema.key_column_usage x
@@ -411,10 +411,9 @@ const QUERIES = {
        JOIN (
          SELECT DISTINCT constraint_schema, constraint_name, table_name
            FROM information_schema.constraint_column_usage
-          WHERE constraint_schema = $1
        ) AS ccu
          ON ccu.constraint_name = rc.unique_constraint_name
-        AND ccu.constraint_schema = $1
+        AND ccu.constraint_schema = rc.unique_constraint_schema
        GROUP BY rc.constraint_name, tc.table_name, rc.update_rule, rc.delete_rule, ccu.table_name
        ORDER BY tc.table_name, rc.constraint_name`,
   },

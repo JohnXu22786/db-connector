@@ -2,6 +2,7 @@
 
 import { strict as assert } from 'node:assert';
 import { Client } from 'pg';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { resolveConnectionSpec } from '../dist/config.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
@@ -62,58 +63,146 @@ test(
 interface QueryConfig {
   name?: string;
   text?: string;
+  values?: unknown[];
 }
 
 interface QueryResult {
-  fields: Array<{ name: string }>;
   rows: Array<Record<string, unknown>>;
   rowCount: number | null;
 }
 
-test('PostgreSQL composite foreign keys do not duplicate source columns', async () => {
+test('PostgreSQL composite foreign-key introspection executes the catalog join correctly', async () => {
   const spec = resolveConnectionSpec({ name: 'pg', driver: 'postgres', database: 'app' }, {});
-  const foreignKeyRows: QueryResult = {
-    fields: [],
-    rows: [{
-      constraint_name: 'orders_customer_fk',
-      table_name: 'orders',
-      column_names: ['customer_id', 'customer_region'],
-      referenced_table: 'customers',
-      referenced_columns: ['id', 'region'],
-      on_update: 'NO ACTION',
-      on_delete: 'NO ACTION',
-    }],
-    rowCount: 1,
+  const catalog = new DatabaseSync(':memory:');
+  let catalogClosed = false;
+  const closeCatalog = () => {
+    if (!catalogClosed) {
+      catalog.close();
+      catalogClosed = true;
+    }
   };
-  const emptyResult: QueryResult = { fields: [], rows: [], rowCount: 0 };
-  const captured: QueryConfig[] = [];
-  const client = {
-    async query(query: string | QueryConfig): Promise<QueryResult> {
-      if (typeof query === 'string') return emptyResult;
-      captured.push(query);
-      return query.name === 'dsh-db-connector.foreign-keys' ? foreignKeyRows : emptyResult;
-    },
-    async connect() {},
-    async end() {},
-  };
-  const driver = new PgDriver(spec, { debug() {}, info() {}, warn() {} });
-  (driver as unknown as { client: typeof client }).client = client;
 
-  const introspection = await driver.introspect(new AbortController().signal);
-  const foreignKeyQuery = captured.find((query) => query.name === 'dsh-db-connector.foreign-keys');
+  try {
+    for (const sql of [
+      `CREATE TABLE fixture_referential_constraints (
+         constraint_name TEXT,
+         constraint_schema TEXT,
+         unique_constraint_schema TEXT,
+         unique_constraint_name TEXT,
+         update_rule TEXT,
+         delete_rule TEXT
+       )`,
+      `CREATE TABLE fixture_table_constraints (
+         constraint_name TEXT,
+         constraint_schema TEXT,
+         table_name TEXT
+       )`,
+      `CREATE TABLE fixture_key_column_usage (
+         constraint_name TEXT,
+         constraint_schema TEXT,
+         column_name TEXT,
+         ordinal_position INTEGER,
+         position_in_unique_constraint INTEGER
+       )`,
+      `CREATE TABLE fixture_constraint_column_usage (
+         constraint_name TEXT,
+         constraint_schema TEXT,
+         table_name TEXT,
+         column_name TEXT
+       )`,
+    ]) {
+      catalog.exec(sql);
+    }
+    catalog.exec(`
+      INSERT INTO fixture_referential_constraints VALUES
+        ('orders_local_fk', 'public', 'public', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
+        ('orders_legacy_fk', 'public', 'legacy', 'customers_pkey', 'NO ACTION', 'NO ACTION')
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_table_constraints VALUES
+        ('orders_local_fk', 'public', 'orders'),
+        ('orders_legacy_fk', 'public', 'orders')
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_key_column_usage VALUES
+        ('orders_local_fk', 'public', 'customer_region', 2, 2),
+        ('orders_local_fk', 'public', 'customer_id', 1, 1),
+        ('orders_legacy_fk', 'public', 'legacy_region', 2, 2),
+        ('orders_legacy_fk', 'public', 'legacy_id', 1, 1)
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_constraint_column_usage VALUES
+        ('customers_pkey', 'public', 'customers', 'id'),
+        ('customers_pkey', 'public', 'customers', 'region'),
+        ('customers_pkey', 'legacy', 'legacy_customers', 'id'),
+        ('customers_pkey', 'legacy', 'legacy_customers', 'region')
+    `);
 
-  assert.ok(foreignKeyQuery);
-  assert.match(
-    foreignKeyQuery!.text!,
-    /JOIN\s+\(\s*SELECT DISTINCT constraint_schema, constraint_name, table_name\s+FROM information_schema\.constraint_column_usage\s+WHERE constraint_schema = \$1\s*\) AS ccu/s,
-  );
-  assert.deepEqual(introspection.foreignKeys, [{
-    name: 'orders_customer_fk',
-    table: 'orders',
-    columns: ['customer_id', 'customer_region'],
-    referencedTable: 'customers',
-    referencedColumns: ['id', 'region'],
-    onUpdate: 'NO ACTION',
-    onDelete: 'NO ACTION',
-  }]);
+    const emptyResult: QueryResult = { rows: [], rowCount: 0 };
+    const captured: QueryConfig[] = [];
+    const client = {
+      async query(query: string | QueryConfig): Promise<QueryResult> {
+        if (typeof query === 'string' || query.name !== 'dsh-db-connector.foreign-keys') {
+          return emptyResult;
+        }
+        captured.push(query);
+
+        // SQLite executes the catalog joins and aggregation. These small
+        // rewrites adapt PostgreSQL array_agg and $1 syntax to SQLite while
+        // preserving the query structure under test.
+        const executableText = query.text!
+          .replace(
+            /array_agg\((kcu|x)\.column_name( ORDER BY \1\.ordinal_position)?\)/g,
+            (_match: string, alias: string, orderBy: string | undefined) =>
+              `json_group_array(${alias}.column_name${orderBy ?? ''})`,
+          )
+          .replaceAll('information_schema.', 'fixture_')
+          .replaceAll('$1', '?');
+        const parameterCount = (query.text!.match(/\$1/g) ?? []).length;
+        const rawRows = catalog
+          .prepare(executableText)
+          .all(...Array.from({ length: parameterCount }, () => 'public')) as Array<Record<string, unknown>>;
+        const parseArray = (value: unknown): string[] =>
+          Array.isArray(value) ? value as string[] : JSON.parse(String(value)) as string[];
+        return {
+          rows: rawRows.map((row) => ({
+            ...row,
+            column_names: parseArray(row.column_names),
+            referenced_columns: parseArray(row.referenced_columns),
+          })),
+          rowCount: rawRows.length,
+        };
+      },
+      async connect() {},
+      async end() {
+        closeCatalog();
+      },
+    };
+    const driver = new PgDriver(spec, { debug() {}, info() {}, warn() {} });
+    (driver as unknown as { client: typeof client }).client = client;
+
+    try {
+      const introspection = await driver.introspect(new AbortController().signal);
+      const foreignKeys = new Map(introspection.foreignKeys.map((foreignKey) => [foreignKey.name, foreignKey]));
+      assert.equal(foreignKeys.size, 2, 'same-schema and cross-schema foreign keys should both be returned');
+
+      const local = foreignKeys.get('orders_local_fk');
+      const legacy = foreignKeys.get('orders_legacy_fk');
+      assert.ok(local);
+      assert.ok(legacy);
+      assert.deepEqual(local.columns, ['customer_id', 'customer_region']);
+      assert.deepEqual(legacy.columns, ['legacy_id', 'legacy_region']);
+      assert.equal(local.referencedTable, 'customers');
+      assert.equal(legacy.referencedTable, 'legacy_customers');
+
+      assert.equal(captured.length, 1);
+      assert.match(captured[0]!.text!, /array_agg\(kcu\.column_name ORDER BY kcu\.ordinal_position\)/);
+      assert.match(captured[0]!.text!, /ccu\.constraint_schema = rc\.unique_constraint_schema/);
+      assert.doesNotMatch(captured[0]!.text!, /WHERE constraint_schema = \$1\s*\) AS ccu/s);
+    } finally {
+      await driver.close();
+    }
+  } finally {
+    closeCatalog();
+  }
 });
