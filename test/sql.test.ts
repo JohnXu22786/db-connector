@@ -200,6 +200,13 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(withLimit.applied, false);
   assert.equal(withLimit.sql, 'SELECT id FROM t LIMIT 5');
 
+  const withFetchFirst = ensureSelectLimit(
+    'SELECT id FROM t FETCH FIRST 5 ROWS ONLY',
+    10,
+  );
+  assert.equal(withFetchFirst.applied, false);
+  assert.equal(withFetchFirst.sql, 'SELECT id FROM t FETCH FIRST 5 ROWS ONLY');
+
   const added = ensureSelectLimit('SELECT id FROM t', 10);
   assert.equal(added.applied, true);
   assert.equal(added.sql, 'SELECT id FROM t LIMIT 10');

@@ -514,8 +514,8 @@ export function rewriteNamedToPositional(
 
 /**
  * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * already. Used only as a courtesy guard: the executor always caps rows on the
- * consuming side no matter what this returns.
+ * or FETCH FIRST/NEXT clause already. Used only as a courtesy guard: the
+ * executor always caps rows on the consuming side no matter what this returns.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -525,10 +525,16 @@ export function ensureSelectLimit(
   if (kind !== 'select') return { sql, applied: false };
 
   const tokens = meaningful(sql);
-  const hasTopLevelLimit = tokens.some(
-    (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
-  );
-  if (hasTopLevelLimit) return { sql, applied: false };
+  const hasTopLevelRowCap = tokens.some((t, index) => {
+    if (t.type !== 'word' || t.depth !== 0) return false;
+    const word = t.value.toUpperCase();
+    if (word === 'LIMIT') return true;
+    const next = tokens[index + 1];
+    return word === 'FETCH' && next?.type === 'word' && next.depth === 0 && (
+      next.value.toUpperCase() === 'FIRST' || next.value.toUpperCase() === 'NEXT'
+    );
+  });
+  if (hasTopLevelRowCap) return { sql, applied: false };
 
   assertSingleStatement(sql);
   const upper = Math.max(1, Math.floor(limit));
