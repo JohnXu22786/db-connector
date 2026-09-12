@@ -37,7 +37,7 @@ cover.
 
 ## Minimum requirements
 
-- Node.js **≥ 22.13** (uses the built-in, unflagged `node:sqlite`).
+- Node.js **≥ 22.16** (uses the built-in, unflagged `node:sqlite`).
 - A running `dsh` profile for the tools to show up on `ctx.tools`.
 - **Optional** server drivers (peer dependencies, only needed for those engines):
   - PostgreSQL: `npm i pg`

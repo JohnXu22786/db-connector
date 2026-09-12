@@ -32,7 +32,7 @@
 
 ## 最低要求
 
-- Node.js **≥ 22.13**（使用内置、无需 flag 的 `node:sqlite`）。
+- Node.js **≥ 22.16**（使用内置、无需 flag 的 `node:sqlite`）。
 - 一个运行中的 `dsh` profile，工具才会出现在 `ctx.tools` 上。
 - **可选** 服务器驱动（peer 依赖，仅在需要相应引擎时装）：
   - PostgreSQL：`npm i pg`
