@@ -5,6 +5,86 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 
+export interface AsyncMutexOptions {
+  signal?: AbortSignal;
+  onAbort?: () => unknown;
+}
+
+/** Serialize asynchronous work while preserving request order. */
+export class AsyncMutex {
+  private tail = Promise.resolve();
+
+  async runExclusive<T>(
+    work: () => Promise<T>,
+    options: AsyncMutexOptions = {},
+  ): Promise<T> {
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    if (options.signal) {
+      await this.waitForTurn(previous, release, options.signal, options.onAbort);
+      if (options.signal.aborted) {
+        release();
+        throw this.abortError(options.onAbort);
+      }
+    } else {
+      await previous;
+    }
+
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  private waitForTurn(
+    previous: Promise<void>,
+    release: () => void,
+    signal: AbortSignal,
+    onAbort?: () => unknown,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let waiting = true;
+      const onSignalAbort = () => {
+        if (!waiting) return;
+        waiting = false;
+        signal.removeEventListener('abort', onSignalAbort);
+        void previous.then(release);
+        reject(this.abortError(onAbort));
+      };
+
+      if (signal.aborted) {
+        onSignalAbort();
+        return;
+      }
+      signal.addEventListener('abort', onSignalAbort, { once: true });
+      void previous.then(() => {
+        if (!waiting) return;
+        waiting = false;
+        signal.removeEventListener('abort', onSignalAbort);
+        if (signal.aborted) {
+          release();
+          reject(this.abortError(onAbort));
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  private abortError(onAbort?: () => unknown): unknown {
+    try {
+      return onAbort?.() ?? new Error('mutex wait aborted');
+    } catch (err) {
+      return err;
+    }
+  }
+}
+
 const MAX_TIMEOUT_MS = 2_147_483_647;
 
 /** sha256 hex digest of a string (used for audit statement digests). */
