@@ -233,6 +233,7 @@ export class SqliteDriver implements DriverApi {
   }
 
   async connect(): Promise<void> {
+    if (this.child && !this.closed) return;
     // Verify the database opens and is queryable; surface failures loudly.
     await this.request('query', new AbortController().signal, { sql: 'SELECT 1' });
   }
