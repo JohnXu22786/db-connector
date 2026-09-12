@@ -292,8 +292,8 @@ function cancelQuery(
   };
   for (const source of sources) addListener(source, 'error', errorListener);
   try {
-    if (cancelClient.ssl && connection) {
-      if (!connection.requestSsl || !connection.cancel) {
+    if (cancelClient.ssl) {
+      if (!connection || !connection.requestSsl || !connection.cancel) {
         throw new Error('pg cancellation connection does not support TLS cancellation');
       }
       const onConnect: PgEventListener = () => {
@@ -305,7 +305,10 @@ function cancelQuery(
       };
       const onSslConnect: PgEventListener = () => {
         try {
-          connection.cancel!(client.processID ?? null, client.secretKey ?? null);
+          if (client.processID == null || client.secretKey == null) {
+            throw new Error('pg client did not expose cancellation credentials');
+          }
+          connection.cancel!(client.processID, client.secretKey);
         } catch (err) {
           onError(err);
         }
