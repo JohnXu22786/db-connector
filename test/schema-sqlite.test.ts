@@ -39,6 +39,30 @@ test('schema snapshot lists tables, columns, indexes, foreign keys', async () =>
   assert.deepEqual(fk!.referencedColumns, ['id']);
 });
 
+test('schema snapshot lists columns for SQLite views', async () => {
+  const h = makeHarness();
+  await seedSqlite(h);
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE VIEW user_directory AS SELECT id, email FROM users',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(s.views.map((v) => v.name), ['user_directory']);
+  assert.deepEqual(
+    s.columns
+      .filter((c) => c.table === 'user_directory')
+      .map((c) => ({ name: c.name, type: c.type, ordinal: c.ordinal })),
+    [
+      { name: 'id', type: 'INTEGER', ordinal: 1 },
+      { name: 'email', type: 'TEXT', ordinal: 2 },
+    ],
+  );
+});
+
 test('schema snapshots are cached within TTL and refreshable', async () => {
   const h = makeHarness({ schema: { ttlMs: 600000 } });
   await seedSqlite(h);
@@ -71,4 +95,3 @@ test('schema result is credential-free JSON', async () => {
   const text = JSON.stringify(s);
   assert.ok(!text.includes('password'));
 });
-
