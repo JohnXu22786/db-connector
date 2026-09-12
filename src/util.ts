@@ -5,6 +5,8 @@
 
 import { createHash, randomUUID } from 'node:crypto';
 
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
 /** sha256 hex digest of a string (used for audit statement digests). */
 export function sha256(text: string): string {
   return createHash('sha256').update(text, 'utf8').digest('hex');
@@ -42,7 +44,8 @@ export function createDeadlineSignal(
     Number.isFinite(timeoutMs) &&
     timeoutMs > 0
   ) {
-    sources.push(AbortSignal.timeout(timeoutMs));
+    const delayMs = Math.min(MAX_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
+    sources.push(AbortSignal.timeout(delayMs));
   }
 
   if (sources.length === 0) {
