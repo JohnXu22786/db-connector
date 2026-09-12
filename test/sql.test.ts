@@ -142,6 +142,7 @@ test('single-statement enforcement ignores semicolons in strings/comments', () =
   assert.doesNotThrow(() => assertSingleStatement("SELECT ';' AS x"));
   assert.doesNotThrow(() => assertSingleStatement('SELECT 1; -- trailing comment only'));
   assert.throws(() => assertSingleStatement('SELECT 1; SELECT 2'), DbConnectorError);
+  assert.throws(() => assertSingleStatement('SELECT 1; SELECT 2;'), DbConnectorError);
   assert.throws(() => assertSingleStatement('SELECT 1; DROP TABLE t'), (e) => {
     assert.equal((e as DbConnectorError).code, 'MULTI_STATEMENTS');
     return true;

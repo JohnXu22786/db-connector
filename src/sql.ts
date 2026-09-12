@@ -363,7 +363,7 @@ export function assertSingleStatement(sql: string): void {
   const tail = tokens.slice(last + 1).filter(
     (t) => t.type !== 'space' && t.type !== 'comment',
   );
-  if (tail.length > 0) {
+  if (separator.length > 1 || tail.length > 0) {
     throw new DbConnectorError(
       ErrorCode.MultiStatements,
       'multiple statements in one call are not supported; send them one at a time',
