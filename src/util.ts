@@ -104,7 +104,8 @@ export function truncateMiddle(text: string, max: number): string {
   const keep = max - 3;
   const left = Math.ceil(keep / 2);
   const right = Math.floor(keep / 2);
-  return `${text.slice(0, left)}...${text.slice(-right)}`;
+  const suffix = right === 0 ? '' : text.slice(-right);
+  return `${text.slice(0, left)}...${suffix}`;
 }
 
 /**
