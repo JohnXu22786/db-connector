@@ -1,6 +1,10 @@
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { createDeadlineSignal } from '../dist/util.js';
+import { createDeadlineSignal, truncateMiddle } from '../dist/util.js';
+
+test('truncateMiddle does not overflow when only one character fits beside the ellipsis', () => {
+  assert.equal(truncateMiddle('abcdefgh', 4), 'a...');
+});
 
 test('normalizes fractional and oversized finite timeout values', () => {
   const originalTimeout = AbortSignal.timeout;
