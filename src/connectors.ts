@@ -151,12 +151,17 @@ export class Connectors {
     rec.lastUsedAt = new Date().toISOString();
   }
 
+  private async closeRecord(rec: ConnectorRecord): Promise<void> {
+    await rec.opening?.catch(() => {});
+    await rec.driver?.close().catch(() => {});
+  }
+
   /** Close and forget a connection. Unknown names are a no-op. */
   async close(name: string): Promise<void> {
     const rec = this.map.get(name);
     if (!rec) return;
-    await rec.driver?.close().catch(() => {});
     this.map.delete(name);
+    await this.closeRecord(rec);
     this.logger.info('db-connector: closed connection %s', name);
   }
 
@@ -164,8 +169,8 @@ export class Connectors {
   async closeAll(): Promise<void> {
     const pending: Promise<void>[] = [];
     for (const [name, rec] of this.map) {
-      if (rec.driver) pending.push(rec.driver.close().catch(() => {}));
       this.map.delete(name);
+      pending.push(this.closeRecord(rec));
     }
     await Promise.all(pending);
   }
