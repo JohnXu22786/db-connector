@@ -58,6 +58,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "pg": "8.13.0",
     "typescript": "^5.9.0"
   },
   "author": "JohnXu22786",
