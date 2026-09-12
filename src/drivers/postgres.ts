@@ -116,6 +116,9 @@ export class PgDriver implements DriverApi {
           await client.query('ROLLBACK').catch(() => {});
           throw err;
         }
+      }, {
+        signal,
+        onAbort: () => cancelError(signal),
       });
     } catch (err) {
       throw toConnectorError(this.spec, err);
@@ -145,6 +148,9 @@ export class PgDriver implements DriverApi {
           await client.query('ROLLBACK').catch(() => {});
           throw err;
         }
+      }, {
+        signal,
+        onAbort: () => cancelError(signal),
       });
     } catch (err) {
       throw toConnectorError(this.spec, err);
@@ -156,53 +162,58 @@ export class PgDriver implements DriverApi {
     const schema = this.spec.schema || 'public';
     const signalOpts = { signal } as const;
     try {
-      const [tables, views, columns, pks, indexes, fks] = await Promise.all([
-        client.query({ ...QUERIES.tables, values: [schema], ...signalOpts }),
-        client.query({ ...QUERIES.views, values: [schema], ...signalOpts }),
-        client.query({ ...QUERIES.columns, values: [schema], ...signalOpts }),
-        client.query({ ...QUERIES.primaryKeys, values: [schema], ...signalOpts }),
-        client.query({ ...QUERIES.indexes, values: [schema], ...signalOpts }),
-        client.query({ ...QUERIES.foreignKeys, values: [schema], ...signalOpts }),
-      ]);
-      const pkRows = pks.rows as Array<{ table_name: string; column_name: string }>;
-      const pkByTable = new Map<string, Set<string>>();
-      for (const row of pkRows) {
-        let set = pkByTable.get(row.table_name);
-        if (!set) {
-          set = new Set();
-          pkByTable.set(row.table_name, set);
+      return await this.transactionMutex.runExclusive(async () => {
+        const [tables, views, columns, pks, indexes, fks] = await Promise.all([
+          client.query({ ...QUERIES.tables, values: [schema], ...signalOpts }),
+          client.query({ ...QUERIES.views, values: [schema], ...signalOpts }),
+          client.query({ ...QUERIES.columns, values: [schema], ...signalOpts }),
+          client.query({ ...QUERIES.primaryKeys, values: [schema], ...signalOpts }),
+          client.query({ ...QUERIES.indexes, values: [schema], ...signalOpts }),
+          client.query({ ...QUERIES.foreignKeys, values: [schema], ...signalOpts }),
+        ]);
+        const pkRows = pks.rows as Array<{ table_name: string; column_name: string }>;
+        const pkByTable = new Map<string, Set<string>>();
+        for (const row of pkRows) {
+          let set = pkByTable.get(row.table_name);
+          if (!set) {
+            set = new Set();
+            pkByTable.set(row.table_name, set);
+          }
+          set.add(row.column_name);
         }
-        set.add(row.column_name);
-      }
-      return {
-        tables: tables.rows.map((r) => ({ name: r.table_name as string })),
-        views: views.rows.map((r) => ({ name: r.table_name as string })),
-        columns: columns.rows.map((r) => ({
-          table: r.table_name as string,
-          name: r.column_name as string,
-          type: r.data_type as string,
-          nullable: !(r.is_nullable === 'NO'),
-          ordinal: Number(r.ordinal_position),
-          default: (r.column_default as string | null) ?? null,
-          primaryKey: pkByTable.get(r.table_name as string)?.has(r.column_name as string) ?? false,
-        })),
-        indexes: indexes.rows.map((r) => ({
-          name: r.index_name as string,
-          table: r.table_name as string,
-          columns: (r.column_names as string[]).filter(Boolean),
-          unique: Boolean(r.is_unique),
-          primary: Boolean(r.is_primary),
-        })),
-        foreignKeys: fks.rows.map((r) => ({
-          name: r.constraint_name as string,
-          table: r.table_name as string,
-          columns: (r.column_names as string[]),
-          referencedTable: r.referenced_table as string,
-          referencedColumns: (r.referenced_columns as string[]),
-          onUpdate: (r.on_update as string | null) ?? undefined,
-          onDelete: (r.on_delete as string | null) ?? undefined,
-        })),
-      } as Introspection;
+        return {
+          tables: tables.rows.map((r) => ({ name: r.table_name as string })),
+          views: views.rows.map((r) => ({ name: r.table_name as string })),
+          columns: columns.rows.map((r) => ({
+            table: r.table_name as string,
+            name: r.column_name as string,
+            type: r.data_type as string,
+            nullable: !(r.is_nullable === 'NO'),
+            ordinal: Number(r.ordinal_position),
+            default: (r.column_default as string | null) ?? null,
+            primaryKey: pkByTable.get(r.table_name as string)?.has(r.column_name as string) ?? false,
+          })),
+          indexes: indexes.rows.map((r) => ({
+            name: r.index_name as string,
+            table: r.table_name as string,
+            columns: (r.column_names as string[]).filter(Boolean),
+            unique: Boolean(r.is_unique),
+            primary: Boolean(r.is_primary),
+          })),
+          foreignKeys: fks.rows.map((r) => ({
+            name: r.constraint_name as string,
+            table: r.table_name as string,
+            columns: (r.column_names as string[]),
+            referencedTable: r.referenced_table as string,
+            referencedColumns: (r.referenced_columns as string[]),
+            onUpdate: (r.on_update as string | null) ?? undefined,
+            onDelete: (r.on_delete as string | null) ?? undefined,
+          })),
+        } as Introspection;
+      }, {
+        signal,
+        onAbort: () => cancelError(signal),
+      });
     } catch (err) {
       throw toConnectorError(this.spec, err);
     }
@@ -228,6 +239,15 @@ function outcomeOf(result: PgQueryResult): ReadOutcome {
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function cancelError(signal: AbortSignal): DbConnectorError {
+  const reason = signal.reason;
+  const isTimeout = reason instanceof Error && /timeout/i.test(reason.message);
+  return new DbConnectorError(
+    isTimeout ? ErrorCode.Timeout : ErrorCode.Cancelled,
+    isTimeout ? `query exceeded its time limit` : 'execution was cancelled',
+  );
 }
 
 function toConnectorError(
@@ -305,4 +325,3 @@ const QUERIES = {
        ORDER BY tc.table_name, rc.constraint_name`,
   },
 };
-

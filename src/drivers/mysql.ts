@@ -121,6 +121,10 @@ export class MysqlDriver implements DriverApi {
           (err) => fail(abortError ?? err),
         );
       }),
+      {
+        signal,
+        onAbort: () => cancelError(signal),
+      },
     );
   }
 
