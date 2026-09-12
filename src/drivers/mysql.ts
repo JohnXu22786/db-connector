@@ -54,12 +54,14 @@ export class MysqlDriver implements DriverApi {
   async connect(): Promise<void> {
     if (this.conn) return;
     const { createConnection } = await loadMysqlModule();
+    const hasConnectionString = Boolean(this.spec.connectionString);
     const conn = await createConnection({
-      host: this.spec.host ?? 'localhost',
-      port: this.spec.port ?? 3306,
+      host: hasConnectionString ? undefined : this.spec.host ?? 'localhost',
+      port: hasConnectionString ? undefined : this.spec.port ?? 3306,
       user: this.spec.user,
       password: this.spec.password || undefined,
       database: this.spec.database || undefined,
+      uri: this.spec.connectionString,
       ssl: normalizeSsl(this.spec.ssl),
       connectTimeout: 10000,
       ...this.spec.options,

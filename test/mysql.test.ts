@@ -1,8 +1,11 @@
 import { strict as assert } from 'node:assert';
-import { test } from 'node:test';
+import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
+import { mock, test } from 'node:test';
 import { ErrorCode, DbConnectorError } from '../dist/errors.js';
 import { MysqlDriver } from '../dist/drivers/mysql.js';
 import { makeHarness } from './helpers.ts';
+import { resolveConnectionSpec } from '../dist/config.js';
 
 interface FakeConnection {
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
@@ -87,4 +90,41 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
   } finally {
     MysqlDriver.prototype.connect = originalConnect;
   }
+});
+
+class FakeStream extends EventEmitter {
+  write(): boolean {
+    return true;
+  }
+
+  setNoDelay(): void {}
+
+  end(): void {}
+}
+
+const require = createRequire(import.meta.url);
+const net = require('node:net') as {
+  connect(...args: unknown[]): FakeStream;
+};
+
+test('MysqlDriver uses the URI host and port for mysql2 connections', async (t) => {
+  let target: { host: unknown; port: unknown } | undefined;
+  mock.method(net, 'connect', (...args: unknown[]) => {
+    target = { port: args[0], host: args[1] };
+    const stream = new FakeStream();
+    queueMicrotask(() => stream.emit('error', new Error('test connection')));
+    return stream;
+  });
+  t.after(() => mock.restoreAll());
+
+  const connectionString = 'mysql://uri-user:uri-pass@db.example.test:3307/app_db';
+  const spec = resolveConnectionSpec(
+    { name: 'uri-only', driver: 'mysql', connectionString },
+    {},
+  );
+  const driver = new MysqlDriver(spec, { debug() {}, info() {}, warn() {} });
+
+  await assert.rejects(() => driver.connect(), /test connection/);
+
+  assert.deepEqual(target, { host: 'db.example.test', port: 3307 });
 });
