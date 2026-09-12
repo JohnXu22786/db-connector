@@ -4,6 +4,7 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { apply, inject, name } from '../dist/index.js';
 import type { DshContext, DshTool } from '../dist/types.js';
@@ -50,6 +51,21 @@ function fakeContext(): {
 test('exports name and inject per the bundle contract', () => {
   assert.equal(name, 'db-connector');
   assert.deepEqual(inject, ['tools']);
+});
+
+test('bundle patch injects every service accessed during apply', () => {
+  const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8');
+  const lines = patch.split(/\r?\n/);
+  const rowStart = lines.findIndex((line) => line.trim() === '- id: db-connector');
+  assert.notEqual(rowStart, -1);
+  const configLine = lines.findIndex(
+    (line, index) => index > rowStart && line.trim() === 'config:',
+  );
+  assert.ok(configLine > rowStart);
+  const injectLine = lines
+    .slice(rowStart, configLine)
+    .find((line) => line.trim().startsWith('inject:'));
+  assert.equal(injectLine?.trim(), 'inject: [tools, commands]');
 });
 
 test('apply registers five tools and the /db command', () => {
