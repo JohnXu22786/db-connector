@@ -394,29 +394,73 @@ const QUERIES = {
   },
   foreignKeys: {
     name: 'dsh-db-connector.foreign-keys',
-    text: `SELECT rc.constraint_name,
-       tc.table_name,
+    text: `WITH foreign_key_constraints AS (
+       SELECT DISTINCT
+              con.oid AS foreign_key_oid,
+              con.conname AS constraint_name,
+              source_ns.nspname AS constraint_schema,
+              source_table.relname AS table_name,
+              rc.unique_constraint_schema,
+              rc.unique_constraint_name,
+              target_table.relname AS referenced_table,
+              CASE con.confupdtype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+              END AS on_update,
+              CASE con.confdeltype
+                WHEN 'a' THEN 'NO ACTION'
+                WHEN 'r' THEN 'RESTRICT'
+                WHEN 'c' THEN 'CASCADE'
+                WHEN 'n' THEN 'SET NULL'
+                WHEN 'd' THEN 'SET DEFAULT'
+              END AS on_delete
+         FROM pg_catalog.pg_constraint AS con
+         JOIN pg_catalog.pg_class AS source_table
+           ON source_table.oid = con.conrelid
+         JOIN pg_catalog.pg_namespace AS source_ns
+           ON source_ns.oid = source_table.relnamespace
+         JOIN pg_catalog.pg_class AS target_table
+           ON target_table.oid = con.confrelid
+         JOIN information_schema.referential_constraints AS rc
+           ON rc.constraint_name = con.conname
+          AND rc.constraint_schema = source_ns.nspname
+         JOIN pg_catalog.pg_constraint AS target_constraint
+           ON target_constraint.conrelid = con.confrelid
+          AND target_constraint.conname = rc.unique_constraint_name
+          AND target_constraint.contype IN ('p', 'u')
+         JOIN pg_catalog.pg_namespace AS target_constraint_ns
+           ON target_constraint_ns.oid = target_constraint.connamespace
+          AND target_constraint_ns.nspname = rc.unique_constraint_schema
+        WHERE con.contype = 'f' AND source_ns.nspname = $1
+     )
+     SELECT fkc.constraint_name,
+       fkc.table_name,
        array_agg(kcu.column_name ORDER BY kcu.ordinal_position) AS column_names,
-       ccu.table_name AS referenced_table,
+       fkc.referenced_table,
        array_agg(rku.column_name ORDER BY kcu.ordinal_position) AS referenced_columns,
-       rc.update_rule AS on_update, rc.delete_rule AS on_delete
-       FROM information_schema.referential_constraints AS rc
-       JOIN information_schema.table_constraints AS tc
-         ON tc.constraint_name = rc.constraint_name AND tc.constraint_schema = $1
+       fkc.on_update, fkc.on_delete
+       FROM foreign_key_constraints AS fkc
        JOIN information_schema.key_column_usage AS kcu
-         ON kcu.constraint_name = rc.constraint_name AND kcu.constraint_schema = $1
+         ON kcu.constraint_name = fkc.constraint_name
+        AND kcu.constraint_schema = fkc.constraint_schema
+        AND kcu.table_name = fkc.table_name
        JOIN information_schema.key_column_usage AS rku
-         ON rku.constraint_name = rc.unique_constraint_name
-        AND rku.constraint_schema = rc.unique_constraint_schema
+         ON rku.constraint_name = fkc.unique_constraint_name
+        AND rku.constraint_schema = fkc.unique_constraint_schema
+        AND rku.table_name = fkc.referenced_table
         AND rku.ordinal_position = kcu.position_in_unique_constraint
        JOIN (
          SELECT DISTINCT constraint_schema, constraint_name, table_name
            FROM information_schema.constraint_column_usage
        ) AS ccu
-         ON ccu.constraint_name = rc.unique_constraint_name
-        AND ccu.constraint_schema = rc.unique_constraint_schema
-       WHERE rc.constraint_schema = $1
-       GROUP BY rc.constraint_name, tc.table_name, rc.update_rule, rc.delete_rule, ccu.table_name
-       ORDER BY tc.table_name, rc.constraint_name`,
+         ON ccu.constraint_name = fkc.unique_constraint_name
+        AND ccu.constraint_schema = fkc.unique_constraint_schema
+        AND ccu.table_name = fkc.referenced_table
+       GROUP BY fkc.foreign_key_oid, fkc.constraint_name, fkc.table_name,
+                fkc.referenced_table, fkc.on_update, fkc.on_delete, ccu.table_name
+       ORDER BY fkc.table_name, fkc.constraint_name`,
   },
 };

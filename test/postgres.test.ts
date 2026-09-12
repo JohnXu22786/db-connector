@@ -71,7 +71,7 @@ interface QueryResult {
   rowCount: number | null;
 }
 
-test('PostgreSQL composite foreign-key introspection executes the catalog join correctly', async () => {
+test('PostgreSQL composite foreign-key introspection avoids same-name constraint cross-joins', async () => {
   const spec = resolveConnectionSpec({ name: 'pg', driver: 'postgres', database: 'app' }, {});
   const catalog = new DatabaseSync(':memory:');
   let catalogClosed = false;
@@ -92,14 +92,10 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
          update_rule TEXT,
          delete_rule TEXT
        )`,
-      `CREATE TABLE fixture_table_constraints (
-         constraint_name TEXT,
-         constraint_schema TEXT,
-         table_name TEXT
-       )`,
       `CREATE TABLE fixture_key_column_usage (
          constraint_name TEXT,
          constraint_schema TEXT,
+         table_name TEXT,
          column_name TEXT,
          ordinal_position INTEGER,
          position_in_unique_constraint INTEGER
@@ -110,6 +106,25 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
          table_name TEXT,
          column_name TEXT
        )`,
+      `CREATE TABLE fixture_pg_namespace (
+         oid INTEGER PRIMARY KEY,
+         nspname TEXT
+       )`,
+      `CREATE TABLE fixture_pg_class (
+         oid INTEGER PRIMARY KEY,
+         relname TEXT,
+         relnamespace INTEGER
+       )`,
+      `CREATE TABLE fixture_pg_constraint (
+         oid INTEGER PRIMARY KEY,
+         conname TEXT,
+         contype TEXT,
+         conrelid INTEGER,
+         confrelid INTEGER,
+         connamespace INTEGER,
+         confupdtype TEXT,
+         confdeltype TEXT
+       )`,
     ]) {
       catalog.exec(sql);
     }
@@ -117,30 +132,55 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
       INSERT INTO fixture_referential_constraints VALUES
         ('orders_local_fk', 'public', 'public', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
         ('orders_local_fk', 'archive', 'legacy', 'customers_pkey', 'CASCADE', 'NO ACTION'),
-        ('orders_legacy_fk', 'public', 'legacy', 'customers_pkey', 'NO ACTION', 'NO ACTION')
-    `);
-    catalog.exec(`
-      INSERT INTO fixture_table_constraints VALUES
-        ('orders_local_fk', 'public', 'orders'),
-        ('orders_legacy_fk', 'public', 'orders')
+        ('orders_legacy_fk', 'public', 'legacy', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
+        ('same_name_fk', 'public', 'public', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
+        ('same_name_fk', 'public', 'public', 'regions_pkey', 'CASCADE', 'SET NULL')
     `);
     catalog.exec(`
       INSERT INTO fixture_key_column_usage VALUES
-        ('orders_local_fk', 'public', 'customer_region', 2, 2),
-        ('orders_local_fk', 'public', 'customer_id', 1, 1),
-        ('orders_legacy_fk', 'public', 'legacy_region', 2, 2),
-        ('orders_legacy_fk', 'public', 'legacy_id', 1, 1),
-        ('customers_pkey', 'public', 'id', 1, NULL),
-        ('customers_pkey', 'public', 'region', 2, NULL),
-        ('customers_pkey', 'legacy', 'id', 1, NULL),
-        ('customers_pkey', 'legacy', 'region', 2, NULL)
+        ('orders_local_fk', 'public', 'orders', 'customer_region', 2, 2),
+        ('orders_local_fk', 'public', 'orders', 'customer_id', 1, 1),
+        ('orders_legacy_fk', 'public', 'orders', 'legacy_region', 2, 2),
+        ('orders_legacy_fk', 'public', 'orders', 'legacy_id', 1, 1),
+        ('same_name_fk', 'public', 'orders', 'billing_region', 2, 2),
+        ('same_name_fk', 'public', 'orders', 'billing_id', 1, 1),
+        ('same_name_fk', 'public', 'invoices', 'region_code', 1, 1),
+        ('customers_pkey', 'public', 'customers', 'id', 1, NULL),
+        ('customers_pkey', 'public', 'customers', 'region', 2, NULL),
+        ('customers_pkey', 'legacy', 'legacy_customers', 'id', 1, NULL),
+        ('customers_pkey', 'legacy', 'legacy_customers', 'region', 2, NULL),
+        ('regions_pkey', 'public', 'regions', 'code', 1, NULL)
     `);
     catalog.exec(`
       INSERT INTO fixture_constraint_column_usage VALUES
         ('customers_pkey', 'public', 'customers', 'id'),
         ('customers_pkey', 'public', 'customers', 'region'),
         ('customers_pkey', 'legacy', 'legacy_customers', 'id'),
-        ('customers_pkey', 'legacy', 'legacy_customers', 'region')
+        ('customers_pkey', 'legacy', 'legacy_customers', 'region'),
+        ('regions_pkey', 'public', 'regions', 'code')
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_pg_namespace VALUES
+        (1, 'public'),
+        (2, 'legacy')
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_pg_class VALUES
+        (10, 'orders', 1),
+        (11, 'invoices', 1),
+        (20, 'customers', 1),
+        (21, 'legacy_customers', 2),
+        (22, 'regions', 1)
+    `);
+    catalog.exec(`
+      INSERT INTO fixture_pg_constraint VALUES
+        (100, 'orders_local_fk', 'f', 10, 20, 1, 'a', 'a'),
+        (101, 'orders_legacy_fk', 'f', 10, 21, 1, 'a', 'a'),
+        (102, 'same_name_fk', 'f', 10, 20, 1, 'a', 'a'),
+        (103, 'same_name_fk', 'f', 11, 22, 1, 'c', 'n'),
+        (200, 'customers_pkey', 'p', 20, NULL, 1, NULL, NULL),
+        (201, 'customers_pkey', 'p', 21, NULL, 2, NULL, NULL),
+        (202, 'regions_pkey', 'p', 22, NULL, 1, NULL, NULL)
     `);
 
     const emptyResult: QueryResult = { rows: [], rowCount: 0 };
@@ -162,6 +202,7 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
               `json_group_array(${alias}.column_name${orderBy ?? ''})`,
           )
           .replaceAll('information_schema.', 'fixture_')
+          .replaceAll('pg_catalog.', 'fixture_')
           .replaceAll('$1', '?');
         const parameterCount = (query.text!.match(/\$1/g) ?? []).length;
         const rawRows = catalog
@@ -188,12 +229,11 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
 
     try {
       const introspection = await driver.introspect(new AbortController().signal);
-      const foreignKeys = new Map(introspection.foreignKeys.map((foreignKey) => [foreignKey.name, foreignKey]));
-      assert.equal(introspection.foreignKeys.length, 2, 'unrelated constraint schemas must not join source-schema rows');
-      assert.equal(foreignKeys.size, 2, 'same-schema and cross-schema foreign keys should both be returned');
+      const foreignKeys = introspection.foreignKeys;
+      assert.equal(foreignKeys.length, 4, 'same-named constraints must remain separate by source table');
 
-      const local = foreignKeys.get('orders_local_fk');
-      const legacy = foreignKeys.get('orders_legacy_fk');
+      const local = foreignKeys.find((foreignKey) => foreignKey.name === 'orders_local_fk');
+      const legacy = foreignKeys.find((foreignKey) => foreignKey.name === 'orders_legacy_fk');
       assert.ok(local);
       assert.ok(legacy);
       assert.deepEqual(local.columns, ['customer_id', 'customer_region']);
@@ -203,12 +243,35 @@ test('PostgreSQL composite foreign-key introspection executes the catalog join c
       assert.equal(local.referencedTable, 'customers');
       assert.equal(legacy.referencedTable, 'legacy_customers');
 
+      const sameName = foreignKeys.filter((foreignKey) => foreignKey.name === 'same_name_fk');
+      assert.equal(sameName.length, 2);
+      const sameNameByTable = new Map(sameName.map((foreignKey) => [foreignKey.table, foreignKey]));
+      assert.deepEqual(sameNameByTable.get('orders'), {
+        name: 'same_name_fk',
+        table: 'orders',
+        columns: ['billing_id', 'billing_region'],
+        referencedTable: 'customers',
+        referencedColumns: ['id', 'region'],
+        onUpdate: 'NO ACTION',
+        onDelete: 'NO ACTION',
+      });
+      assert.deepEqual(sameNameByTable.get('invoices'), {
+        name: 'same_name_fk',
+        table: 'invoices',
+        columns: ['region_code'],
+        referencedTable: 'regions',
+        referencedColumns: ['code'],
+        onUpdate: 'CASCADE',
+        onDelete: 'SET NULL',
+      });
+
       assert.equal(captured.length, 1);
       assert.match(captured[0]!.text!, /array_agg\(kcu\.column_name ORDER BY kcu\.ordinal_position\)/);
       assert.match(captured[0]!.text!, /array_agg\(rku\.column_name ORDER BY kcu\.ordinal_position\)/);
-      assert.match(captured[0]!.text!, /rc\.constraint_schema = \$1/);
-      assert.match(captured[0]!.text!, /ccu\.constraint_schema = rc\.unique_constraint_schema/);
-      assert.doesNotMatch(captured[0]!.text!, /WHERE constraint_schema = \$1\s*\) AS ccu/s);
+      assert.match(captured[0]!.text!, /pg_catalog\.pg_constraint/);
+      assert.match(captured[0]!.text!, /kcu\.table_name = fkc\.table_name/);
+      assert.match(captured[0]!.text!, /rku\.table_name = fkc\.referenced_table/);
+      assert.match(captured[0]!.text!, /ccu\.table_name = fkc\.referenced_table/);
     } finally {
       await driver.close();
     }
