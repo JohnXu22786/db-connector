@@ -40,17 +40,35 @@ interface PgQueryable {
   query(text: string): Promise<PgQueryResult>;
 }
 
+type PgEventListener = (...args: unknown[]) => void;
+
+interface PgEventSource {
+  on(event: string, listener: PgEventListener): void;
+  removeListener?(event: string, listener: PgEventListener): void;
+}
+
+interface PgConnectionLike extends PgEventSource {
+  connect(port: number, host?: string): void;
+  requestSsl?(): void;
+  cancel?(processID: number | null, secretKey: number | null): void;
+}
+
 interface PgClientLike extends PgQueryable {
   host?: string;
   port?: number;
+  ssl?: unknown;
+  processID?: number | null;
+  secretKey?: number | null;
   activeQuery?: PgQueryHandle;
   _activeQuery?: PgQueryHandle;
-  cancel(...args: unknown[]): void;
+  connection?: PgConnectionLike;
+  cancel(...args: unknown[]): unknown;
   connect(): Promise<void>;
   end(): Promise<void>;
 }
 
-type PgClientConstructor = new (config?: Record<string, unknown>) => PgClientLike;
+type PgClientConfig = Record<string, unknown>;
+type PgClientConstructor = new (config?: PgClientConfig) => PgClientLike;
 
 type PgModule = {
   Client: PgClientConstructor;
@@ -79,6 +97,7 @@ export class PgDriver implements DriverApi {
   private client: PgClientLike | null = null;
   private clientConstructor: PgClientConstructor | null = null;
   private queryConstructor: PgQueryConstructor | null = null;
+  private clientConfig: PgClientConfig | null = null;
   private closed = false;
 
   constructor(
@@ -89,7 +108,7 @@ export class PgDriver implements DriverApi {
   async connect(): Promise<void> {
     if (this.client) return;
     const { Client, Query } = await loadPgModule();
-    const clientConfig: Record<string, unknown> = {
+    const clientConfig: PgClientConfig = {
       host: this.spec.host,
       port: this.spec.port,
       user: this.spec.user,
@@ -109,6 +128,7 @@ export class PgDriver implements DriverApi {
     }
     this.clientConstructor = Client;
     this.queryConstructor = Query;
+    this.clientConfig = clientConfig;
     this.client = client;
   }
 
@@ -130,7 +150,7 @@ export class PgDriver implements DriverApi {
       // classifier cannot mutate data inside a READ ONLY transaction.
       await client.query('BEGIN TRANSACTION READ ONLY');
       try {
-        const result = await queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, {
+        const result = await queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, {
           text: converted.sql,
           values: params,
         }, signal);
@@ -156,7 +176,7 @@ export class PgDriver implements DriverApi {
     try {
       await client.query('BEGIN');
       try {
-        const result = await queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, {
+        const result = await queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, {
           text: converted.sql,
           values: params,
         }, signal);
@@ -176,12 +196,12 @@ export class PgDriver implements DriverApi {
     const schema = this.spec.schema || 'public';
     try {
       const [tables, views, columns, pks, indexes, fks] = await Promise.all([
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.tables, values: [schema] }, signal),
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.views, values: [schema] }, signal),
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.columns, values: [schema] }, signal),
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.primaryKeys, values: [schema] }, signal),
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.indexes, values: [schema] }, signal),
-        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, { ...QUERIES.foreignKeys, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.tables, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.views, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.columns, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.primaryKeys, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.indexes, values: [schema] }, signal),
+        queryWithCancellation(client, this.clientConstructor!, this.queryConstructor!, this.clientConfig!, { ...QUERIES.foreignKeys, values: [schema] }, signal),
       ]);
       const pkRows = pks.rows as Array<{ table_name: string; column_name: string }>;
       const pkByTable = new Map<string, Set<string>>();
@@ -232,6 +252,9 @@ export class PgDriver implements DriverApi {
     this.closed = true;
     const client = this.client;
     this.client = null;
+    this.clientConstructor = null;
+    this.queryConstructor = null;
+    this.clientConfig = null;
     if (client) await client.end().catch(() => {});
   }
 }
@@ -239,22 +262,83 @@ export class PgDriver implements DriverApi {
 function cancelQuery(
   client: PgClientLike,
   Client: PgClientConstructor,
+  clientConfig: PgClientConfig,
   query: PgQueryHandle,
-): void {
+  onError: (err: unknown) => void,
+): () => void {
   if (client.cancel.length <= 1) {
     // pg-native's API cancels the query on the connected client directly.
     client.cancel(query);
-    return;
+    return () => {};
   }
 
   // The pure-JS pg implementation uses this client's connection only to
   // send a CancelRequest for the target client's active query.
-  const cancelClient = new Client({ host: client.host, port: client.port });
-  const connection = (cancelClient as unknown as {
-    connection?: { on(event: string, listener: () => void): void };
-  }).connection;
-  connection?.on('error', () => {});
-  cancelClient.cancel(client, query);
+  const cancelClient = new Client({ ...clientConfig });
+  const sources = new Set<PgEventSource>();
+  const listeners: Array<{ source: PgEventSource; event: string; listener: PgEventListener }> = [];
+  const connection = cancelClient.connection;
+  if (connection) sources.add(connection);
+  const cancelClientEvents = cancelClient as unknown as PgEventSource;
+  if (typeof cancelClientEvents.on === 'function') sources.add(cancelClientEvents);
+  if (sources.size === 0) {
+    throw new Error('pg cancellation client did not expose an error event source');
+  }
+
+  const errorListener: PgEventListener = (err) => onError(err);
+  const addListener = (source: PgEventSource, event: string, listener: PgEventListener) => {
+    source.on(event, listener);
+    listeners.push({ source, event, listener });
+  };
+  for (const source of sources) addListener(source, 'error', errorListener);
+  try {
+    if (cancelClient.ssl && connection) {
+      if (!connection.requestSsl || !connection.cancel) {
+        throw new Error('pg cancellation connection does not support TLS cancellation');
+      }
+      const onConnect: PgEventListener = () => {
+        try {
+          connection.requestSsl!();
+        } catch (err) {
+          onError(err);
+        }
+      };
+      const onSslConnect: PgEventListener = () => {
+        try {
+          connection.cancel!(client.processID ?? null, client.secretKey ?? null);
+        } catch (err) {
+          onError(err);
+        }
+      };
+      addListener(connection, 'connect', onConnect);
+      addListener(connection, 'sslconnect', onSslConnect);
+      connection.connect(cancelClient.port ?? client.port ?? 5432, cancelClient.host ?? client.host);
+    } else {
+      const result = cancelClient.cancel(client, query);
+      if (isPromiseLike(result)) void result.catch(onError);
+    }
+  } catch (err) {
+    for (const { source, event, listener } of listeners) {
+      source.removeListener?.(event, listener);
+    }
+    throw err;
+  }
+
+  return () => {
+    for (const { source, event, listener } of listeners) {
+      source.removeListener?.(event, listener);
+    }
+  };
+}
+
+type PgPromiseLike = {
+  catch(onRejected: (reason: unknown) => unknown): unknown;
+};
+
+function isPromiseLike(value: unknown): value is PgPromiseLike {
+  return typeof value === 'object' && value !== null &&
+    typeof (value as { then?: unknown }).then === 'function' &&
+    typeof (value as { catch?: unknown }).catch === 'function';
 }
 
 /** Execute a pg 8.13 query with callback access to the handle used for cancel. */
@@ -262,6 +346,7 @@ function queryWithCancellation(
   client: PgClientLike,
   Client: PgClientConstructor,
   Query: PgQueryConstructor,
+  clientConfig: PgClientConfig,
   config: PgQueryConfig,
   signal: AbortSignal,
 ): Promise<PgQueryResult> {
@@ -272,8 +357,13 @@ function queryWithCancellation(
     let settled = false;
     let cancelRequested = false;
     let cancelSent = false;
+    let removeCancellationErrorListener: (() => void) | undefined;
 
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+      removeCancellationErrorListener?.();
+      removeCancellationErrorListener = undefined;
+    };
     const finish = (handler: () => void) => {
       if (settled) return;
       settled = true;
@@ -285,7 +375,15 @@ function queryWithCancellation(
       cancelSent = true;
       const active = client.activeQuery === query || client._activeQuery === query;
       try {
-        cancelQuery(client, Client, query);
+        const removeErrorListener = cancelQuery(
+          client,
+          Client,
+          clientConfig,
+          query,
+          (err) => finish(() => reject(err)),
+        );
+        if (settled) removeErrorListener();
+        else removeCancellationErrorListener = removeErrorListener;
       } catch (err) {
         finish(() => reject(err));
         return;
