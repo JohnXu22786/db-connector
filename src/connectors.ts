@@ -32,6 +32,9 @@ interface ConnectorRecord {
   lastUsedAt: string | null;
   executions: number;
   opening: Promise<DriverApi> | null;
+  closing: boolean;
+  closeSignal: Promise<void>;
+  signalClose: () => void;
 }
 
 const DEFAULT_LOGGER: DriverLogger = { debug() {}, info() {}, warn() {} };
@@ -50,6 +53,10 @@ export class Connectors {
         `a connection named "${resolved.name}" already exists`,
       );
     }
+    let signalClose!: () => void;
+    const closeSignal = new Promise<void>((resolve) => {
+      signalClose = resolve;
+    });
     this.map.set(resolved.name, {
       spec: resolved,
       driver: null,
@@ -58,6 +65,9 @@ export class Connectors {
       lastUsedAt: null,
       executions: 0,
       opening: null,
+      closing: false,
+      closeSignal,
+      signalClose,
     });
     return this.statusOf(resolved.name, this.map.get(resolved.name)!);
   }
@@ -101,11 +111,12 @@ export class Connectors {
         `connection "${name}" is not defined; run db_connect first`,
       );
     }
+    if (rec.closing) throw this.connectionClosingError(name);
     if (rec.driver) {
       const driver = rec.driver;
       const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
       try {
-        await opening;
+        await this.waitForOpen(rec, opening);
       } finally {
         if (rec.opening === opening) rec.opening = null;
       }
@@ -113,9 +124,9 @@ export class Connectors {
       rec.status = 'connected';
       return driver;
     }
-    if (rec.opening) return rec.opening;
+    if (rec.opening) return this.waitForOpen(rec, rec.opening);
 
-    rec.opening = (async () => {
+    const opening = (async () => {
       let spec = rec.spec;
       if (spec.passwordRef && resolveCredentials) {
         spec = (await applyCredentialPassword(spec, resolveCredentials)) as ResolvedConnectionSpec;
@@ -135,12 +146,32 @@ export class Connectors {
       this.logger.info('db-connector: connected %s', summarizeSpec(spec));
       return driver;
     })();
+    rec.opening = opening;
 
     try {
-      return await rec.opening;
+      return await this.waitForOpen(rec, opening);
     } finally {
-      rec.opening = null;
+      if (rec.opening === opening) rec.opening = null;
     }
+  }
+
+  private async waitForOpen(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi>,
+  ): Promise<DriverApi> {
+    const result = await Promise.race([
+      opening.then((driver) => ({ driver })),
+      rec.closeSignal.then(() => null),
+    ]);
+    if (result === null || rec.closing) throw this.connectionClosingError(rec.spec.name);
+    return result.driver;
+  }
+
+  private connectionClosingError(name: string): DbConnectorError {
+    return new DbConnectorError(
+      ErrorCode.ConnectionNotFound,
+      `connection "${name}" is closing`,
+    );
   }
 
   /** Mark a connection as just executed against (stats only, never secrets). */
@@ -151,8 +182,11 @@ export class Connectors {
     rec.lastUsedAt = new Date().toISOString();
   }
 
-  private async closeRecord(rec: ConnectorRecord): Promise<void> {
-    await rec.opening?.catch(() => {});
+  private async closeRecord(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi> | null,
+  ): Promise<void> {
+    await opening?.catch(() => {});
     await rec.driver?.close().catch(() => {});
   }
 
@@ -160,8 +194,11 @@ export class Connectors {
   async close(name: string): Promise<void> {
     const rec = this.map.get(name);
     if (!rec) return;
+    const opening = rec.opening;
+    rec.closing = true;
+    rec.signalClose();
     this.map.delete(name);
-    await this.closeRecord(rec);
+    await this.closeRecord(rec, opening);
     this.logger.info('db-connector: closed connection %s', name);
   }
 
@@ -169,8 +206,11 @@ export class Connectors {
   async closeAll(): Promise<void> {
     const pending: Promise<void>[] = [];
     for (const [name, rec] of this.map) {
+      const opening = rec.opening;
+      rec.closing = true;
+      rec.signalClose();
       this.map.delete(name);
-      pending.push(this.closeRecord(rec));
+      pending.push(this.closeRecord(rec, opening));
     }
     await Promise.all(pending);
   }
