@@ -408,9 +408,13 @@ const QUERIES = {
          ON tc.constraint_name = rc.constraint_name AND tc.constraint_schema = $1
        JOIN information_schema.key_column_usage AS kcu
          ON kcu.constraint_name = rc.constraint_name AND kcu.constraint_schema = $1
-       JOIN information_schema.constraint_column_usage AS ccu
+       JOIN (
+         SELECT DISTINCT constraint_schema, constraint_name, table_name
+           FROM information_schema.constraint_column_usage
+          WHERE constraint_schema = $1
+       ) AS ccu
          ON ccu.constraint_name = rc.unique_constraint_name
-      WHERE ccu.constraint_schema = $1
+        AND ccu.constraint_schema = $1
        GROUP BY rc.constraint_name, tc.table_name, rc.update_rule, rc.delete_rule, ccu.table_name
        ORDER BY tc.table_name, rc.constraint_name`,
   },

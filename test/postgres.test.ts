@@ -58,3 +58,62 @@ test(
     }
   },
 );
+
+interface QueryConfig {
+  name?: string;
+  text?: string;
+}
+
+interface QueryResult {
+  fields: Array<{ name: string }>;
+  rows: Array<Record<string, unknown>>;
+  rowCount: number | null;
+}
+
+test('PostgreSQL composite foreign keys do not duplicate source columns', async () => {
+  const spec = resolveConnectionSpec({ name: 'pg', driver: 'postgres', database: 'app' }, {});
+  const foreignKeyRows: QueryResult = {
+    fields: [],
+    rows: [{
+      constraint_name: 'orders_customer_fk',
+      table_name: 'orders',
+      column_names: ['customer_id', 'customer_region'],
+      referenced_table: 'customers',
+      referenced_columns: ['id', 'region'],
+      on_update: 'NO ACTION',
+      on_delete: 'NO ACTION',
+    }],
+    rowCount: 1,
+  };
+  const emptyResult: QueryResult = { fields: [], rows: [], rowCount: 0 };
+  const captured: QueryConfig[] = [];
+  const client = {
+    async query(query: string | QueryConfig): Promise<QueryResult> {
+      if (typeof query === 'string') return emptyResult;
+      captured.push(query);
+      return query.name === 'dsh-db-connector.foreign-keys' ? foreignKeyRows : emptyResult;
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec, { debug() {}, info() {}, warn() {} });
+  (driver as unknown as { client: typeof client }).client = client;
+
+  const introspection = await driver.introspect(new AbortController().signal);
+  const foreignKeyQuery = captured.find((query) => query.name === 'dsh-db-connector.foreign-keys');
+
+  assert.ok(foreignKeyQuery);
+  assert.match(
+    foreignKeyQuery!.text!,
+    /JOIN\s+\(\s*SELECT DISTINCT constraint_schema, constraint_name, table_name\s+FROM information_schema\.constraint_column_usage\s+WHERE constraint_schema = \$1\s*\) AS ccu/s,
+  );
+  assert.deepEqual(introspection.foreignKeys, [{
+    name: 'orders_customer_fk',
+    table: 'orders',
+    columns: ['customer_id', 'customer_region'],
+    referencedTable: 'customers',
+    referencedColumns: ['id', 'region'],
+    onUpdate: 'NO ACTION',
+    onDelete: 'NO ACTION',
+  }]);
+});
