@@ -21,11 +21,16 @@ interface PgQueryResult {
   rowCount: number | null;
 }
 
+interface PgArrayQueryResult extends Omit<PgQueryResult, 'rows'> {
+  rows: unknown[][];
+}
+
 interface PgQueryConfig {
   text: string;
   values?: unknown[];
   signal?: AbortSignal;
   name?: string;
+  rowMode?: 'array';
 }
 
 interface PgQueryable {
@@ -139,13 +144,14 @@ export class PgDriver implements DriverApi {
       // classifier cannot mutate data inside a READ ONLY transaction.
       await client.query('BEGIN TRANSACTION READ ONLY');
       try {
-        const result: PgQueryResult = await client.query({
+        const result = await client.query({
           text: converted.sql,
           values: params,
           signal,
+          rowMode: 'array',
         } as never);
         await client.query('ROLLBACK');
-        return outcomeOf(result);
+        return outcomeOf(result as unknown as PgArrayQueryResult);
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         throw err;
@@ -273,11 +279,9 @@ export class PgDriver implements DriverApi {
   }
 }
 
-function outcomeOf(result: PgQueryResult): ReadOutcome {
+function outcomeOf(result: PgArrayQueryResult): ReadOutcome {
   const columns = result.fields.map((f) => f.name);
-  const rows = result.rows.map((row) =>
-    columns.map((c) => (row as Record<string, unknown>)[c] ?? null),
-  );
+  const rows = result.rows.map((row) => row.map((value) => value ?? null));
   return { columns, rows, rowCount: rows.length };
 }
 
