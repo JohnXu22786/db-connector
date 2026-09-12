@@ -122,6 +122,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
          conrelid INTEGER,
          confrelid INTEGER,
          connamespace INTEGER,
+         conindid INTEGER,
          confupdtype TEXT,
          confdeltype TEXT
        )`,
@@ -134,7 +135,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
         ('orders_local_fk', 'archive', 'legacy', 'customers_pkey', 'CASCADE', 'NO ACTION'),
         ('orders_legacy_fk', 'public', 'legacy', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
         ('same_name_fk', 'public', 'public', 'customers_pkey', 'NO ACTION', 'NO ACTION'),
-        ('same_name_fk', 'public', 'public', 'regions_pkey', 'CASCADE', 'SET NULL')
+        ('same_name_fk', 'public', 'public', 'customers_code_key', 'CASCADE', 'SET NULL')
     `);
     catalog.exec(`
       INSERT INTO fixture_key_column_usage VALUES
@@ -149,7 +150,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
         ('customers_pkey', 'public', 'customers', 'region', 2, NULL),
         ('customers_pkey', 'legacy', 'legacy_customers', 'id', 1, NULL),
         ('customers_pkey', 'legacy', 'legacy_customers', 'region', 2, NULL),
-        ('regions_pkey', 'public', 'regions', 'code', 1, NULL)
+        ('customers_code_key', 'public', 'customers', 'code', 1, NULL)
     `);
     catalog.exec(`
       INSERT INTO fixture_constraint_column_usage VALUES
@@ -157,7 +158,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
         ('customers_pkey', 'public', 'customers', 'region'),
         ('customers_pkey', 'legacy', 'legacy_customers', 'id'),
         ('customers_pkey', 'legacy', 'legacy_customers', 'region'),
-        ('regions_pkey', 'public', 'regions', 'code')
+        ('customers_code_key', 'public', 'customers', 'code')
     `);
     catalog.exec(`
       INSERT INTO fixture_pg_namespace VALUES
@@ -169,18 +170,17 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
         (10, 'orders', 1),
         (11, 'invoices', 1),
         (20, 'customers', 1),
-        (21, 'legacy_customers', 2),
-        (22, 'regions', 1)
+        (21, 'legacy_customers', 2)
     `);
     catalog.exec(`
       INSERT INTO fixture_pg_constraint VALUES
-        (100, 'orders_local_fk', 'f', 10, 20, 1, 'a', 'a'),
-        (101, 'orders_legacy_fk', 'f', 10, 21, 1, 'a', 'a'),
-        (102, 'same_name_fk', 'f', 10, 20, 1, 'a', 'a'),
-        (103, 'same_name_fk', 'f', 11, 22, 1, 'c', 'n'),
-        (200, 'customers_pkey', 'p', 20, NULL, 1, NULL, NULL),
-        (201, 'customers_pkey', 'p', 21, NULL, 2, NULL, NULL),
-        (202, 'regions_pkey', 'p', 22, NULL, 1, NULL, NULL)
+        (100, 'orders_local_fk', 'f', 10, 20, 1, 2000, 'a', 'a'),
+        (101, 'orders_legacy_fk', 'f', 10, 21, 1, 2001, 'a', 'a'),
+        (102, 'same_name_fk', 'f', 10, 20, 1, 2000, 'a', 'a'),
+        (103, 'same_name_fk', 'f', 11, 20, 1, 2003, 'c', 'n'),
+        (200, 'customers_pkey', 'p', 20, NULL, 1, 2000, NULL, NULL),
+        (201, 'customers_pkey', 'p', 21, NULL, 2, 2001, NULL, NULL),
+        (202, 'customers_code_key', 'u', 20, NULL, 1, 2003, NULL, NULL)
     `);
 
     const emptyResult: QueryResult = { rows: [], rowCount: 0 };
@@ -259,7 +259,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
         name: 'same_name_fk',
         table: 'invoices',
         columns: ['region_code'],
-        referencedTable: 'regions',
+        referencedTable: 'customers',
         referencedColumns: ['code'],
         onUpdate: 'CASCADE',
         onDelete: 'SET NULL',
@@ -269,6 +269,7 @@ test('PostgreSQL composite foreign-key introspection avoids same-name constraint
       assert.match(captured[0]!.text!, /array_agg\(kcu\.column_name ORDER BY kcu\.ordinal_position\)/);
       assert.match(captured[0]!.text!, /array_agg\(rku\.column_name ORDER BY kcu\.ordinal_position\)/);
       assert.match(captured[0]!.text!, /pg_catalog\.pg_constraint/);
+      assert.match(captured[0]!.text!, /target_constraint\.conindid = con\.conindid/);
       assert.match(captured[0]!.text!, /kcu\.table_name = fkc\.table_name/);
       assert.match(captured[0]!.text!, /rku\.table_name = fkc\.referenced_table/);
       assert.match(captured[0]!.text!, /ccu\.table_name = fkc\.referenced_table/);

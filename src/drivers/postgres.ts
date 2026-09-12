@@ -424,16 +424,17 @@ const QUERIES = {
            ON source_ns.oid = source_table.relnamespace
          JOIN pg_catalog.pg_class AS target_table
            ON target_table.oid = con.confrelid
-         JOIN information_schema.referential_constraints AS rc
-           ON rc.constraint_name = con.conname
-          AND rc.constraint_schema = source_ns.nspname
          JOIN pg_catalog.pg_constraint AS target_constraint
            ON target_constraint.conrelid = con.confrelid
-          AND target_constraint.conname = rc.unique_constraint_name
+          AND target_constraint.conindid = con.conindid
           AND target_constraint.contype IN ('p', 'u')
          JOIN pg_catalog.pg_namespace AS target_constraint_ns
            ON target_constraint_ns.oid = target_constraint.connamespace
-          AND target_constraint_ns.nspname = rc.unique_constraint_schema
+         JOIN information_schema.referential_constraints AS rc
+           ON rc.constraint_name = con.conname
+          AND rc.constraint_schema = source_ns.nspname
+          AND rc.unique_constraint_name = target_constraint.conname
+          AND rc.unique_constraint_schema = target_constraint_ns.nspname
         WHERE con.contype = 'f' AND source_ns.nspname = $1
      )
      SELECT fkc.constraint_name,
