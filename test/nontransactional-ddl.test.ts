@@ -91,6 +91,56 @@ test('PostgreSQL serializes concurrent transactional and direct operations', asy
   ]);
 });
 
+test('PostgreSQL queued operations honor abort signals while waiting for the lock', async () => {
+  const calls: string[] = [];
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let finish!: () => void;
+  const firstFinished = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  const driver = makePgDriver(calls, async (query) => {
+    const text = typeof query === 'string' ? query : query.text;
+    if (text === 'VACUUM' && calls.filter((call) => call === 'VACUUM').length === 1) {
+      started();
+      await firstFinished;
+    }
+    return { fields: [], rows: [], rowCount: 0 };
+  });
+
+  const first = driver.write('VACUUM', [], true, new AbortController().signal);
+  await firstStarted;
+
+  const queuedController = new AbortController();
+  const queued = driver.write('VACUUM', [], true, queuedController.signal);
+  queuedController.abort(new Error('cancelled while waiting for the connection'));
+
+  const timeout = Symbol('timeout');
+  let outcome: DbConnectorError | 'resolved' | typeof timeout;
+  try {
+    outcome = await Promise.race([
+      queued.then(
+        () => 'resolved' as const,
+        (err) => err as DbConnectorError,
+      ),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 100)),
+    ]);
+    assert.notEqual(outcome, timeout, 'queued operation did not observe cancellation');
+    assert.notEqual(outcome, 'resolved');
+    assert.equal((outcome as DbConnectorError).code, ErrorCode.Cancelled);
+    assert.deepEqual(calls, ['VACUUM']);
+  } finally {
+    finish();
+    await first;
+    await queued.catch(() => {});
+  }
+
+  await driver.write('VACUUM', [], true, new AbortController().signal);
+  assert.deepEqual(calls, ['VACUUM', 'VACUUM']);
+});
+
 test('PostgreSQL direct statement failures do not issue a rollback', async () => {
   const calls: string[] = [];
   const driver = makePgDriver(calls, async (query) => {

@@ -87,17 +87,29 @@ export class PgDriver implements DriverApi {
     });
   }
 
-  private async withOperationLock<T>(operation: () => Promise<T>): Promise<T> {
+  private async withOperationLock<T>(
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     const previous = this.operationTail;
     let release!: () => void;
     this.operationTail = new Promise<void>((resolve) => {
       release = resolve;
     });
-    await previous;
+    let acquired = false;
     try {
+      await waitForOperationLock(previous, signal);
+      acquired = true;
       return await operation();
     } finally {
-      release();
+      if (acquired) {
+        release();
+      } else {
+        // An aborted waiter must not let a later operation overtake the
+        // operation it was queued behind. Release this queue entry only once
+        // the prior operation has finished.
+        void previous.then(release, release);
+      }
     }
   }
 
@@ -112,7 +124,7 @@ export class PgDriver implements DriverApi {
   }
 
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
-    return this.withOperationLock(() => this.readUnlocked(sql, params, signal));
+    return this.withOperationLock(() => this.readUnlocked(sql, params, signal), signal);
   }
 
   private async readUnlocked(
@@ -149,7 +161,7 @@ export class PgDriver implements DriverApi {
     isDdl: boolean,
     signal: AbortSignal,
   ): Promise<WriteOutcome> {
-    return this.withOperationLock(() => this.writeUnlocked(sql, params, isDdl, signal));
+    return this.withOperationLock(() => this.writeUnlocked(sql, params, isDdl, signal), signal);
   }
 
   private async writeUnlocked(
@@ -190,7 +202,7 @@ export class PgDriver implements DriverApi {
   }
 
   async introspect(signal: AbortSignal): Promise<Introspection> {
-    return this.withOperationLock(() => this.introspectUnlocked(signal));
+    return this.withOperationLock(() => this.introspectUnlocked(signal), signal);
   }
 
   private async introspectUnlocked(signal: AbortSignal): Promise<Introspection> {
@@ -272,6 +284,51 @@ function outcomeOf(result: PgQueryResult): ReadOutcome {
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function cancelError(signal: AbortSignal): DbConnectorError {
+  const reason = signal.reason;
+  const isTimeout = reason instanceof Error && /timeout/i.test(reason.message);
+  return new DbConnectorError(
+    isTimeout ? ErrorCode.Timeout : ErrorCode.Cancelled,
+    isTimeout ? 'query exceeded its time limit' : 'execution was cancelled',
+  );
+}
+
+function waitForOperationLock(
+  previous: Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (!signal) return previous;
+  if (signal.aborted) return Promise.reject(cancelError(signal));
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(cancelError(signal));
+    };
+
+    signal.addEventListener('abort', onAbort, { once: true });
+    previous.then(
+      () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      },
+    );
+    if (signal.aborted) onAbort();
+  });
 }
 
 function toConnectorError(
