@@ -148,6 +148,7 @@ export class ExecutionEngine {
 
   async close(name: string): Promise<void> {
     await this.connectors.close(name);
+    this.schemaService.invalidate(name);
   }
 
   async listConnections(): Promise<{ connections: ConnectorStatus[] }> {
