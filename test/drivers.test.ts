@@ -784,6 +784,83 @@ test('SQLite does not retry a request after close starts', async () => {
   }
 });
 
+test('SQLite cancellation waits for the child to exit before rejecting', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  const state = driver as unknown as {
+    ensureChild(): {
+      send: (...args: unknown[]) => boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+    };
+    child: {
+      kill(signal?: NodeJS.Signals): boolean;
+    } | null;
+  };
+  const child = state.ensureChild();
+  const originalSend = child.send.bind(child);
+  const originalKill = child.kill.bind(child);
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let killCalled!: () => void;
+  const killStarted = new Promise<void>((resolve) => {
+    killCalled = resolve;
+  });
+
+  // Keep the request pending, then delay the actual SIGKILL so an immediate
+  // cancellation rejection is observable without relying on a slow query.
+  child.send = () => true;
+  child.kill = (signal) => {
+    killCalled();
+    killTimer = setTimeout(() => {
+      killTimer = undefined;
+      originalKill(signal);
+    }, 50);
+    return true;
+  };
+
+  const controller = new AbortController();
+  try {
+    const request = driver.read('SELECT 1', [], controller.signal);
+    let settled = false;
+    void request.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+
+    controller.abort();
+    const nextRequest = driver.read('SELECT 1', [], signal());
+    await killStarted;
+    await nextTurn();
+    assert.equal(settled, false);
+    assert.equal(state.child, null);
+
+    const requestError = await request.then(() => undefined, (err: unknown) => err);
+    assert.ok(requestError instanceof DbConnectorError);
+    assert.equal((requestError as DbConnectorError).code, ErrorCode.Cancelled);
+    assert.equal(child.exitCode === null && child.signalCode === null, false);
+    await nextRequest;
+  } finally {
+    if (killTimer !== undefined) clearTimeout(killTimer);
+    child.send = originalSend;
+    if (child.exitCode === null && child.signalCode === null) originalKill('SIGKILL');
+    await driver.close();
+  }
+});
+
 interface MysqlClientFake {
   query(sql: string): Promise<[unknown, unknown]>;
   execute(options: unknown): Promise<[unknown, unknown]>;

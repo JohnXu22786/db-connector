@@ -47,6 +47,8 @@ const DB_ENV = 'DSH_DB_CONNECTOR_SQLITE_DATABASE';
 export class SqliteDriver implements DriverApi {
   readonly kind = 'sqlite' as const;
   private child: ChildProcess | null = null;
+  /** Blocks replacement requests until a deliberately killed child exits. */
+  private retiring: Promise<void> | null = null;
   private closed = false;
   private seq = 0;
   private readonly pending = new Map<
@@ -155,11 +157,17 @@ export class SqliteDriver implements DriverApi {
     }
   }
 
-  private request(
+  private async request(
     op: Op,
     signal: AbortSignal,
     extra?: Partial<Omit<RequestMessage, 'id' | 'op'>>,
   ): Promise<unknown> {
+    if (this.closed) {
+      return Promise.reject(
+        new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection is closed'),
+      );
+    }
+    if (this.retiring) await this.retiring;
     if (this.closed) {
       return Promise.reject(
         new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection is closed'),
@@ -171,15 +179,18 @@ export class SqliteDriver implements DriverApi {
         const onAbort = () => {
           signal.removeEventListener('abort', onAbort);
           this.pending.delete(id);
-          this.refDrop(child);
-          // Drop the driver's reference immediately so the next request spawns
-          // a fresh child even before this one's exit event lands.
           if (this.child === child) this.child = null;
           this.dropped.add(child);
           // Hard-kill works even while the child is blocked in native SQLite
           // and never blocks this process from exiting.
+          const exited = waitForChildExit(child);
+          this.retiring = exited;
           child.kill('SIGKILL');
-          reject(cancelError(signal));
+          void exited.then(() => {
+            if (this.retiring === exited) this.retiring = null;
+            this.refDrop(child);
+            reject(cancelError(signal));
+          });
         };
         this.pending.set(id, {
           child,
@@ -289,6 +300,13 @@ export class SqliteDriver implements DriverApi {
       if (child.exitCode === null) child.kill('SIGKILL');
     }
   }
+}
+
+function waitForChildExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    child.once('exit', () => resolve());
+  });
 }
 
 function cancelError(signal: AbortSignal): DbConnectorError {
