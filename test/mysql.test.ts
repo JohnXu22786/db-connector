@@ -216,6 +216,62 @@ test('MysqlDriver releases its lifecycle lock after a failed connection', async 
   assert.equal(endCalls, 1);
 });
 
+test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
+  let createCalls = 0;
+  let failedExecuteCalls = 0;
+  const failedConnection: FakeConnection = {
+    execute: async () => {
+      failedExecuteCalls += 1;
+      throw new Error('connection lost');
+    },
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {},
+  };
+  const workingConnection: FakeConnection = {
+    execute: async () => [[[2]], [{ name: 'id' }]],
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {},
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return createCalls === 1 ? failedConnection : workingConnection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'query-retry', driver: 'mysql', database: 'test' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+
+  await driver.connect();
+  await assert.rejects(
+    () => driver.read('SELECT id FROM users', [], new AbortController().signal),
+    (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.QueryFailed,
+  );
+  assert.equal(failedExecuteCalls, 1);
+  assert.equal((driver as unknown as { conn: FakeConnection | null }).conn, null);
+
+  await driver.connect();
+  const result = await driver.read(
+    'SELECT id FROM users',
+    [],
+    new AbortController().signal,
+  );
+
+  assert.equal(createCalls, 2);
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[2]]);
+  await driver.close();
+});
+
 test('MysqlDriver uses the URI host and port for mysql2 connections', async (t) => {
   let target: { host: unknown; port: unknown } | undefined;
   mock.method(net, 'connect', (...args: unknown[]) => {

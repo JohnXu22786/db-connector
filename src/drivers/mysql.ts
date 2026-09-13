@@ -119,6 +119,7 @@ export class MysqlDriver implements DriverApi {
             if (settled) return;
             settled = true;
             cleanup();
+            if (!abortError && this.conn === conn) this.conn = null;
             reject(toConnectorError(this.spec, err));
           };
           const onAbort = () => {
@@ -128,7 +129,8 @@ export class MysqlDriver implements DriverApi {
             abortError = cancelError(signal);
           };
           if (signal.aborted) {
-            fail(cancelError(signal));
+            abortError = cancelError(signal);
+            fail(abortError);
             return;
           }
           signal.addEventListener('abort', onAbort, { once: true });
