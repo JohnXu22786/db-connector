@@ -256,10 +256,12 @@ export class MysqlDriver implements DriverApi {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    await this.lifecycleMutex.runExclusive(async () => {
-      const conn = this.conn;
-      this.conn = null;
-      if (conn) await conn.end().catch(() => {});
+    await this.transactionMutex.runExclusive(async () => {
+      await this.lifecycleMutex.runExclusive(async () => {
+        const conn = this.conn;
+        this.conn = null;
+        if (conn) await conn.end().catch(() => {});
+      });
     });
   }
 }
