@@ -222,6 +222,12 @@ function containsWriteKeyword(sql: string): boolean {
   );
 }
 
+function hasTopLevelInto(sql: string): boolean {
+  return meaningful(sql).some(
+    (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'INTO',
+  );
+}
+
 /**
  * Classify an EXPLAIN ANALYZE statement. Bare EXPLAIN plans never execute;
  * EXPLAIN ANALYZE does (PostgreSQL executes the underlying DML), so the
@@ -230,6 +236,7 @@ function containsWriteKeyword(sql: string): boolean {
  * treated as a write (conservative: never admitted through a read path).
  */
 function classifyAnalyzed(sql: string): 'select' | 'write' {
+  if (hasTopLevelInto(sql)) return 'write';
   if (containsWriteKeyword(sql)) return 'write';
   const keyword = firstDataKeyword(sql);
   const kw = keyword?.value.toUpperCase() ?? '';
@@ -254,9 +261,7 @@ export function classifyStatement(sql: string): {
   if (word === 'SELECT' || word === 'VALUES') {
     // SELECT ... INTO creates a table (PostgreSQL) or writes a file
     // (MySQL INTO OUTFILE/DUMPFILE) — a top-level INTO makes it a write.
-    const hasInto = word === 'SELECT' && tokens.some(
-      (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'INTO',
-    );
+    const hasInto = word === 'SELECT' && hasTopLevelInto(sql);
     return hasInto ? { kind: 'write', firstWord: word } : { kind: 'select', firstWord: word };
   }
 
@@ -279,7 +284,9 @@ export function classifyStatement(sql: string): {
     // WITH may be read (WITH ... SELECT) or a write: the outer keyword can
     // SELECT while a data-modifying CTE (PostgreSQL) writes. Any write
     // keyword anywhere marks the whole statement a write.
-    if (containsWriteKeyword(sql)) return { kind: 'write', firstWord: word };
+    if (hasTopLevelInto(sql) || containsWriteKeyword(sql)) {
+      return { kind: 'write', firstWord: word };
+    }
     const next = firstDataKeyword(sql);
     if (next) return { kind: 'select', firstWord: word };
     return { kind: 'unknown', firstWord: word };
