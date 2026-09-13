@@ -160,7 +160,7 @@ export async function runDbLine(
       if (!name) throw new Error('usage: /db query <name> --sql "SELECT ..."');
       if (!sql) throw new Error('missing --sql "..."');
       const paramsText = flagStr(flags, 'params');
-      const params = paramsText ? decodeCsv(paramsText) : undefined;
+      const params = paramsText !== undefined ? decodeCsv(paramsText) : undefined;
       const limit = flagNumber(flags, 'limit');
       const result = await engine.query(
         {
@@ -187,7 +187,7 @@ export async function runDbLine(
       if (!name) throw new Error('usage: /db exec <name> --sql "..." --allow-write');
       if (!sql) throw new Error('missing --sql "..."');
       const paramsText = flagStr(flags, 'params');
-      const params = paramsText ? decodeCsv(paramsText) : undefined;
+      const params = paramsText !== undefined ? decodeCsv(paramsText) : undefined;
       const result = await engine.exec(
         {
           connection: name,
