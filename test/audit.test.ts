@@ -85,6 +85,16 @@ test('audit summaries do not treat SQLite backslashes as string escapes', async 
   assert.ok(!JSON.stringify(rec).includes('SQLITE_SECRET'));
 });
 
+test('audit summaries redact SQLite comment suffixes containing quotes', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: String.raw`SELECT 'safe\' -- 'SQLITE_COMMENT_SECRET` }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('SQLITE_COMMENT_SECRET'));
+});
+
 test('audit summaries redact MySQL double-quoted string literals', async () => {
   const log = new AuditLog(freshPath());
   await log.append(input({ sql: String.raw`SELECT "safe\"MYSQL_SECRET"` }));

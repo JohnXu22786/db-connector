@@ -464,12 +464,11 @@ function renderSanitized(sql: string, tokenSets: Token[][]): string {
   const comments = mergeSpans(
     tokenSets.flatMap((tokens) => tokens
       .filter((token) => token.type === 'comment')
-      .map((token) => ({
+      .flatMap((token) => subtractSpans({
         start: token.pos,
         end: token.pos + token.value.length,
         replacement: ' ',
-      })))
-      .filter((span) => !literals.some((literal) => overlaps(span, literal))),
+      }, literals))),
   );
   const spans = [...literals, ...comments].sort((a, b) => a.start - b.start);
   let out = '';
@@ -483,8 +482,22 @@ function renderSanitized(sql: string, tokenSets: Token[][]): string {
   return out + sql.slice(cursor);
 }
 
-function overlaps(a: RedactionSpan, b: RedactionSpan): boolean {
-  return a.start < b.end && b.start < a.end;
+function subtractSpans(span: RedactionSpan, blockers: RedactionSpan[]): RedactionSpan[] {
+  const pieces: RedactionSpan[] = [];
+  let start = span.start;
+  for (const blocker of blockers) {
+    if (blocker.end <= start) continue;
+    if (blocker.start >= span.end) break;
+    if (blocker.start > start) {
+      pieces.push({ start, end: blocker.start, replacement: span.replacement });
+    }
+    start = Math.max(start, blocker.end);
+    if (start >= span.end) break;
+  }
+  if (start < span.end) {
+    pieces.push({ start, end: span.end, replacement: span.replacement });
+  }
+  return pieces;
 }
 
 function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
