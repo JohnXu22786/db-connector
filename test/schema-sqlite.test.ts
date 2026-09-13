@@ -89,6 +89,57 @@ test('schema snapshot lists tables, columns, indexes, foreign keys', async () =>
   assert.deepEqual(fk!.referencedColumns, ['id']);
 });
 
+test('schema snapshot preserves SQLite nullability for non-INTEGER primary keys', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE records (key TEXT PRIMARY KEY, value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const key = s.columns.find((column) => column.table === 'records' && column.name === 'key')!;
+
+  assert.equal(key.primaryKey, true);
+  assert.equal(key.nullable, true);
+});
+
+test('schema snapshot preserves SQLite nullability for composite INTEGER primary keys', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE records (key INTEGER, scope INTEGER, PRIMARY KEY (key, scope))',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const keys = s.columns.filter((column) => column.table === 'records' && column.primaryKey);
+
+  assert.deepEqual(keys.map((column) => column.name), ['key', 'scope']);
+  assert.equal(keys.every((column) => column.nullable), true);
+});
+
+test('schema snapshot preserves SQLite nullability for INTEGER PRIMARY KEY DESC', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE records (key INTEGER PRIMARY KEY DESC, value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const key = s.columns.find((column) => column.table === 'records' && column.name === 'key')!;
+
+  assert.equal(key.primaryKey, true);
+  assert.equal(key.nullable, true);
+});
+
 test('schema snapshot lists columns for SQLite views', async () => {
   const h = makeHarness();
   await seedSqlite(h);

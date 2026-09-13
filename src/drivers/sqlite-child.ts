@@ -115,17 +115,18 @@ function runSchema(): unknown {
 
   const quote = (name: string): string => name.replaceAll('"', '""');
 
-  const readColumns = (object: { name: string; sql?: string }): void => {
+  const readColumns = (object: { name: string; sql?: string }, hasPrimaryKeyIndex = false): void => {
     const cols = db
       .prepare(`PRAGMA table_info("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
     const hasAutoincrement = /AUTOINCREMENT/i.test(object.sql ?? '');
     for (const c of cols) {
+      const isRowidAlias = c.pk > 0 && c.type.toUpperCase() === 'INTEGER' && !hasPrimaryKeyIndex;
       columns.push({
         table: object.name,
         name: c.name,
         type: c.type || 'ANY',
-        nullable: c.notnull === 0 && c.pk === 0,
+        nullable: c.notnull === 0 && !isRowidAlias,
         ordinal: c.cid + 1,
         default: c.dflt_value ?? null,
         primaryKey: c.pk > 0,
@@ -135,11 +136,12 @@ function runSchema(): unknown {
   };
 
   for (const table of tables) {
-    readColumns(table);
-
     const idxRows = db
       .prepare(`PRAGMA index_list("${quote(table.name)}")`)
       .all() as unknown as Array<{ name: string; unique: number; origin: string }>;
+    const hasPrimaryKeyIndex = idxRows.some((idx) => idx.origin === 'pk');
+    readColumns(table, hasPrimaryKeyIndex);
+
     for (const idx of idxRows) {
       const parts = db
         .prepare(`PRAGMA index_info("${quote(idx.name)}")`)
