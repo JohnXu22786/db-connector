@@ -102,6 +102,31 @@ test('close removes the connection; closeAll clears everything', async () => {
   assert.equal(h.connectors.has('b'), false);
 });
 
+test('closeAll blocks new definitions until teardown finishes', async () => {
+  const h = makeHarness();
+  const closeStarted = deferred<void>();
+  const releaseClose = deferred<void>();
+  installDriver(h, makeFakeDriver(async () => {}, async () => {
+    closeStarted.resolve();
+    await releaseClose.promise;
+  }));
+  h.connectors.define({ name: 'a', driver: 'sqlite' });
+  await h.connectors.open('a');
+
+  const closing = h.connectors.closeAll();
+  await closeStarted.promise;
+  assert.throws(
+    () => h.connectors.define({ name: 'b', driver: 'sqlite' }),
+    (e: DbConnectorError) => e.code === ErrorCode.ConnectionNotFound,
+  );
+
+  releaseClose.resolve();
+  await closing;
+  h.connectors.define({ name: 'b', driver: 'sqlite' });
+  assert.equal(h.connectors.has('b'), true);
+  await h.connectors.close('b');
+});
+
 test('close cancels a pending open waiter and closes its driver', async () => {
   const h = makeHarness();
   const openingStarted = deferred<void>();
