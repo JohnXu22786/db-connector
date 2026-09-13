@@ -277,6 +277,7 @@ export class SqliteDriver implements DriverApi {
     this.closed = true;
     const child = this.child;
     this.child = null;
+    const retiring = this.retiring;
     // reject any still-in-flight requests to the current (and stale) children
     for (const [id, entry] of this.pending) {
       this.pending.delete(id);
@@ -299,6 +300,7 @@ export class SqliteDriver implements DriverApi {
       ]);
       if (child.exitCode === null) child.kill('SIGKILL');
     }
+    await retiring;
   }
 }
 

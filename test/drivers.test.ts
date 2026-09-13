@@ -861,6 +861,75 @@ test('SQLite cancellation waits for the child to exit before rejecting', async (
   }
 });
 
+test('SQLite close waits for a canceled child before reopening', async () => {
+  const spec = {
+    name: 'sqlite-test',
+    driver: 'sqlite' as const,
+    database: ':memory:',
+    password: '',
+    passwordSource: 'none' as const,
+    options: {},
+  };
+  const driver = new SqliteDriver(spec, logger);
+  const state = driver as unknown as {
+    ensureChild(): {
+      send: (...args: unknown[]) => boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+    };
+  };
+  const child = state.ensureChild();
+  const originalSend = child.send.bind(child);
+  const originalKill = child.kill.bind(child);
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let killCalled!: () => void;
+  const killStarted = new Promise<void>((resolve) => {
+    killCalled = resolve;
+  });
+  child.send = () => true;
+  child.kill = (signal) => {
+    killCalled();
+    killTimer = setTimeout(() => {
+      killTimer = undefined;
+      originalKill(signal);
+    }, 50);
+    return true;
+  };
+
+  const controller = new AbortController();
+  let closing: Promise<void> | undefined;
+  let reopened: SqliteDriver | undefined;
+  try {
+    const cancellation = driver.read('SELECT 1', [], controller.signal);
+    controller.abort();
+    closing = driver.close();
+    let closeSettled = false;
+    void closing.then(() => {
+      closeSettled = true;
+    });
+
+    await killStarted;
+    await nextTurn();
+    assert.equal(closeSettled, false);
+
+    const cancellationError = await cancellation.then(() => undefined, (err: unknown) => err);
+    assert.ok(cancellationError instanceof DbConnectorError);
+    assert.equal((cancellationError as DbConnectorError).code, ErrorCode.Cancelled);
+    await closing;
+
+    reopened = new SqliteDriver(spec, logger);
+    await reopened.connect();
+  } finally {
+    if (killTimer !== undefined) clearTimeout(killTimer);
+    child.send = originalSend;
+    if (child.exitCode === null && child.signalCode === null) originalKill('SIGKILL');
+    if (closing) await closing;
+    else await driver.close();
+    await reopened?.close();
+  }
+});
+
 interface MysqlClientFake {
   query(sql: string): Promise<[unknown, unknown]>;
   execute(options: unknown): Promise<[unknown, unknown]>;
