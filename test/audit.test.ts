@@ -65,6 +65,16 @@ test('audit summaries redact string literal bodies', async () => {
   assert.ok(!JSON.stringify(rec).includes('secret'));
 });
 
+test('audit summaries redact backslash-escaped string literals', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: "SELECT 'safe\\'SECRET'" }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('SECRET'));
+});
+
 test('error records carry code + message, rows default to 0', async () => {
   const log = new AuditLog(freshPath());
   await log.append(input({ status: 'error', error: { code: 'QUERY_FAILED', message: 'boom' }, rows: 0 }));

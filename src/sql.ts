@@ -6,10 +6,10 @@
  * text. All recognition is string-literal / comment aware so a crafted value
  * like `'INSERT'` or a `SELECT ... -- DROP` comment can never fool the gate.
  *
- * Scanner limitation note: single-quoted strings follow ANSI doubling (`''`)
- * and a bare `'` in MySQL with backslash-escaped quotes is recognized only
- * approximately. Classification only ever uses recognition to REJECT writes,
- * never to allow them, so this cannot widen the write surface.
+ * Scanner limitation note: single-quoted strings follow ANSI doubling (`''`).
+ * Summary normalization additionally enables MySQL-style backslash escapes.
+ * Classification only ever uses recognition to REJECT writes, never to allow
+ * them, so this cannot widen the write surface.
  */
 
 import { ErrorCode, DbConnectorError } from './errors.js';
@@ -34,6 +34,11 @@ export interface Token {
   depth: number;
 }
 
+interface ScanOptions {
+  /** Treat backslashes as escapes inside single-quoted strings. */
+  backslashEscapes?: boolean;
+}
+
 /** Data-statement keywords valid at the top level of a statement. */
 const DATA_KEYWORDS = new Set([
   'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'VALUES',
@@ -47,11 +52,12 @@ const WRITE_KEYWORDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE'
  * parameter markers. Paren depth is recorded on each token so callers can
  * distinguish a top-level LIMIT from a subquery LIMIT.
  */
-export function scan(sql: string): Token[] {
+export function scan(sql: string, options: ScanOptions = {}): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const n = sql.length;
   let depth = 0;
+  const backslashEscapes = options.backslashEscapes === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -89,6 +95,10 @@ export function scan(sql: string): Token[] {
     if (c === "'") {
       i += 1;
       while (i < n) {
+        if (backslashEscapes && sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] === "'") {
           if (sql[i + 1] === "'") {
             i += 2;
@@ -421,9 +431,9 @@ export function assertSingleStatement(sql: string): void {
  * Return a copy of the SQL with comments removed and string-literal bodies /
  * quoted identifiers replaced by `x`, so callers can reason about structure.
  */
-export function stripComments(sql: string): string {
+export function stripComments(sql: string, options: ScanOptions = {}): string {
   let out = '';
-  for (const t of scan(sql)) {
+  for (const t of scan(sql, options)) {
     if (t.type === 'comment') out += ' ';
     else if (t.type === 'string') out += `'x'`;
     else if (t.type === 'quotedid') out += `"x"`;
@@ -434,7 +444,7 @@ export function stripComments(sql: string): string {
 
 /** Collapse whitespace, dropping comments. Used for summaries/digests. */
 export function normalizeText(sql: string): string {
-  return stripComments(sql).replace(/\s+/g, ' ').trim();
+  return stripComments(sql, { backslashEscapes: true }).replace(/\s+/g, ' ').trim();
 }
 
 /**
