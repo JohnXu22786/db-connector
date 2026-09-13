@@ -69,3 +69,10 @@ test('capRows truncates and reports', () => {
   assert.deepEqual(capRows(rows, undefined), { rows, truncated: false });
   assert.equal(capRows(rows, 0).rows.length, 0);
 });
+
+test('capRows rejects a negative row limit', () => {
+  assert.throws(
+    () => capRows([1, 2, 3], -1),
+    { name: 'RangeError', message: 'maxRows must be a non-negative number' },
+  );
+});
