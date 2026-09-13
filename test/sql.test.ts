@@ -175,6 +175,38 @@ test('toDollarPlaceholders rewrites positional ? outside strings/comments', () =
   });
 });
 
+test('MySQL backslash-escaped strings protect placeholder markers', () => {
+  const sql = "SELECT 'it\\'s ? :ignored', ?";
+  assert.deepEqual(toDollarPlaceholders(sql, 'mysql'), {
+    sql: "SELECT 'it\\'s ? :ignored', $1",
+    count: 1,
+  });
+
+  assert.deepEqual(
+    rewriteNamedToPositional("SELECT 'it\\'s ? :ignored', :value", ['value'], 'mysql'),
+    {
+      sql: "SELECT 'it\\'s ? :ignored', ?",
+      order: ['value'],
+    },
+  );
+});
+
+test("PostgreSQL E'...' strings protect escaped placeholder markers", () => {
+  const sql = "SELECT E'it\\'s ? :ignored', ?";
+  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), {
+    sql: "SELECT E'it\\'s ? :ignored', $1",
+    count: 1,
+  });
+
+  assert.deepEqual(
+    rewriteNamedToPositional("SELECT E'it\\'s ? :ignored', :value", ['value'], 'postgres'),
+    {
+      sql: "SELECT E'it\\'s ? :ignored', ?",
+      order: ['value'],
+    },
+  );
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',

@@ -200,3 +200,53 @@ test('failed schema introspection is audited', async () => {
   assert.equal(records[0]!.error?.code, ErrorCode.QueryFailed);
   assert.equal(records[0]!.error?.message, 'schema failed');
 });
+
+test('executor binds markers using the MySQL escaped-string dialect', async () => {
+  const h = makeHarness();
+  let received: { sql: string; params: unknown[] } | undefined;
+  installDriver(h, emptyDriver({
+    kind: 'mysql',
+    read: async (sql, params) => {
+      received = { sql, params };
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+  }));
+  h.connectors.define({ name: 'mysql-escaped', driver: 'mysql', database: 'test' });
+
+  await h.engine.query({
+    connection: 'mysql-escaped',
+    sql: "SELECT 'it\\'s ? :ignored', ? LIMIT 1",
+    params: [42],
+    way: 'cli',
+  }, freshSignal());
+
+  assert.deepEqual(received, {
+    sql: "SELECT 'it\\'s ? :ignored', ? LIMIT 1",
+    params: [42],
+  });
+});
+
+test("executor binds markers using PostgreSQL E'...' strings", async () => {
+  const h = makeHarness();
+  let received: { sql: string; params: unknown[] } | undefined;
+  installDriver(h, emptyDriver({
+    kind: 'postgres',
+    read: async (sql, params) => {
+      received = { sql, params };
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+  }));
+  h.connectors.define({ name: 'postgres-escaped', driver: 'postgres', database: 'test' });
+
+  await h.engine.query({
+    connection: 'postgres-escaped',
+    sql: "SELECT E'it\\'s ? :ignored', :value LIMIT 1",
+    namedParams: { value: 42 },
+    way: 'cli',
+  }, freshSignal());
+
+  assert.deepEqual(received, {
+    sql: "SELECT E'it\\'s ? :ignored', ? LIMIT 1",
+    params: [42],
+  });
+});
