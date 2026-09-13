@@ -6,10 +6,10 @@
  * text. All recognition is string-literal / comment aware so a crafted value
  * like `'INSERT'` or a `SELECT ... -- DROP` comment can never fool the gate.
  *
- * Scanner limitation note: single-quoted strings follow ANSI doubling (`''`).
- * Summary normalization additionally enables MySQL-style backslash escapes.
- * Classification only ever uses recognition to REJECT writes, never to allow
- * them, so this cannot widen the write surface.
+ * The default scanner follows ANSI string escaping (`''`). Dialect-aware scans
+ * additionally recognize MySQL backslash escapes and PostgreSQL `E'...'`
+ * escape strings. Classification only ever uses recognition to REJECT writes,
+ * never to allow them, so this cannot widen the write surface.
  */
 
 import { ErrorCode, DbConnectorError } from './errors.js';
@@ -34,9 +34,17 @@ export interface Token {
   depth: number;
 }
 
-interface ScanOptions {
+export interface ScanOptions {
   /** Treat backslashes as escapes inside quoted strings. */
   backslashEscapes?: boolean;
+  /** Recognize PostgreSQL `E'...'` escape string constants. */
+  postgresEscapeStrings?: boolean;
+}
+
+function scanOptionsForDriver(driver: DriverKind): ScanOptions {
+  if (driver === 'mysql') return { backslashEscapes: true };
+  if (driver === 'postgres') return { postgresEscapeStrings: true };
+  return {};
 }
 
 /** Data-statement keywords valid at the top level of a statement. */
@@ -50,15 +58,18 @@ const WRITE_KEYWORDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE'
 /**
  * Scan SQL into tokens, tracking strings, quoted identifiers, comments, and
  * parameter markers. Paren depth is recorded on each token so callers can
- * distinguish a top-level LIMIT from a subquery LIMIT. `backslashEscapes` is
- * enabled only for the MySQL-compatible summary pass.
+ * distinguish a top-level LIMIT from a subquery LIMIT. A driver selects the
+ * dialect-specific string rules; an options object is also accepted for
+ * dialect-independent callers such as audit redaction.
  */
-export function scan(sql: string, options: ScanOptions = {}): Token[] {
+export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const n = sql.length;
   let depth = 0;
-  const backslashEscapes = options.backslashEscapes === true;
+  const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
+  const backslashEscapes = resolvedOptions.backslashEscapes === true;
+  const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -89,6 +100,33 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
       while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
       i = Math.min(n, i + 2);
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // PostgreSQL escape string constant: E'...' / e'...'. Backslashes have
+    // special meaning only in this prefixed form (not ordinary PG strings).
+    if (
+      postgresEscapeStrings &&
+      (c === 'E' || c === 'e') &&
+      sql[i + 1] === "'"
+    ) {
+      i += 2;
+      while (i < n) {
+        if (sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === "'") {
+          if (sql[i + 1] === "'") {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      tokens.push({ type: 'string', value: sql.slice(at, i), pos: at, depth });
       continue;
     }
 
@@ -214,13 +252,13 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
 }
 
 /** Meaningful tokens: everything except whitespace and comments. */
-function meaningful(sql: string): Token[] {
-  return scan(sql).filter((t) => t.type !== 'space' && t.type !== 'comment');
+function meaningful(sql: string, driver?: DriverKind): Token[] {
+  return scan(sql, driver ?? {}).filter((t) => t.type !== 'space' && t.type !== 'comment');
 }
 
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
-function firstDataKeyword(sql: string): Token | undefined {
-  const tokens = meaningful(sql);
+function firstDataKeyword(sql: string, driver?: DriverKind): Token | undefined {
+  const tokens = meaningful(sql, driver);
   return tokens.find(
     (t) => t.type === 'word' && t.depth === 0 && DATA_KEYWORDS.has(t.value.toUpperCase()),
   );
@@ -236,14 +274,14 @@ const LEADING_READ = new Set([
  * unquoted occurrence is never a plain identifier, and the scanner never
  * emits them from strings, comments, or quoted identifiers.
  */
-function containsWriteKeyword(sql: string): boolean {
-  return meaningful(sql).some(
+function containsWriteKeyword(sql: string, driver?: DriverKind): boolean {
+  return meaningful(sql, driver).some(
     (t) => t.type === 'word' && WRITE_KEYWORDS.has(t.value.toUpperCase()),
   );
 }
 
-function hasTopLevelInto(sql: string): boolean {
-  return meaningful(sql).some(
+function hasTopLevelInto(sql: string, driver?: DriverKind): boolean {
+  return meaningful(sql, driver).some(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'INTO',
   );
 }
@@ -255,10 +293,10 @@ function hasTopLevelInto(sql: string): boolean {
  * otherwise the first top-level data keyword decides; an unresolved case is
  * treated as a write (conservative: never admitted through a read path).
  */
-function classifyAnalyzed(sql: string): 'select' | 'write' {
-  if (hasTopLevelInto(sql)) return 'write';
-  if (containsWriteKeyword(sql)) return 'write';
-  const keyword = firstDataKeyword(sql);
+function classifyAnalyzed(sql: string, driver?: DriverKind): 'select' | 'write' {
+  if (hasTopLevelInto(sql, driver)) return 'write';
+  if (containsWriteKeyword(sql, driver)) return 'write';
+  const keyword = firstDataKeyword(sql, driver);
   const kw = keyword?.value.toUpperCase() ?? '';
   if (kw === 'SELECT' || kw === 'VALUES') return 'select';
   return 'write';
@@ -269,11 +307,11 @@ function classifyAnalyzed(sql: string): 'select' | 'write' {
  * input; anything unrecognized classifies as `unknown` (conservative — the
  * read-only path rejects it).
  */
-export function classifyStatement(sql: string): {
+export function classifyStatement(sql: string, driver?: DriverKind): {
   kind: 'select' | 'explain' | 'write' | 'ddl' | 'unknown';
   firstWord: string;
 } {
-  const tokens = meaningful(sql);
+  const tokens = meaningful(sql, driver);
   const lead = tokens.find((t) => t.type === 'word');
   if (!lead) return { kind: 'unknown', firstWord: '' };
   const word = lead.value.toUpperCase();
@@ -281,7 +319,7 @@ export function classifyStatement(sql: string): {
   if (word === 'SELECT' || word === 'VALUES') {
     // SELECT ... INTO creates a table (PostgreSQL) or writes a file
     // (MySQL INTO OUTFILE/DUMPFILE) — a top-level INTO makes it a write.
-    const hasInto = word === 'SELECT' && hasTopLevelInto(sql);
+    const hasInto = word === 'SELECT' && hasTopLevelInto(sql, driver);
     return hasInto ? { kind: 'write', firstWord: word } : { kind: 'select', firstWord: word };
   }
 
@@ -295,7 +333,7 @@ export function classifyStatement(sql: string): {
       const hasAnalyze = tokens.some(
         (t) => t.type === 'word' && t.value.toUpperCase() === 'ANALYZE',
       );
-      if (hasAnalyze) return { kind: classifyAnalyzed(sql), firstWord: word };
+      if (hasAnalyze) return { kind: classifyAnalyzed(sql, driver), firstWord: word };
     }
     return { kind: 'explain', firstWord: word };
   }
@@ -304,10 +342,10 @@ export function classifyStatement(sql: string): {
     // WITH may be read (WITH ... SELECT) or a write: the outer keyword can
     // SELECT while a data-modifying CTE (PostgreSQL) writes. Any write
     // keyword anywhere marks the whole statement a write.
-    if (hasTopLevelInto(sql) || containsWriteKeyword(sql)) {
+    if (hasTopLevelInto(sql, driver) || containsWriteKeyword(sql, driver)) {
       return { kind: 'write', firstWord: word };
     }
-    const next = firstDataKeyword(sql);
+    const next = firstDataKeyword(sql, driver);
     if (next) return { kind: 'select', firstWord: word };
     return { kind: 'unknown', firstWord: word };
   }
@@ -331,7 +369,7 @@ export function classifyStatement(sql: string): {
  * included; all other writes retain transaction protection.
  */
 export function isNonTransactionalStatement(sql: string, driver: DriverKind): boolean {
-  const words = scan(sql)
+  const words = scan(sql, driver)
     .filter((token) => token.type === 'word' && token.depth === 0)
     .map((token) => token.value.toUpperCase());
 
@@ -370,8 +408,8 @@ export function isNonTransactionalStatement(sql: string, driver: DriverKind): bo
  * True when a statement may be sent through a read-only path.
  * Only plain SELECTs and EXPLAIN-style plans qualify.
  */
-export function isReadStatement(sql: string): boolean {
-  const { kind } = classifyStatement(sql);
+export function isReadStatement(sql: string, driver?: DriverKind): boolean {
+  const { kind } = classifyStatement(sql, driver);
   return kind === 'select' || kind === 'explain';
 }
 
@@ -379,8 +417,8 @@ export function isReadStatement(sql: string): boolean {
  * Assert the input holds exactly one top-level statement. Semicolons inside
  * strings, quoted identifiers, comments, and trigger bodies are ignored.
  */
-export function assertSingleStatement(sql: string): void {
-  const tokens = scan(sql);
+export function assertSingleStatement(sql: string, driver?: DriverKind): void {
+  const tokens = scan(sql, driver ?? {});
   const meaningful = tokens
     .map((t, idx) => ({ t, idx }))
     .filter(({ t }) => t.type !== 'space' && t.type !== 'comment');
@@ -441,7 +479,7 @@ export function assertSingleStatement(sql: string): void {
  * Return a copy of the SQL with comments removed and string-literal bodies /
  * quoted identifiers replaced by `x`, so callers can reason about structure.
  */
-export function stripComments(sql: string, options: ScanOptions = {}): string {
+export function stripComments(sql: string, options: ScanOptions | DriverKind = {}): string {
   return renderSanitized(sql, [scan(sql, options)]);
 }
 
@@ -515,8 +553,11 @@ function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
 }
 
 /** Collapse whitespace, dropping comments. Used for summaries/digests. */
-export function normalizeText(sql: string): string {
-  return renderSanitized(sql, [scan(sql), scan(sql, { backslashEscapes: true })])
+export function normalizeText(sql: string, driver?: DriverKind): string {
+  const tokenSets = driver
+    ? [scan(sql, driver)]
+    : [scan(sql), scan(sql, 'mysql'), scan(sql, 'postgres')];
+  return renderSanitized(sql, tokenSets)
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -528,8 +569,9 @@ export function normalizeText(sql: string): string {
 export function summarizeSql(
   sql: string,
   maxChars: number,
+  driver?: DriverKind,
 ): { summary: string; digest: string; chars: number } {
-  const normalized = normalizeText(sql);
+  const normalized = normalizeText(sql, driver);
   return {
     summary: truncateMiddle(normalized, Math.max(1, maxChars)),
     digest: sha256(normalized),
@@ -549,9 +591,10 @@ interface RewriteState {
 function rewritePlaceholders(
   sql: string,
   onParam: (state: RewriteState, token: Token) => void,
+  driver?: DriverKind,
 ): RewriteState {
   const state: RewriteState = { out: '', count: 0 };
-  for (const t of scan(sql)) {
+  for (const t of scan(sql, driver ?? {})) {
     if (t.type === 'param') onParam(state, t);
     else state.out += t.value;
   }
@@ -562,11 +605,14 @@ function rewritePlaceholders(
  * Rewrite `?` markers to `$1..$n` for PostgreSQL's client, preserving all
  * other text verbatim.
  */
-export function toDollarPlaceholders(sql: string): { sql: string; count: number } {
+export function toDollarPlaceholders(
+  sql: string,
+  driver?: DriverKind,
+): { sql: string; count: number } {
   const state = rewritePlaceholders(sql, (s) => {
     s.count += 1;
     s.out += `$${s.count}`;
-  });
+  }, driver);
   return { sql: state.out, count: state.count };
 }
 
@@ -578,6 +624,7 @@ export function toDollarPlaceholders(sql: string): { sql: string; count: number 
 export function rewriteNamedToPositional(
   sql: string,
   provided: string[],
+  driver?: DriverKind,
 ): { sql: string; order: string[] } {
   const known = new Map(provided.map((n) => [n.toUpperCase(), n]));
   const order: string[] = [];
@@ -598,7 +645,7 @@ export function rewriteNamedToPositional(
     order.push(providedName);
     s.count += 1;
     s.out += '?';
-  });
+  }, driver);
   void state.count;
   return { sql: state.out, order };
 }
@@ -611,19 +658,20 @@ export function rewriteNamedToPositional(
 export function ensureSelectLimit(
   sql: string,
   limit: number,
+  driver?: DriverKind,
 ): { sql: string; applied: boolean } {
-  const { kind } = classifyStatement(sql);
+  const { kind } = classifyStatement(sql, driver);
   if (kind !== 'select') return { sql, applied: false };
 
-  const tokens = meaningful(sql);
+  const tokens = meaningful(sql, driver);
   const hasTopLevelLimit = tokens.some(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
   );
   if (hasTopLevelLimit) return { sql, applied: false };
 
-  assertSingleStatement(sql);
+  assertSingleStatement(sql, driver);
   const upper = Math.max(1, Math.floor(limit));
-  const insertAt = insertionPoint(sql);
+  const insertAt = insertionPoint(sql, driver);
   const out =
     sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);
   return { sql: out, applied: true };
@@ -636,8 +684,8 @@ export function ensureSelectLimit(
  *  - before a trailing `;` token (so it stays the terminator), or
  *  - after the last meaningful token.
  */
-function insertionPoint(source: string): number {
-  const tokens = scan(source).filter(
+function insertionPoint(source: string, driver?: DriverKind): number {
+  const tokens = scan(source, driver ?? {}).filter(
     (t) => t.type !== 'space' && t.type !== 'comment',
   );
   const last = tokens[tokens.length - 1];
