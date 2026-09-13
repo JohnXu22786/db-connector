@@ -119,6 +119,7 @@ export function createDeadlineSignal(
   timeoutMs?: number,
 ): { signal: AbortSignal; clear: () => void } {
   const sources: AbortSignal[] = [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
   if (caller) sources.push(caller);
   if (
     timeoutMs !== undefined &&
@@ -126,18 +127,31 @@ export function createDeadlineSignal(
     timeoutMs > 0
   ) {
     const delayMs = Math.min(MAX_TIMEOUT_MS, Math.max(1, Math.floor(timeoutMs)));
-    sources.push(AbortSignal.timeout(delayMs));
+    const timeoutController = new AbortController();
+    timer = setTimeout(() => {
+      timer = undefined;
+      timeoutController.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    }, delayMs);
+    timer.unref?.();
+    sources.push(timeoutController.signal);
   }
 
+  const clear = () => {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
+  };
+
   if (sources.length === 0) {
-    return { signal: new AbortController().signal, clear() {} };
+    return { signal: new AbortController().signal, clear };
   }
   if (sources.length === 1) {
     const only = sources[0]!;
-    return { signal: only, clear() {} };
+    return { signal: only, clear };
   }
   const signal = AbortSignal.any(sources);
-  return { signal, clear() {} };
+  return { signal, clear };
 }
 
 /** Compute timing in ms between two high-resolution markers. */
