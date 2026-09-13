@@ -13,6 +13,7 @@ import type { ConnectionSpec, ContentBlock, DshTool } from './types.js';
 interface Prop {
   type?: string;
   minLength?: number;
+  minimum?: number;
   description?: string;
   enum?: readonly unknown[];
 }
@@ -57,6 +58,9 @@ function checkValue(spec: Prop, value: unknown, key: string): void {
       break;
     default:
       break;
+  }
+  if (spec.minimum !== undefined && typeof value === 'number' && value < spec.minimum) {
+    throw invalid(`"${key}" must be at least ${spec.minimum}`);
   }
   if (spec.enum !== undefined && !spec.enum.includes(value)) {
     throw invalid(
@@ -108,7 +112,7 @@ const REQUIRED_NAME_SQL = { type: 'string', minLength: 1, description: 'Name of 
 const SQL_FIELD = { type: 'string', minLength: 1, description: 'Single SQL statement to run.' };
 const PARAMS_FIELD = { type: 'array', description: 'Positional values for "?" placeholders. Values are bound as parameters, never interpolated into SQL text.' };
 const NAMED_FIELD = { type: 'object', description: 'Binding for ":name" placeholders. Values are bound as parameters, never interpolated into SQL text.' };
-const TIMEOUT_FIELD = { type: 'integer', description: 'Per-statement deadline in milliseconds (AbortSignal-based).' };
+const TIMEOUT_FIELD = { type: 'integer', minimum: 1, description: 'Per-statement deadline in milliseconds (AbortSignal-based).' };
 
 const CONNECT_PARAMS = parameters(
   {

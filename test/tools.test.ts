@@ -53,6 +53,18 @@ test('validateArgs enforces types, required, enums and extra keys', () => {
   assert.throws(() => validateArgs(schema, { name: 'x', extra: 1 }), (e: DbConnectorError) => e.code === 'INVALID_ARGS');
 });
 
+test('db_query and db_exec reject negative timeoutMs during tool validation', async () => {
+  const h = makeHarness();
+  const tools = run(h);
+
+  for (const tool of [tools[2]!, tools[3]!]) {
+    await assert.rejects(
+      tool.execute({ name: 'missing', sql: 'SELECT 1', timeoutMs: -1 }, fakeExec()),
+      (e: DbConnectorError) => e.code === 'INVALID_ARGS',
+    );
+  }
+});
+
 test('db_connect list/close/connect through the engine', async () => {
   const h = await makeHarness();
   await seedSqlite(h);
