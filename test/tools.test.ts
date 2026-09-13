@@ -71,6 +71,19 @@ test('db_connect list/close/connect through the engine', async () => {
   assert.equal(made.status.status, 'connected');
 });
 
+test('db_connect rejects a null database with INVALID_ARGS', async () => {
+  const h = makeHarness();
+  const connect = run(h)[0]!;
+
+  await assert.rejects(
+    connect.execute(
+      { action: 'connect', name: 'invalid', config: { driver: 'sqlite', database: null } },
+      fakeExec(),
+    ),
+    (e: DbConnectorError) => e.code === 'INVALID_ARGS',
+  );
+});
+
 test('db_query handler validates and runs read-only', async () => {
   const h = await makeHarness();
   await seedSqlite(h);
@@ -135,4 +148,3 @@ test('raw output renders canonical JSON content blocks', async () => {
   assert.equal(blocks[0]!.type, 'text');
   assert.equal(JSON.parse(blocks[0]!.text).ok, true);
 });
-

@@ -208,6 +208,9 @@ Examples:
       if (typeof config !== 'object' || config === null || Array.isArray(config)) {
         throw invalid('"config" must be an object');
       }
+      if (config.database !== undefined && typeof config.database !== 'string') {
+        throw invalid('"config.database" must be a string');
+      }
       // The explicit top-level "name" wins over any name inside "config".
       const spec: ConnectionSpec = { ...(config as unknown as ConnectionSpec), name };
       const status = await engine.connect(spec);
