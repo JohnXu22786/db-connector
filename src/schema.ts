@@ -61,25 +61,26 @@ export class SchemaService {
       }
     }
 
+    const snapshot = cloneSnapshot(base);
     const filter = normalizeFilter(req.filter);
     const selection = filter
       ? new Set(
-          [...base.tables.map((t) => t.name), ...base.views.map((v) => v.name)].filter(
+          [...snapshot.tables.map((t) => t.name), ...snapshot.views.map((v) => v.name)].filter(
             (name) => name.toLowerCase().includes(filter),
           ),
         )
       : null;
 
     const tables = selection
-      ? base.tables.filter((t) => selection.has(t.name))
-      : base.tables;
+      ? snapshot.tables.filter((t) => selection.has(t.name))
+      : snapshot.tables;
     const views = selection
-      ? base.views.filter((v) => selection.has(v.name))
-      : base.views;
+      ? snapshot.views.filter((v) => selection.has(v.name))
+      : snapshot.views;
     const keep = (t: string): boolean => !selection || selection.has(t);
-    const columns = base.columns.filter((c) => keep(c.table));
-    const indexes = base.indexes.filter((i) => keep(i.table));
-    const foreignKeys = base.foreignKeys.filter((f) => keep(f.table));
+    const columns = snapshot.columns.filter((c) => keep(c.table));
+    const indexes = snapshot.indexes.filter((i) => keep(i.table));
+    const foreignKeys = snapshot.foreignKeys.filter((f) => keep(f.table));
 
     return {
       kind: 'schema',
@@ -104,6 +105,28 @@ export class SchemaService {
     this.cache.clear();
     this.latestIntrospection.clear();
   }
+}
+
+function cloneSnapshot(
+  snapshot: Omit<SchemaResult, 'fromCache'>,
+): Omit<SchemaResult, 'fromCache'> {
+  return {
+    kind: snapshot.kind,
+    connection: snapshot.connection,
+    capturedAt: snapshot.capturedAt,
+    tables: snapshot.tables.map((table) => ({ ...table })),
+    views: snapshot.views.map((view) => ({ ...view })),
+    columns: snapshot.columns.map((column) => ({ ...column })),
+    indexes: snapshot.indexes.map((index) => ({
+      ...index,
+      columns: [...index.columns],
+    })),
+    foreignKeys: snapshot.foreignKeys.map((foreignKey) => ({
+      ...foreignKey,
+      columns: [...foreignKey.columns],
+      referencedColumns: [...foreignKey.referencedColumns],
+    })),
+  };
 }
 
 function normalizeFilter(filter: string | undefined): string | null {
