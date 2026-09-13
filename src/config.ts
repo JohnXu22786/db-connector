@@ -86,7 +86,7 @@ export function resolveConnectionSpec(
 
   let password = '';
   let passwordSource: ResolvedConnectionSpec['passwordSource'] = 'none';
-  const inlinePassword = raw.password !== undefined ? String(raw.password) : undefined;
+  const inlinePassword = raw.password !== undefined ? expandEnv(String(raw.password), env) : undefined;
   const passwordEnv = expandEnv(raw.passwordEnv, env);
 
   // Resolution priority: credentials ref is filled later by the caller when a
@@ -123,7 +123,7 @@ export function resolveConnectionSpec(
     ssl: raw.ssl,
     options: raw.options ?? {},
     passwordEnv,
-    passwordRef: raw.passwordRef,
+    passwordRef: expandEnv(raw.passwordRef, env),
   };
 
   if (driver === 'sqlite') {
