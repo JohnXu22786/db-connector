@@ -23,6 +23,22 @@ test('binary serializes to base64', () => {
   assert.equal(serializeValue(view), Buffer.from(view.buffer).toString('base64'));
 });
 
+test('non-plain objects serialize to null', () => {
+  class CustomResult {
+    value = 1;
+  }
+
+  assert.equal(serializeValue(new CustomResult()), null);
+});
+
+test('preserves an own __proto__ key when serializing objects', () => {
+  const input = JSON.parse('{"__proto__":{"big":1}}') as Record<string, unknown>;
+  const out = serializeValue(input) as Record<string, unknown>;
+
+  assert.deepEqual(Object.keys(out), ['__proto__']);
+  assert.deepEqual(out['__proto__'], { big: 1 });
+});
+
 test('non-finite numbers and undefined become null', () => {
   assert.equal(serializeValue(undefined), null);
   assert.equal(serializeValue(NaN), null);

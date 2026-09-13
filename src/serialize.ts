@@ -8,7 +8,9 @@
  */
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
 }
 
 function toBase64(buffer: Uint8Array): string {
@@ -45,7 +47,14 @@ export function serializeValue(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(serializeValue);
   if (isPlainObject(v)) {
     const out: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(v)) out[key] = serializeValue(val);
+    for (const [key, val] of Object.entries(v)) {
+      Object.defineProperty(out, key, {
+        configurable: true,
+        enumerable: true,
+        value: serializeValue(val),
+        writable: true,
+      });
+    }
     return out;
   }
   return null;
