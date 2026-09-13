@@ -1,12 +1,13 @@
 /**
- * Regression coverage for server-driver transaction serialization and result
- * conversion using fake clients, without requiring live database servers.
+ * Regression coverage for driver transaction serialization, result conversion,
+ * and SQLite lifecycle behavior, without requiring live database servers.
  */
 
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { MysqlDriver } from '../dist/drivers/mysql.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
+import { SqliteDriver } from '../dist/drivers/sqlite.js';
 import { DbConnectorError, ErrorCode } from '../dist/errors.js';
 import type { ResolvedConnectionSpec } from '../dist/types.js';
 
@@ -520,6 +521,36 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     ],
   );
   assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+});
+
+test('SQLite does not retry a request after close starts', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  const state = driver as unknown as {
+    child: { kill(signal?: NodeJS.Signals): boolean } | null;
+  };
+
+  try {
+    const request = driver.read('SELECT 1', [], signal());
+    const closing = driver.close();
+    const requestError = await request.then(() => undefined, (err: unknown) => err);
+    await closing;
+
+    assert.ok(requestError instanceof DbConnectorError);
+    assert.equal((requestError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+    assert.equal(state.child, null);
+  } finally {
+    state.child?.kill('SIGKILL');
+  }
 });
 
 interface MysqlClientFake {
