@@ -532,8 +532,11 @@ export function ensureSelectLimit(
   if (kind !== 'select') return { sql, applied: false };
 
   const tokens = meaningful(sql);
-  const dataKeyword = firstDataKeyword(sql);
-  if (dataKeyword?.value.toUpperCase() !== 'SELECT') {
+  const dataKeywords = tokens.filter(
+    (t) => t.type === 'word' && t.depth === 0 && DATA_KEYWORDS.has(t.value.toUpperCase()),
+  );
+  const finalDataKeyword = dataKeywords[dataKeywords.length - 1];
+  if (finalDataKeyword?.value.toUpperCase() !== 'SELECT') {
     return { sql, applied: false };
   }
   const hasTopLevelLimit = tokens.some(
