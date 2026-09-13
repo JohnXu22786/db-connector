@@ -24,7 +24,10 @@ const HELP = `db — SQL database operations
 export function tokenize(input: string): string[] {
   const regex = /"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'|(\S+)/g;
   const out: string[] = [];
-  for (const m of input.matchAll(regex)) out.push(m[1] ?? m[2] ?? m[3]!);
+  for (const m of input.matchAll(regex)) {
+    const quoted = m[1] ?? m[2];
+    out.push(quoted === undefined ? m[3]! : quoted.replace(/\\(.)/g, '$1'));
+  }
   return out;
 }
 
