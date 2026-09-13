@@ -59,7 +59,7 @@ async function resolveCredential(
   try {
     const b = await provider.resolve(ref as never);
     const value = read(b);
-    return value ?? process.env[ref];
+    return value || process.env[ref];
   } catch {
     return process.env[ref];
   }
