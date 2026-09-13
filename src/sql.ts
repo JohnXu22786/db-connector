@@ -56,6 +56,7 @@ export function scan(sql: string): Token[] {
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
     /[A-Za-z0-9_$\u0080-\uffff]/.test(c);
+  const isDollarTagPart = (c: string): boolean => isIdentPart(c) && c !== '$';
 
   while (i < n) {
     const at = i;
@@ -133,7 +134,7 @@ export function scan(sql: string): Token[] {
     // PostgreSQL dollar-quoted string: $$...$$ or $tag$...$tag$
     if (c === '$') {
       let j = i + 1;
-      while (j < n && isIdentPart(sql[j]!)) j += 1;
+      while (j < n && isDollarTagPart(sql[j]!)) j += 1;
       if (j < n && sql[j] === '$') {
         const delim = sql.slice(i, j + 1);
         const end = sql.indexOf(delim, j + 1);

@@ -173,6 +173,14 @@ test('toDollarPlaceholders rewrites positional ? outside strings/comments', () =
   });
 });
 
+test('PostgreSQL dollar-quoted strings protect placeholders and semicolons', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $$?$$, ?'), {
+    sql: 'SELECT $$?$$, $1',
+    count: 1,
+  });
+  assert.doesNotThrow(() => assertSingleStatement('SELECT $$value; still literal$$'));
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',
