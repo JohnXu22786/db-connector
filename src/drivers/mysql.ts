@@ -47,6 +47,7 @@ export class MysqlDriver implements DriverApi {
   readonly kind = 'mysql' as const;
   private conn: MysqlConnection | null = null;
   private closed = false;
+  private readonly lifecycleMutex = new AsyncMutex();
   private readonly transactionMutex = new AsyncMutex();
 
   constructor(
@@ -55,27 +56,35 @@ export class MysqlDriver implements DriverApi {
   ) {}
 
   async connect(): Promise<void> {
-    if (this.conn) return;
-    const { createConnection } = await loadMysqlModule();
-    const hasConnectionString = Boolean(this.spec.connectionString);
-    const conn = await createConnection({
-      host: hasConnectionString ? undefined : this.spec.host ?? 'localhost',
-      port: hasConnectionString ? undefined : this.spec.port ?? 3306,
-      user: this.spec.user,
-      password: this.spec.password || undefined,
-      database: this.spec.database || undefined,
-      uri: this.spec.connectionString,
-      ssl: normalizeSsl(this.spec.ssl),
-      connectTimeout: 10000,
-      ...this.spec.options,
+    await this.lifecycleMutex.runExclusive(async () => {
+      if (this.closed) {
+        throw new DbConnectorError(
+          ErrorCode.ConnectionNotFound,
+          `connection "${this.spec.name}" is closed`,
+        );
+      }
+      if (this.conn) return;
+      const { createConnection } = await loadMysqlModule();
+      const hasConnectionString = Boolean(this.spec.connectionString);
+      const conn = await createConnection({
+        host: hasConnectionString ? undefined : this.spec.host ?? 'localhost',
+        port: hasConnectionString ? undefined : this.spec.port ?? 3306,
+        user: this.spec.user,
+        password: this.spec.password || undefined,
+        database: this.spec.database || undefined,
+        uri: this.spec.connectionString,
+        ssl: normalizeSsl(this.spec.ssl),
+        connectTimeout: 10000,
+        ...this.spec.options,
+      });
+      try {
+        await conn.query('SELECT 1');
+      } catch (err) {
+        conn.destroy();
+        throw toConnectorError(this.spec, err);
+      }
+      this.conn = conn;
     });
-    try {
-      await conn.query('SELECT 1');
-    } catch (err) {
-      conn.destroy();
-      throw toConnectorError(this.spec, err);
-    }
-    this.conn = conn;
   }
 
   private ensure(): MysqlConnection {
@@ -247,9 +256,11 @@ export class MysqlDriver implements DriverApi {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    const conn = this.conn;
-    this.conn = null;
-    if (conn) await conn.end().catch(() => {});
+    await this.lifecycleMutex.runExclusive(async () => {
+      const conn = this.conn;
+      this.conn = null;
+      if (conn) await conn.end().catch(() => {});
+    });
   }
 }
 
