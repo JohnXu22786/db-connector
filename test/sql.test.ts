@@ -189,6 +189,14 @@ test('unmatched dollar tags do not hide SQLite parameters or statements', () => 
   assert.throws(() => assertSingleStatement('SELECT $foo$; SELECT ?'), DbConnectorError);
 });
 
+test('digit-leading dollar tags do not hide placeholders or statements', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $1$?; SELECT $1$, ?'), {
+    sql: 'SELECT $1$$1; SELECT $1$, $2',
+    count: 2,
+  });
+  assert.throws(() => assertSingleStatement('SELECT $1$; SELECT $1$'), DbConnectorError);
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',
