@@ -41,6 +41,52 @@ interface MasterRow {
 const database = process.env.DSH_DB_CONNECTOR_SQLITE_DATABASE ?? ':memory:';
 const db = new DatabaseSync(database);
 
+// `process.send` is asynchronous. Keep the child alive until every response
+// has been acknowledged by the IPC channel; otherwise a close message can
+// call process.exit while the previous response is still buffered.
+let pendingResponseSends = 0;
+let closeRequested = false;
+let closeStarted = false;
+
+function exitAfterResponses(): void {
+  if (!closeRequested || closeStarted || pendingResponseSends !== 0) return;
+  closeStarted = true;
+  try {
+    db.close();
+  } finally {
+    process.exit(0);
+  }
+}
+
+function sendResponse(message: {
+  id: number;
+  ok: boolean;
+  payload?: unknown;
+  error?: string;
+}): void {
+  if (!process.send) {
+    exitAfterResponses();
+    return;
+  }
+
+  pendingResponseSends += 1;
+  let acknowledged = false;
+  const onAcknowledged = (): void => {
+    if (acknowledged) return;
+    acknowledged = true;
+    pendingResponseSends -= 1;
+    exitAfterResponses();
+  };
+
+  try {
+    process.send(message, onAcknowledged);
+  } catch {
+    // A disconnected parent cannot receive the response. Do not leave the
+    // close path waiting forever for an acknowledgement that cannot arrive.
+    onAcknowledged();
+  }
+}
+
 function runQuery(req: Request): unknown {
   const stmt = db.prepare(req.sql ?? '');
   const columns = stmt.columns().map((column) => column.name);
@@ -219,11 +265,8 @@ function runSchema(): unknown {
 process.on('message', (req: Request) => {
   if (!req || typeof req !== 'object') return;
   if (req.op === 'close') {
-    try {
-      db.close();
-    } finally {
-      process.exit(0);
-    }
+    closeRequested = true;
+    exitAfterResponses();
     return;
   }
   try {
@@ -231,10 +274,10 @@ process.on('message', (req: Request) => {
     if (req.op === 'query') payload = runQuery(req);
     else if (req.op === 'write') payload = runWrite(req);
     else payload = runSchema();
-    process.send?.({ id: req.id, ok: true, payload });
+    sendResponse({ id: req.id, ok: true, payload });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    process.send?.({ id: req.id, ok: false, error: message });
+    sendResponse({ id: req.id, ok: false, error: message });
   }
 });
 
