@@ -178,3 +178,12 @@ test('normalizeConfig preserves the connection-map key over a nested name', () =
 
   assert.equal(cfg.connections.alias?.name, 'alias');
 });
+
+test('normalizeConfig preserves a connection named __proto__', () => {
+  const connections = { ['__proto__']: { driver: 'sqlite' } };
+  const cfg = normalizeConfig({ connections }, {});
+
+  assert.ok(Object.hasOwn(cfg.connections, '__proto__'));
+  assert.equal(cfg.connections['__proto__']?.name, '__proto__');
+  assert.equal(cfg.connections['__proto__']?.driver, 'sqlite');
+});
