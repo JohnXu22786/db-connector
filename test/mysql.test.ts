@@ -107,6 +107,115 @@ const net = require('node:net') as {
   connect(...args: unknown[]): FakeStream;
 };
 
+const mysqlPromise = require('mysql2/promise') as {
+  createConnection(options: Record<string, unknown>): Promise<FakeConnection>;
+};
+
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+test('MysqlDriver closes a connection that finishes connecting concurrently', async (t) => {
+  const validation = deferred<[unknown, unknown]>();
+  const validationStarted = deferred<void>();
+  let createCalls = 0;
+  let endCalls = 0;
+  const connection: FakeConnection = {
+    execute: async () => [[], []],
+    query: async (sql) => {
+      if (sql === 'SELECT 1') {
+        validationStarted.resolve();
+        return validation.promise;
+      }
+      return [[], []];
+    },
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {
+      endCalls += 1;
+    },
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return connection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'lifecycle', driver: 'mysql', database: 'test' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+  const connecting = driver.connect();
+  await validationStarted.promise;
+  const closing = driver.close();
+
+  assert.equal(endCalls, 0);
+  validation.resolve([[], []]);
+  await Promise.all([connecting, closing]);
+
+  assert.equal(createCalls, 1);
+  assert.equal(endCalls, 1);
+  assert.equal((driver as unknown as { conn: FakeConnection | null }).conn, null);
+  await assert.rejects(() => driver.connect(), (error: unknown) => {
+    return error instanceof DbConnectorError && error.code === ErrorCode.ConnectionNotFound;
+  });
+});
+
+test('MysqlDriver releases its lifecycle lock after a failed connection', async (t) => {
+  let createCalls = 0;
+  let destroyCalls = 0;
+  let endCalls = 0;
+  const failedConnection: FakeConnection = {
+    execute: async () => [[], []],
+    query: async () => {
+      throw new Error('validation failed');
+    },
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {
+      destroyCalls += 1;
+    },
+    end: async () => {},
+  };
+  const workingConnection: FakeConnection = {
+    execute: async () => [[], []],
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {
+      endCalls += 1;
+    },
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return createCalls === 1 ? failedConnection : workingConnection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'retry', driver: 'mysql', database: 'test' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+
+  await assert.rejects(() => driver.connect());
+  await driver.connect();
+
+  assert.equal(createCalls, 2);
+  assert.equal(destroyCalls, 1);
+  assert.equal((driver as unknown as { conn: FakeConnection | null }).conn, workingConnection);
+  await driver.close();
+  assert.equal(endCalls, 1);
+});
+
 test('MysqlDriver uses the URI host and port for mysql2 connections', async (t) => {
   let target: { host: unknown; port: unknown } | undefined;
   mock.method(net, 'connect', (...args: unknown[]) => {
