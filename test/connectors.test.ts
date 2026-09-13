@@ -443,3 +443,41 @@ test('open reconnects an existing driver after a dropped connection', async () =
   assert.equal(connectCalls, 1);
   await reopened.read('SELECT 1', [], new AbortController().signal);
 });
+
+test('failed reconnect reports the connection as defined', async () => {
+  const h = makeHarness();
+  h.connectors.define({ name: 'mysql', driver: 'mysql', database: 'test' });
+
+  let connectCalls = 0;
+  const driver: DriverApi = {
+    kind: 'mysql',
+    connect: async () => {
+      connectCalls += 1;
+      if (connectCalls === 1) throw new Error('reconnect failed');
+    },
+    read: async () => ({ columns: [], rows: [], rowCount: 0 }),
+    write: async (_sql, _params, isDdl) => ({ affectedRows: 0, isDdl }),
+    introspect: async () => ({
+      tables: [],
+      views: [],
+      columns: [],
+      indexes: [],
+      foreignKeys: [],
+    }),
+    close: async () => {},
+  };
+  const record = (h.connectors as unknown as {
+    map: Map<string, { driver: DriverApi | null; status: string }>;
+  }).map.get('mysql');
+  assert.ok(record);
+  record.driver = driver;
+  record.status = 'connected';
+
+  await assert.rejects(h.connectors.open('mysql'), /reconnect failed/);
+  assert.equal(h.connectors.describe('mysql')?.status, 'defined');
+  assert.equal(h.connectors.has('mysql'), true);
+
+  await h.connectors.open('mysql');
+  assert.equal(h.connectors.describe('mysql')?.status, 'connected');
+  assert.equal(connectCalls, 2);
+});
