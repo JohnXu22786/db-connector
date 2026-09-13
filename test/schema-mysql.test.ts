@@ -94,3 +94,25 @@ test('MySQL schema introspection keeps colon-containing names distinct', () => {
     },
   ]);
 });
+
+test('MySQL schema introspection preserves NULL functional index columns as empty names', () => {
+  const indexes = indexesFromStatistics([
+    {
+      table_name: 'users',
+      index_name: 'idx_users_lower_email',
+      non_unique: 1,
+      seq_in_index: 1,
+      column_name: null,
+    },
+  ]);
+
+  assert.deepEqual(indexes, [
+    {
+      name: 'idx_users_lower_email',
+      table: 'users',
+      columns: [''],
+      unique: false,
+      primary: false,
+    },
+  ]);
+});
