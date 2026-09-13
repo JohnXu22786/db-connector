@@ -177,6 +177,53 @@ function makeEngine(driver: DriverApi): ExecutionEngine {
   });
 }
 
+test('successful PostgreSQL SELECT INTO invalidates the schema cache', async () => {
+  let introspections = 0;
+  let writeIsDdl: boolean | undefined;
+  const driver: DriverApi = {
+    kind: 'postgres',
+    async connect() {},
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write(_sql, _params, isDdl) {
+      writeIsDdl = isDdl;
+      return { affectedRows: 0, isDdl };
+    },
+    async introspect() {
+      introspections += 1;
+      return introspections === 1
+        ? emptyIntrospection()
+        : { ...emptyIntrospection(), tables: [{ name: 'created_table' }] };
+    },
+    async close() {},
+  };
+  const engine = makeEngine(driver);
+
+  await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  assert.equal(introspections, 1);
+
+  const result = await engine.exec({
+    connection: 'pg',
+    sql: 'SELECT * INTO created_table FROM source_table',
+    allowWrite: true,
+    way: 'cli',
+  }, new AbortController().signal);
+
+  assert.equal(writeIsDdl, true);
+  assert.equal(result.kind, 'ddl');
+
+  const refreshed = await engine.schema(
+    { connection: 'pg', way: 'cli' },
+    new AbortController().signal,
+  );
+  assert.equal(refreshed.fromCache, false);
+  assert.ok(refreshed.tables.some((table) => table.name === 'created_table'));
+  assert.equal(introspections, 2);
+  await engine.dispose();
+});
+
 test('failed non-transactional DDL invalidates the schema cache and reports no rollback', async () => {
   let introspections = 0;
   const driver: DriverApi = {

@@ -304,7 +304,8 @@ export class ExecutionEngine {
       throw err;
     }
     const started = process.hrtime();
-    const isDdl = classification.kind === 'ddl';
+    const executionClassification = classifyStatement(bound.sql, driver.kind);
+    const isDdl = executionClassification.kind === 'ddl';
     // The classifier deliberately leaves PRAGMA as unknown because it may
     // write. The driver still needs to bypass its transaction wrapper for
     // approved non-transactional forms such as SQLite journal_mode changes.
