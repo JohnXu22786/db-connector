@@ -65,6 +65,28 @@ test('list is empty initially; define+open shows connected', async () => {
   assert.ok(status.openedAt);
 });
 
+test('lazy open resolves environment-backed settings after definition', async () => {
+  const h = makeHarness();
+  const env: NodeJS.ProcessEnv = {};
+  const database = join(h.dir, 'late.sqlite');
+  let builtSpec: { database?: string } | undefined;
+  (h.connectors as unknown as {
+    buildDriver(spec: { database?: string }): DriverApi;
+  }).buildDriver = (spec) => {
+    builtSpec = spec;
+    return makeFakeDriver();
+  };
+
+  h.connectors.define(
+    { name: 'lazy-env', driver: 'sqlite', database: '${LAZY_DATABASE}' },
+    env,
+  );
+  env.LAZY_DATABASE = database;
+
+  await h.connectors.open('lazy-env');
+  assert.equal(builtSpec?.database, database);
+});
+
 test('duplicate definition is refused', () => {
   const h = makeHarness();
   h.connectors.define({ name: 'a', driver: 'sqlite' });

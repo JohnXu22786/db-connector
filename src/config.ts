@@ -17,6 +17,31 @@ import type {
 
 const DRIVER_KINDS: ReadonlySet<string> = new Set(['sqlite', 'postgres', 'mysql']);
 
+/** Validate the parts of a connection spec that do not depend on the environment. */
+export function validateConnectionSpec(raw: ConnectionSpec): void {
+  if (!raw || typeof raw !== 'object') {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection config must be an object');
+  }
+  if (typeof raw.name !== 'string' || raw.name.length === 0) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection "name" is required');
+  }
+  if (raw.name.length > 128) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection name is too long (max 128)');
+  }
+  if (!/^[A-Za-z0-9_.-]+$/.test(raw.name)) {
+    throw new DbConnectorError(
+      ErrorCode.InvalidArgs,
+      'connection name may contain only letters, digits, ".", "_" and "-"',
+    );
+  }
+  if (!DRIVER_KINDS.has(raw.driver)) {
+    throw new DbConnectorError(
+      ErrorCode.UnsupportedDriver,
+      `unsupported driver "${String(raw.driver)}" (expected sqlite, postgres or mysql)`,
+    );
+  }
+}
+
 /** Expand `${VAR}` placeholders from the process environment. */
 export function expandEnv(
   value: string | undefined,
@@ -53,27 +78,7 @@ export function resolveConnectionSpec(
   raw: ConnectionSpec,
   env: NodeJS.ProcessEnv = process.env,
 ): ResolvedConnectionSpec {
-  if (!raw || typeof raw !== 'object') {
-    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection config must be an object');
-  }
-  if (typeof raw.name !== 'string' || raw.name.length === 0) {
-    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection "name" is required');
-  }
-  if (raw.name.length > 128) {
-    throw new DbConnectorError(ErrorCode.InvalidArgs, 'connection name is too long (max 128)');
-  }
-  if (!/^[A-Za-z0-9_.-]+$/.test(raw.name)) {
-    throw new DbConnectorError(
-      ErrorCode.InvalidArgs,
-      'connection name may contain only letters, digits, ".", "_" and "-"',
-    );
-  }
-  if (!DRIVER_KINDS.has(raw.driver)) {
-    throw new DbConnectorError(
-      ErrorCode.UnsupportedDriver,
-      `unsupported driver "${String(raw.driver)}" (expected sqlite, postgres or mysql)`,
-    );
-  }
+  validateConnectionSpec(raw);
   const driver = raw.driver as DriverKind;
   const connectionString = expandEnv(raw.connectionString, env);
   const database = expandEnv(raw.database, env);
@@ -264,7 +269,7 @@ function num(v: unknown, fallback: number): number {
   return fallback;
 }
 
-/** Copy the `connections` map verbatim (validation happens at define time). */
+/** Copy the `connections` map verbatim (validation happens at define/open time). */
 function normalizeConnections(raw: unknown): Record<string, import('./types.js').ConnectionSpec> {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
   const out: Record<string, import('./types.js').ConnectionSpec> = {};
