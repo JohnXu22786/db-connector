@@ -91,6 +91,22 @@ test('password resolution: env above inline, ref applied later', () => {
   assert.equal(withCred.passwordSource, 'credentials');
 });
 
+test('resolveConnectionSpec expands password and passwordRef placeholders', () => {
+  const spec = resolveConnectionSpec(
+    {
+      name: 'p',
+      driver: 'postgres',
+      database: 'd',
+      password: '${DB_PASSWORD}',
+      passwordRef: '${PASSWORD_REF}',
+    },
+    { DB_PASSWORD: 's3cret', PASSWORD_REF: 'CRED' },
+  );
+
+  assert.equal(spec.password, 's3cret');
+  assert.equal(spec.passwordRef, 'CRED');
+});
+
 test('applyCredentialPassword errors on empty resolved value', async () => {
   const refSpec = resolveConnectionSpec(
     { name: 'p', driver: 'postgres', database: 'd', passwordRef: 'CRED' },
