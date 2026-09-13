@@ -401,7 +401,7 @@ const QUERIES = {
        JOIN pg_namespace n ON n.oid = t.relnamespace
        JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS k(attnum, ord) ON true
        LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum
-       WHERE n.nspname = $1 AND t.relkind = 'r'
+       WHERE n.nspname = $1 AND t.relkind IN ('r', 'p')
        GROUP BY i.relname, t.relname, idx.indisunique, idx.indisprimary
        ORDER BY t.relname, i.relname`,
   },

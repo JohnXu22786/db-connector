@@ -321,6 +321,45 @@ test('PostgreSQL introspection keeps primary keys associated with their table', 
   assert.equal(secondTable.find((item) => item.name === 'id')?.primaryKey, false);
 });
 
+test('PostgreSQL introspection includes indexes on partitioned tables', async () => {
+  const client: PgClientStub = {
+    connect: async () => {},
+    end: async () => {},
+    query: async (input) => {
+      const text = typeof input === 'string' ? input : input.text;
+      if (text.includes('FROM pg_index')) {
+        const rows = text.includes("t.relkind = 'r'")
+          ? []
+          : [{
+              index_name: 'events_pkey',
+              table_name: 'events',
+              is_unique: true,
+              is_primary: true,
+              column_names: ['id'],
+            }];
+        return { fields: [], rows, rowCount: rows.length } as never;
+      }
+      return { fields: [], rows: [], rowCount: 0 };
+    },
+  };
+  const driver = new PgDriver(spec('postgres'), {
+    debug() {},
+    info() {},
+    warn() {},
+  });
+  installPgClient(driver, client);
+
+  const introspection = await driver.introspect(new AbortController().signal);
+
+  assert.deepEqual(introspection.indexes, [{
+    name: 'events_pkey',
+    table: 'events',
+    columns: ['id'],
+    unique: true,
+    primary: true,
+  }]);
+});
+
 test('PostgreSQL close waits before ending the client used by queued operations', async () => {
   const events: string[] = [];
   const statement = deferred<PgResult>();
