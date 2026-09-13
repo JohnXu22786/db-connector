@@ -41,6 +41,7 @@ const DEFAULT_LOGGER: DriverLogger = { debug() {}, info() {}, warn() {} };
 
 export class Connectors {
   private readonly map = new Map<string, ConnectorRecord>();
+  private closeAllPromise: Promise<void> | null = null;
 
   constructor(private readonly logger: DriverLogger = DEFAULT_LOGGER) {}
 
@@ -51,6 +52,12 @@ export class Connectors {
       throw new DbConnectorError(
         ErrorCode.ConnectionExists,
         `a connection named "${resolved.name}" already exists`,
+      );
+    }
+    if (this.closeAllPromise) {
+      throw new DbConnectorError(
+        ErrorCode.ConnectionNotFound,
+        'connections are closing',
       );
     }
     this.map.set(resolved.name, {
@@ -233,11 +240,23 @@ export class Connectors {
 
   /** Close every open connection (plugin teardown). */
   async closeAll(): Promise<void> {
-    const pending: Promise<void>[] = [];
-    for (const [name, rec] of this.map) {
-      pending.push(this.startClose(name, rec));
+    if (this.closeAllPromise) {
+      await this.closeAllPromise;
+      return;
     }
-    await Promise.all(pending);
+    const closing = (async () => {
+      const pending: Promise<void>[] = [];
+      for (const [name, rec] of this.map) {
+        pending.push(this.startClose(name, rec));
+      }
+      await Promise.all(pending);
+    })();
+    this.closeAllPromise = closing;
+    try {
+      await closing;
+    } finally {
+      if (this.closeAllPromise === closing) this.closeAllPromise = null;
+    }
   }
 
   /** Redacted status of a single connection, or undefined if unknown. */
