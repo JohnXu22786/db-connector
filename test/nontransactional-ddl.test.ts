@@ -166,6 +166,7 @@ function makeEngine(driver: DriverApi): ExecutionEngine {
   }, {});
   const connectors = {
     open: async () => driver,
+    describe: () => ({ driver: driver.kind }),
     touch() {},
     closeAll: async () => {},
   } as never;
