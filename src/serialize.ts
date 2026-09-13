@@ -62,7 +62,10 @@ export function serializeValue(v: unknown): unknown {
 
 /** Cap an already-materialized row array at `maxRows`. */
 export function capRows<T>(rows: T[], maxRows?: number): { rows: T[]; truncated: boolean } {
-  const max = maxRows === undefined || !Number.isFinite(maxRows) || maxRows < 0
+  if (maxRows !== undefined && maxRows < 0) {
+    throw new RangeError('maxRows must be a non-negative number');
+  }
+  const max = maxRows === undefined || !Number.isFinite(maxRows)
     ? Infinity
     : Math.floor(maxRows);
   if (rows.length <= max) return { rows, truncated: false };
