@@ -757,7 +757,7 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
   assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
 });
 
-test('SQLite does not retry a request after close starts', async () => {
+test('SQLite close waits for a dispatched request before exiting', async () => {
   const driver = new SqliteDriver(
     {
       name: 'sqlite-test',
@@ -776,14 +776,63 @@ test('SQLite does not retry a request after close starts', async () => {
   try {
     const request = driver.read('SELECT 1', [], signal());
     const closing = driver.close();
-    const requestError = await request.then(() => undefined, (err: unknown) => err);
+    const requestResult = await request;
     await closing;
 
-    assert.ok(requestError instanceof DbConnectorError);
-    assert.equal((requestError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+    assert.deepEqual(requestResult.rows, [[1]]);
     assert.equal(state.child, null);
   } finally {
     state.child?.kill('SIGKILL');
+  }
+});
+
+test('SQLite close lets a dispatched write finish before exiting', async () => {
+  const database = join(mkdtempSync(join(tmpdir(), 'db-connector-')), 'active.sqlite');
+  const spec = {
+    name: 'sqlite-test',
+    driver: 'sqlite' as const,
+    database,
+    password: '',
+    passwordSource: 'none' as const,
+    options: {},
+  };
+  const driver = new SqliteDriver(spec, logger);
+  let closing: Promise<void> | undefined;
+  let reopened: SqliteDriver | undefined;
+
+  try {
+    await driver.connect();
+    await driver.write(
+      'CREATE TABLE entries(value INTEGER)',
+      [],
+      true,
+      signal(),
+    );
+
+    const write = driver.write(
+      'INSERT INTO entries(value) VALUES (1)',
+      [],
+      false,
+      signal(),
+    );
+    closing = driver.close();
+
+    const result = await write;
+    await closing;
+    assert.equal(result.affectedRows, 1);
+
+    reopened = new SqliteDriver(spec, logger);
+    await reopened.connect();
+    const rows = await reopened.read(
+      'SELECT COUNT(*) AS count FROM entries',
+      [],
+      signal(),
+    );
+    assert.deepEqual(rows.rows, [[1]]);
+  } finally {
+    await closing?.catch(() => {});
+    await driver.close();
+    await reopened?.close();
   }
 });
 
@@ -828,14 +877,13 @@ test('SQLite close rejects queued writes without executing them', async () => {
     );
     closing = driver.close();
 
-    const [activeError, queuedError] = await Promise.all([
-      active.then(() => undefined, (err: unknown) => err),
+    const [activeResult, queuedError] = await Promise.all([
+      active,
       queued.then(() => undefined, (err: unknown) => err),
     ]);
     await closing;
 
-    assert.ok(activeError instanceof DbConnectorError);
-    assert.equal((activeError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+    assert.equal(activeResult.rowCount, 1);
     assert.ok(queuedError instanceof DbConnectorError);
     assert.equal((queuedError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
 

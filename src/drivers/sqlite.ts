@@ -366,21 +366,21 @@ export class SqliteDriver implements DriverApi {
     const child = this.child;
     this.child = null;
     const retiring = this.retiring;
-    // Reject the request currently dispatched to the child. Later requests
-    // are waiting in operationQueue and have not reached the child yet.
-    for (const [id, entry] of this.pending) {
-      this.pending.delete(id);
-      this.refDrop(entry.child);
-      entry.reject(new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection closed'));
-    }
+    const closedError = new DbConnectorError(
+      ErrorCode.ConnectionNotFound,
+      'connection closed',
+    );
+    // Requests still waiting in the parent have not reached the child and
+    // must be rejected without being dispatched.
     const queued = this.operationQueue.splice(0);
     for (const operation of queued) {
       operation.signal.removeEventListener('abort', operation.onAbort);
-      operation.reject(new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection closed'));
+      operation.reject(closedError);
     }
-    if (child) this.inFlight.delete(child);
     if (child && child.exitCode === null && child.connected) {
       try {
+        // The parent dispatches only one request at a time, so this close
+        // message follows the already-dispatched operation and lets it settle.
         child.send({ id: -1, op: 'close' });
       } catch {
         /* channel already closed */
@@ -392,7 +392,19 @@ export class SqliteDriver implements DriverApi {
         }),
         new Promise<void>((resolve) => setTimeout(resolve, 1000)),
       ]);
-      if (child.exitCode === null) child.kill('SIGKILL');
+      if (child.exitCode === null) {
+        // A native operation that outlives the graceful-close window cannot
+        // reply; reject it before killing the child so no caller hangs.
+        child.ref();
+        this.rejectFor(child, closedError);
+        this.dropped.add(child);
+        const exited = waitForChildExit(child);
+        child.kill('SIGKILL');
+        await exited;
+        child.unref();
+      } else {
+        this.rejectFor(child, closedError);
+      }
     }
     await retiring;
   }
