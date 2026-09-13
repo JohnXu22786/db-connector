@@ -100,6 +100,23 @@ test('params CSV decode maps numbers, booleans, null, strings', async () => {
   assert.ok(q.includes('1 row(s)'));
 });
 
+test('params CSV decode preserves an empty value for query', async () => {
+  const h = await makeHarnessAndRows();
+  const q = await runDbLine(h.engine, 'query app --sql "SELECT ? AS v" --params ""', freshSignal());
+  assert.ok(q.includes('1 row(s)'));
+  assert.match(q, /"rows": \[\s*\[\s*""/);
+});
+
+test('params CSV decode preserves an empty value for exec', async () => {
+  const h = await makeHarnessAndRows();
+  const result = await runDbLine(
+    h.engine,
+    'exec app --sql "INSERT INTO t(v) VALUES (?)" --params "" --allow-write',
+    freshSignal(),
+  );
+  assert.ok(result.includes('1 row(s) affected'));
+});
+
 async function makeHarnessAndRows(): Promise<Harness> {
   const h = makeHarness();
   await h.engine.connect({ name: 'app', driver: 'sqlite', database: h.dir + '/app.sqlite' });
