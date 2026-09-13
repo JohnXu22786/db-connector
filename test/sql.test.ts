@@ -217,6 +217,21 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit preserves FETCH caps and identifier names', () => {
+  for (const sql of [
+    'SELECT id FROM t FETCH FIRST 5 ROWS ONLY',
+    'SELECT id FROM t FETCH NEXT 5 ROWS ONLY',
+  ]) {
+    const guarded = ensureSelectLimit(sql, 10);
+    assert.equal(guarded.applied, false, sql);
+    assert.equal(guarded.sql, sql);
+  }
+
+  const withMergeTable = ensureSelectLimit('SELECT * FROM merge', 10);
+  assert.equal(withMergeTable.applied, true);
+  assert.equal(withMergeTable.sql, 'SELECT * FROM merge LIMIT 10');
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');
