@@ -187,6 +187,61 @@ test('PostgreSQL serializes introspection after an active write transaction', as
   assert.equal(events.length, 9);
 });
 
+test('PostgreSQL keeps the operation lock until all catalog queries settle after a failure', async () => {
+  const events: string[] = [];
+  const viewsStarted = deferred<void>();
+  const viewsResult = deferred<PgResult>();
+  const client: PgClientStub = {
+    connect: async () => {},
+    end: async () => {},
+    query: async (input) => {
+      const text = typeof input === 'string' ? input : input.text;
+      events.push(text);
+      if (text.includes('FROM information_schema.tables')) {
+        throw new Error('catalog failure');
+      }
+      if (text.includes('FROM information_schema.views')) {
+        viewsStarted.resolve();
+        return viewsResult.promise;
+      }
+      return { fields: [], rows: [], rowCount: 0 };
+    },
+  };
+  const driver = new PgDriver(spec('postgres'), {
+    debug() {},
+    info() {},
+    warn() {},
+  });
+  installPgClient(driver, client);
+
+  const introspection = driver.introspect(new AbortController().signal);
+  void introspection.catch(() => {});
+  await viewsStarted.promise;
+  await nextTurn();
+
+  const queued = driver.write(
+    'UPDATE after catalog failure',
+    [],
+    false,
+    new AbortController().signal,
+  );
+  await nextTurn();
+
+  try {
+    assert.equal(events.includes('BEGIN'), false);
+  } finally {
+    viewsResult.resolve({ fields: [], rows: [], rowCount: 0 });
+    await assert.rejects(introspection, /catalog failure/);
+    await queued;
+  }
+
+  assert.deepEqual(events.slice(-3), [
+    'BEGIN',
+    'UPDATE after catalog failure',
+    'COMMIT',
+  ]);
+});
+
 test('PostgreSQL introspection keeps primary keys associated with their table', async () => {
   const client: PgClientStub = {
     connect: async () => {},
