@@ -274,3 +274,69 @@ test('MysqlDriver uses the URI database for schema introspection', async () => {
   assert.deepEqual(schemas, ['app_db', 'app_db', 'app_db', 'app_db']);
   assert.deepEqual(introspection.tables, [{ name: 'users' }]);
 });
+
+test('MysqlDriver keeps colon-containing foreign key names distinct', async () => {
+  const connection = {
+    async query(sql: string) {
+      if (sql.includes('information_schema.key_column_usage')) {
+        return [[
+          {
+            table_name: 'a:b',
+            constraint_name: 'c',
+            column_name: 'first_id',
+            referenced_table_name: 'parents',
+            referenced_column_name: 'id',
+            update_rule: 'RESTRICT',
+            delete_rule: 'CASCADE',
+          },
+          {
+            table_name: 'a',
+            constraint_name: 'b:c',
+            column_name: 'second_id',
+            referenced_table_name: 'parents',
+            referenced_column_name: 'id',
+            update_rule: 'RESTRICT',
+            delete_rule: 'CASCADE',
+          },
+        ], []];
+      }
+      return [[], []];
+    },
+    async execute() {
+      return [[], []];
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'fk-collision', driver: 'mysql', database: 'app_db' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+  (driver as unknown as { conn: unknown }).conn = connection;
+
+  const introspection = await driver.introspect(new AbortController().signal);
+
+  assert.deepEqual(introspection.foreignKeys, [
+    {
+      name: 'c',
+      table: 'a:b',
+      columns: ['first_id'],
+      referencedTable: 'parents',
+      referencedColumns: ['id'],
+      onUpdate: 'RESTRICT',
+      onDelete: 'CASCADE',
+    },
+    {
+      name: 'b:c',
+      table: 'a',
+      columns: ['second_id'],
+      referencedTable: 'parents',
+      referencedColumns: ['id'],
+      onUpdate: 'RESTRICT',
+      onDelete: 'CASCADE',
+    },
+  ]);
+});
