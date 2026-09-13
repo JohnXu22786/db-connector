@@ -13,6 +13,16 @@ test('tokenize respects single and double quotes', () => {
   assert.deepEqual(tokenize('a \'b c\' d'), ['a', 'b c', 'd']);
 });
 
+test('tokenize decodes backslash escapes inside quotes', () => {
+  const input = 'query --sql "SELECT \\"C:\\\\tmp\\""';
+  assert.deepEqual(tokenize(input), ['query', '--sql', 'SELECT "C:\\tmp"']);
+});
+
+test('tokenize preserves ordinary backslashes in quoted values', () => {
+  const input = 'connect app --db "C:\\tmp\\app.db"';
+  assert.deepEqual(tokenize(input), ['connect', 'app', '--db', 'C:\\tmp\\app.db']);
+});
+
 test('splitFlags separates positionals from --key value pairs', () => {
   const { positionals, flags } = splitFlags(
     tokenize('connect app --driver sqlite --db ./x.db --refresh'),
@@ -98,4 +108,3 @@ async function makeHarnessAndRows(): Promise<Harness> {
   await h.engine.exec({ connection: 'app', sql: 'INSERT INTO t(v) VALUES (?)', params: ['world'], allowWrite: true, way: 'command' }, freshSignal());
   return h;
 }
-
