@@ -73,11 +73,16 @@ function runWrite(req: Request): unknown {
 function runSchema(): unknown {
   const master = db
     .prepare(
-      `SELECT name, type, sql FROM sqlite_master
+      `SELECT name, type, sql FROM sqlite_temp_master
        WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
        UNION ALL
-       SELECT name, type, sql FROM sqlite_temp_master
-       WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
+       SELECT main.name, main.type, main.sql FROM sqlite_master AS main
+       WHERE main.type IN ('table','view') AND main.name NOT LIKE 'sqlite_%'
+         AND NOT EXISTS (
+           SELECT 1 FROM sqlite_temp_master AS temp
+           WHERE temp.type IN ('table','view') AND temp.name NOT LIKE 'sqlite_%'
+             AND temp.name COLLATE NOCASE = main.name COLLATE NOCASE
+         )
        ORDER BY name`,
     )
     .all() as unknown as MasterRow[];
