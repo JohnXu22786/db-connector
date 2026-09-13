@@ -175,6 +175,30 @@ test('toDollarPlaceholders rewrites positional ? outside strings/comments', () =
   });
 });
 
+test('PostgreSQL dollar-quoted strings protect placeholders and semicolons', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $$?$$, ?'), {
+    sql: 'SELECT $$?$$, $1',
+    count: 1,
+  });
+  assert.doesNotThrow(() => assertSingleStatement('SELECT $$value; still literal$$'));
+});
+
+test('unmatched dollar tags do not hide SQLite parameters or statements', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $foo$ || ?'), {
+    sql: 'SELECT $foo$ || $1',
+    count: 1,
+  });
+  assert.throws(() => assertSingleStatement('SELECT $foo$; SELECT ?'), DbConnectorError);
+});
+
+test('digit-leading dollar tags do not hide placeholders or statements', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $1$?; SELECT $1$, ?'), {
+    sql: 'SELECT $1$$1; SELECT $1$, $2',
+    count: 2,
+  });
+  assert.throws(() => assertSingleStatement('SELECT $1$; SELECT $1$'), DbConnectorError);
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',
