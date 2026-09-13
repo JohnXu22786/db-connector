@@ -74,7 +74,11 @@ function runSchema(): unknown {
   const master = db
     .prepare(
       `SELECT name, type, sql FROM sqlite_master
-       WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name`,
+       WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
+       UNION ALL
+       SELECT name, type, sql FROM sqlite_temp_master
+       WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
+       ORDER BY name`,
     )
     .all() as unknown as MasterRow[];
 

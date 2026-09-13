@@ -216,6 +216,41 @@ test('schema snapshot lists columns for SQLite views', async () => {
   );
 });
 
+test('schema snapshot includes SQLite temporary tables and views', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP TABLE temp_records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP VIEW temp_directory AS SELECT id, value FROM temp_records',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(s.tables.map((table) => table.name), ['temp_records']);
+  assert.deepEqual(s.views.map((view) => view.name), ['temp_directory']);
+  assert.deepEqual(
+    s.columns
+      .filter((column) => column.table === 'temp_directory')
+      .map((column) => ({ name: column.name, type: column.type, ordinal: column.ordinal })),
+    [
+      { name: 'id', type: 'INTEGER', ordinal: 1 },
+      { name: 'value', type: 'TEXT', ordinal: 2 },
+    ],
+  );
+});
+
 test('schema snapshots are cached within TTL and refreshable', async () => {
   const h = makeHarness({ schema: { ttlMs: 600000 } });
   await seedSqlite(h);
