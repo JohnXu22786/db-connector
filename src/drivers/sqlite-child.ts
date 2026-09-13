@@ -125,7 +125,7 @@ function runSchema(): unknown {
         table: object.name,
         name: c.name,
         type: c.type || 'ANY',
-        nullable: c.notnull === 0 && c.pk === 0,
+        nullable: c.notnull === 0 && (c.pk === 0 || c.type.toUpperCase() !== 'INTEGER'),
         ordinal: c.cid + 1,
         default: c.dflt_value ?? null,
         primaryKey: c.pk > 0,
