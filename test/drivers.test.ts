@@ -786,6 +786,43 @@ test('SQLite close waits for a dispatched request before exiting', async () => {
   }
 });
 
+test('SQLite close flushes a buffered response before exiting', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  let closing: Promise<void> | undefined;
+
+  try {
+    const read = driver.read(
+      `WITH RECURSIVE counter(value) AS (
+         VALUES(1)
+         UNION ALL
+         SELECT value + 1 FROM counter WHERE value < 64
+       )
+       SELECT hex(zeroblob(8192)) AS payload FROM counter`,
+      [],
+      signal(),
+    );
+    closing = driver.close();
+
+    const result = await read;
+    await closing;
+    assert.equal(result.rowCount, 64);
+    assert.equal((result.rows[0]?.[0] as string).length, 16384);
+  } finally {
+    await closing?.catch(() => {});
+    await driver.close();
+  }
+});
+
 test('SQLite close lets a dispatched write finish before exiting', async () => {
   const database = join(mkdtempSync(join(tmpdir(), 'db-connector-')), 'active.sqlite');
   const spec = {
