@@ -280,7 +280,7 @@ export function indexesFromStatistics(
       };
       indexMap.set(key, entry);
     }
-    entry.columns.push(String(s.column_name));
+    entry.columns.push(s.column_name === null ? '' : String(s.column_name));
   }
   return [...indexMap.values()].map((e) => ({
     name: e.name,
