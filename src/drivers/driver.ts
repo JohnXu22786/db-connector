@@ -89,7 +89,11 @@ export async function importOptional<T>(name: string): Promise<T> {
   } catch (err) {
     const friendly =
       name === 'pg' ? 'postgres' : name === 'mysql2' ? 'mysql' : name;
-    if (err instanceof Error && 'code' in err && err.code === 'MODULE_NOT_FOUND') {
+    if (
+      err instanceof Error &&
+      'code' in err &&
+      (err.code === 'MODULE_NOT_FOUND' || err.code === 'ERR_MODULE_NOT_FOUND')
+    ) {
       throw new DbConnectorError(
         ErrorCode.DriverNotInstalled,
         `the "${name}" package is not installed; run "npm i ${name}" to enable ${friendly} connections`,

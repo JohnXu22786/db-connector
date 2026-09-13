@@ -177,6 +177,23 @@ function makeEngine(driver: DriverApi): ExecutionEngine {
   });
 }
 
+test('missing optional packages reported by native ESM get an actionable error', async () => {
+  const missingPackage = 'dsh-db-connector-missing-optional-driver';
+
+  await assert.rejects(
+    importOptional<Record<string, unknown>>(missingPackage),
+    (err: unknown) => {
+      assert.ok(err instanceof DbConnectorError);
+      assert.equal(err.code, ErrorCode.DriverNotInstalled);
+      assert.equal(
+        err.message,
+        `the "${missingPackage}" package is not installed; run "npm i ${missingPackage}" to enable ${missingPackage} connections`,
+      );
+      return true;
+    },
+  );
+});
+
 test('failed non-transactional DDL invalidates the schema cache and reports no rollback', async () => {
   let introspections = 0;
   const driver: DriverApi = {
