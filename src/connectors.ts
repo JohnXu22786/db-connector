@@ -117,7 +117,13 @@ export class Connectors {
     if (rec.closing) throw this.connectionClosingError(name);
     if (rec.driver) {
       const driver = rec.driver;
-      const opening = rec.opening ?? (rec.opening = driver.connect().then(() => driver));
+      const opening = rec.opening ?? (rec.opening = driver.connect().then(
+        () => driver,
+        (error) => {
+          rec.status = 'defined';
+          throw error;
+        },
+      ));
       try {
         await this.waitForOpen(rec, opening);
         if (rec.closing) throw this.connectionClosingError(name);
