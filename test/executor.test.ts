@@ -77,6 +77,31 @@ test('invalid exec validation is audited', async () => {
   assert.equal(records[0]!.error?.code, ErrorCode.MultiStatements);
 });
 
+test('PostgreSQL JSONB question operators are not counted as parameters', async () => {
+  const h = makeHarness();
+  const sql = `SELECT '{"a":1}'::jsonb ? 'a'`;
+  let receivedSql = '';
+  let receivedParams: unknown[] = [];
+  installDriver(h, emptyDriver({
+    kind: 'postgres',
+    read: async (received, params) => {
+      receivedSql = received;
+      receivedParams = params;
+      return { columns: ['exists'], rows: [[true]], rowCount: 1 };
+    },
+  }));
+  h.connectors.define({ name: 'postgres', driver: 'postgres', database: 'test' });
+
+  const result = await h.engine.query(
+    { connection: 'postgres', sql, way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.deepEqual(result.rows, [[true]]);
+  assert.match(receivedSql, /jsonb \? 'a'/);
+  assert.deepEqual(receivedParams, []);
+});
+
 test('failed lazy connection open is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
