@@ -49,6 +49,72 @@ test('append writes one valid JSON line with the full schema', async () => {
   assert.ok(!JSON.stringify(rec).includes('password'));
 });
 
+test('audit summaries redact string literal bodies', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({
+    sql: "SELECT * FROM users WHERE email = 'alice@example.com' AND note = 'secret'",
+  }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(
+    rec.statement.summary,
+    "SELECT * FROM users WHERE email = 'x' AND note = 'x'",
+  );
+  assert.ok(!JSON.stringify(rec).includes('alice@example.com'));
+  assert.ok(!JSON.stringify(rec).includes('secret'));
+});
+
+test('audit summaries redact backslash-escaped string literals', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: "SELECT 'safe\\'SECRET'" }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('SECRET'));
+});
+
+test('audit summaries do not treat SQLite backslashes as string escapes', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: String.raw`SELECT 'safe\' || 'SQLITE_SECRET'` }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('SQLITE_SECRET'));
+});
+
+test('audit summaries redact SQLite comment suffixes containing quotes', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: String.raw`SELECT 'safe\' -- 'SQLITE_COMMENT_SECRET` }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('SQLITE_COMMENT_SECRET'));
+});
+
+test('audit summaries redact MySQL double-quoted string literals', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: String.raw`SELECT "safe\"MYSQL_SECRET"` }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, 'SELECT "x"');
+  assert.ok(!JSON.stringify(rec).includes('MYSQL_SECRET'));
+});
+
+test('audit summaries redact PostgreSQL dollar-quoted literals', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: 'SELECT $$DOLLAR_SECRET$$' }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, "SELECT 'x'");
+  assert.ok(!JSON.stringify(rec).includes('DOLLAR_SECRET'));
+});
+
 test('error records carry code + message, rows default to 0', async () => {
   const log = new AuditLog(freshPath());
   await log.append(input({ status: 'error', error: { code: 'QUERY_FAILED', message: 'boom' }, rows: 0 }));

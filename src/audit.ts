@@ -11,6 +11,7 @@
 import { mkdir, open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { ErrorCode, DbConnectorError } from './errors.js';
+import { summarizeSql } from './sql.js';
 import type { AuditRecord, WayKind } from './types.js';
 import { sha256, uid } from './util.js';
 
@@ -67,7 +68,7 @@ export class AuditLog {
       connection: input.connection,
       kind: input.kind,
       way: input.way,
-      statement: summarize(sqlSummary(input.sql), input.maxSqlChars),
+      statement: summarizeSql(input.sql, input.maxSqlChars),
       rows: Math.max(0, Math.floor(input.rows) || 0),
       durationMs: Math.max(0, Math.round(input.durationMs)),
       status: input.status,
@@ -152,21 +153,4 @@ export class AuditLog {
     out.reverse();
     return out.slice(0, limit);
   }
-}
-
-/** Collapse raw SQL to a single line of readable text for logging. */
-function sqlSummary(sql: string): string {
-  return sql.replace(/\s+/g, ' ').trim();
-}
-
-function summarize(
-  collapsed: string,
-  maxChars: number,
-): AuditRecord['statement'] {
-  const max = Math.max(1, maxChars);
-  return {
-    summary: collapsed.length > max ? `${collapsed.slice(0, max)}…` : collapsed,
-    digest: sha256(collapsed),
-    chars: collapsed.length,
-  };
 }

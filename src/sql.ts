@@ -6,10 +6,10 @@
  * text. All recognition is string-literal / comment aware so a crafted value
  * like `'INSERT'` or a `SELECT ... -- DROP` comment can never fool the gate.
  *
- * Scanner limitation note: single-quoted strings follow ANSI doubling (`''`)
- * and a bare `'` in MySQL with backslash-escaped quotes is recognized only
- * approximately. Classification only ever uses recognition to REJECT writes,
- * never to allow them, so this cannot widen the write surface.
+ * Scanner limitation note: single-quoted strings follow ANSI doubling (`''`).
+ * Summary normalization additionally enables MySQL-style backslash escapes.
+ * Classification only ever uses recognition to REJECT writes, never to allow
+ * them, so this cannot widen the write surface.
  */
 
 import { ErrorCode, DbConnectorError } from './errors.js';
@@ -34,6 +34,11 @@ export interface Token {
   depth: number;
 }
 
+interface ScanOptions {
+  /** Treat backslashes as escapes inside quoted strings. */
+  backslashEscapes?: boolean;
+}
+
 /** Data-statement keywords valid at the top level of a statement. */
 const DATA_KEYWORDS = new Set([
   'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'VALUES',
@@ -45,13 +50,15 @@ const WRITE_KEYWORDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE'
 /**
  * Scan SQL into tokens, tracking strings, quoted identifiers, comments, and
  * parameter markers. Paren depth is recorded on each token so callers can
- * distinguish a top-level LIMIT from a subquery LIMIT.
+ * distinguish a top-level LIMIT from a subquery LIMIT. `backslashEscapes` is
+ * enabled only for the MySQL-compatible summary pass.
  */
-export function scan(sql: string): Token[] {
+export function scan(sql: string, options: ScanOptions = {}): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const n = sql.length;
   let depth = 0;
+  const backslashEscapes = options.backslashEscapes === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -89,6 +96,10 @@ export function scan(sql: string): Token[] {
     if (c === "'") {
       i += 1;
       while (i < n) {
+        if (backslashEscapes && sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] === "'") {
           if (sql[i + 1] === "'") {
             i += 2;
@@ -107,6 +118,10 @@ export function scan(sql: string): Token[] {
     if (c === '"') {
       i += 1;
       while (i < n) {
+        if (backslashEscapes && sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] === '"') {
           if (sql[i + 1] === '"') {
             i += 2;
@@ -133,8 +148,13 @@ export function scan(sql: string): Token[] {
     // PostgreSQL dollar-quoted string: $$...$$ or $tag$...$tag$
     if (c === '$') {
       let j = i + 1;
-      while (j < n && isIdentPart(sql[j]!)) j += 1;
-      if (j < n && sql[j] === '$') {
+      const emptyTag = sql[j] === '$';
+      const namedTag = isIdentStart(sql[j] ?? '');
+      if (namedTag) {
+        j += 1;
+        while (j < n && sql[j] !== '$' && isIdentPart(sql[j]!)) j += 1;
+      }
+      if (emptyTag || (namedTag && j < n && sql[j] === '$')) {
         const delim = sql.slice(i, j + 1);
         const end = sql.indexOf(delim, j + 1);
         i = end === -1 ? n : end + delim.length;
@@ -421,20 +441,84 @@ export function assertSingleStatement(sql: string): void {
  * Return a copy of the SQL with comments removed and string-literal bodies /
  * quoted identifiers replaced by `x`, so callers can reason about structure.
  */
-export function stripComments(sql: string): string {
+export function stripComments(sql: string, options: ScanOptions = {}): string {
+  return renderSanitized(sql, [scan(sql, options)]);
+}
+
+interface RedactionSpan {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+function renderSanitized(sql: string, tokenSets: Token[][]): string {
+  const literals = mergeSpans(
+    tokenSets.flatMap((tokens) => tokens
+      .filter((token) => token.type === 'string' || token.type === 'quotedid')
+      .map((token) => ({
+        start: token.pos,
+        end: token.pos + token.value.length,
+        replacement: token.type === 'string' ? `'x'` : `"x"`,
+      }))),
+  );
+  const comments = mergeSpans(
+    tokenSets.flatMap((tokens) => tokens
+      .filter((token) => token.type === 'comment')
+      .flatMap((token) => subtractSpans({
+        start: token.pos,
+        end: token.pos + token.value.length,
+        replacement: ' ',
+      }, literals))),
+  );
+  const spans = [...literals, ...comments].sort((a, b) => a.start - b.start);
   let out = '';
-  for (const t of scan(sql)) {
-    if (t.type === 'comment') out += ' ';
-    else if (t.type === 'string') out += `'x'`;
-    else if (t.type === 'quotedid') out += `"x"`;
-    else out += t.value;
+  let cursor = 0;
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    out += sql.slice(cursor, span.start);
+    out += span.replacement;
+    cursor = span.end;
   }
-  return out;
+  return out + sql.slice(cursor);
+}
+
+function subtractSpans(span: RedactionSpan, blockers: RedactionSpan[]): RedactionSpan[] {
+  const pieces: RedactionSpan[] = [];
+  let start = span.start;
+  for (const blocker of blockers) {
+    if (blocker.end <= start) continue;
+    if (blocker.start >= span.end) break;
+    if (blocker.start > start) {
+      pieces.push({ start, end: blocker.start, replacement: span.replacement });
+    }
+    start = Math.max(start, blocker.end);
+    if (start >= span.end) break;
+  }
+  if (start < span.end) {
+    pieces.push({ start, end: span.end, replacement: span.replacement });
+  }
+  return pieces;
+}
+
+function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: RedactionSpan[] = [];
+  for (const span of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && span.start <= previous.end) {
+      previous.end = Math.max(previous.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
 }
 
 /** Collapse whitespace, dropping comments. Used for summaries/digests. */
 export function normalizeText(sql: string): string {
-  return stripComments(sql).replace(/\s+/g, ' ').trim();
+  return renderSanitized(sql, [scan(sql), scan(sql, { backslashEscapes: true })])
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /**
