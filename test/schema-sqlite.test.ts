@@ -201,6 +201,71 @@ test('schema snapshots are cached within TTL and refreshable', async () => {
   assert.equal(fresh.fromCache, false);
 });
 
+test('schema cache returns isolated snapshots', async () => {
+  const driver: DriverApi = {
+    kind: 'sqlite',
+    connect: async () => {},
+    read: async () => ({ columns: [], rows: [], rowCount: 0 }),
+    write: async () => ({ affectedRows: 0, isDdl: false }),
+    introspect: async () => ({
+      tables: [{ name: 'users', sql: 'CREATE TABLE users (...)' }],
+      views: [{ name: 'user_directory', sql: 'CREATE VIEW user_directory AS ...' }],
+      columns: [{
+        table: 'users',
+        name: 'id',
+        type: 'INTEGER',
+        nullable: false,
+        ordinal: 1,
+        default: null,
+        primaryKey: true,
+      }],
+      indexes: [{
+        name: 'users_email_idx',
+        table: 'users',
+        columns: ['email'],
+        unique: true,
+        primary: false,
+      }],
+      foreignKeys: [{
+        name: 'orders_user_fk',
+        table: 'orders',
+        columns: ['user_id'],
+        referencedTable: 'users',
+        referencedColumns: ['id'],
+      }],
+    }),
+    close: async () => {},
+  };
+  const service = new SchemaService(600_000);
+
+  const first = await service.get(driver, 'sample', { signal: freshSignal() });
+  first.tables[0]!.name = 'mutated';
+  first.tables.splice(0, 1);
+  first.views[0]!.sql = 'mutated';
+  first.columns[0]!.name = 'mutated';
+  first.indexes[0]!.columns.push('mutated');
+  first.foreignKeys[0]!.columns[0] = 'mutated';
+  first.foreignKeys[0]!.referencedColumns.push('mutated');
+
+  const cached = await service.get(driver, 'sample', { signal: freshSignal() });
+
+  assert.equal(cached.fromCache, true);
+  assert.deepEqual(cached.tables, [{ name: 'users', type: 'table', sql: 'CREATE TABLE users (...)' }]);
+  assert.deepEqual(cached.views, [{ name: 'user_directory', sql: 'CREATE VIEW user_directory AS ...' }]);
+  assert.deepEqual(cached.columns, [{
+    table: 'users',
+    name: 'id',
+    type: 'INTEGER',
+    nullable: false,
+    ordinal: 1,
+    default: null,
+    primaryKey: true,
+  }]);
+  assert.deepEqual(cached.indexes[0]!.columns, ['email']);
+  assert.deepEqual(cached.foreignKeys[0]!.columns, ['user_id']);
+  assert.deepEqual(cached.foreignKeys[0]!.referencedColumns, ['id']);
+});
+
 test('schema cache is invalidated when a connection name is rebound', async () => {
   const h = makeHarness({ schema: { ttlMs: 600000 } });
   const firstDb = join(h.dir, 'first.sqlite');
