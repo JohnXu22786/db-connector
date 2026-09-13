@@ -114,6 +114,20 @@ function runSchema(): unknown {
   }> = [];
 
   const quote = (name: string): string => name.replaceAll('"', '""');
+  const primaryKeyColumns = new Map<string, string[]>();
+  const readPrimaryKeyColumns = (table: string): string[] => {
+    const cached = primaryKeyColumns.get(table);
+    if (cached) return cached;
+
+    const columns = (db
+      .prepare(`PRAGMA table_xinfo("${quote(table)}")`)
+      .all() as unknown as ColumnRow[])
+      .filter((column) => column.pk > 0)
+      .sort((a, b) => a.pk - b.pk)
+      .map((column) => column.name);
+    primaryKeyColumns.set(table, columns);
+    return columns;
+  };
 
   const readColumns = (object: { name: string; sql?: string }, hasPrimaryKeyIndex = false): void => {
     const cols = db
@@ -160,9 +174,10 @@ function runSchema(): unknown {
       .prepare(`PRAGMA foreign_key_list("${quote(table.name)}")`)
       .all() as unknown as Array<{
       id: number;
+      seq: number;
       table: string;
       from: string;
-      to: string;
+      to: string | null;
       on_update: string;
       on_delete: string;
     }>;
@@ -182,7 +197,7 @@ function runSchema(): unknown {
         grouped.set(fk.id, entry);
       }
       entry.columns.push(fk.from);
-      entry.referencedColumns.push(fk.to);
+      entry.referencedColumns.push(fk.to ?? readPrimaryKeyColumns(fk.table)[fk.seq] ?? '');
     }
     foreignKeys.push(...grouped.values());
   }
