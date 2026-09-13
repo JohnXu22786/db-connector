@@ -187,6 +187,82 @@ test('PostgreSQL serializes introspection after an active write transaction', as
   assert.equal(events.length, 9);
 });
 
+test('PostgreSQL introspection keeps primary keys associated with their table', async () => {
+  const client: PgClientStub = {
+    connect: async () => {},
+    end: async () => {},
+    query: async (input) => {
+      const text = typeof input === 'string' ? input : input.text;
+      if (text.includes('FROM information_schema.tables')) {
+        return {
+          fields: [],
+          rows: [{ table_name: 'first_table' }, { table_name: 'second_table' }],
+          rowCount: 2,
+        } as never;
+      }
+      if (text.includes('FROM information_schema.columns')) {
+        return {
+          fields: [],
+          rows: [
+            {
+              table_name: 'first_table',
+              column_name: 'id',
+              data_type: 'integer',
+              is_nullable: 'NO',
+              ordinal_position: '1',
+              column_default: null,
+            },
+            {
+              table_name: 'second_table',
+              column_name: 'id',
+              data_type: 'integer',
+              is_nullable: 'NO',
+              ordinal_position: '1',
+              column_default: null,
+            },
+            {
+              table_name: 'second_table',
+              column_name: 'code',
+              data_type: 'integer',
+              is_nullable: 'NO',
+              ordinal_position: '2',
+              column_default: null,
+            },
+          ],
+          rowCount: 3,
+        } as never;
+      }
+      if (text.includes('FROM information_schema.table_constraints')) {
+        const rows = text.includes('tc.table_name = kcu.table_name')
+          ? [
+              { table_name: 'first_table', column_name: 'id' },
+              { table_name: 'second_table', column_name: 'code' },
+            ]
+          : [
+              { table_name: 'first_table', column_name: 'id' },
+              { table_name: 'first_table', column_name: 'code' },
+              { table_name: 'second_table', column_name: 'id' },
+              { table_name: 'second_table', column_name: 'code' },
+            ];
+        return { fields: [], rows, rowCount: rows.length } as never;
+      }
+      return { fields: [], rows: [], rowCount: 0 };
+    },
+  };
+  const driver = new PgDriver(spec('postgres'), {
+    debug() {},
+    info() {},
+    warn() {},
+  });
+  installPgClient(driver, client);
+
+  const introspection = await driver.introspect(new AbortController().signal);
+  const secondTable = introspection.columns.filter((item) => item.table === 'second_table');
+
+  assert.equal(secondTable.find((item) => item.name === 'code')?.primaryKey, true);
+  assert.equal(secondTable.find((item) => item.name === 'id')?.primaryKey, false);
+});
+
 test('PostgreSQL close waits before ending the client used by queued operations', async () => {
   const events: string[] = [];
   const statement = deferred<PgResult>();
