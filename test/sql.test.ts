@@ -65,6 +65,7 @@ test('non-transactional statement detection covers SQLite PRAGMAs and PostgreSQL
 
 test('EXPLAIN ANALYZE classifies by its real statement', () => {
   assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT * FROM t').kind, 'select');
+  assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT 1 INTO newtab').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN ANALYZE DELETE FROM t').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN ANALYZE UPDATE t SET a = 1').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t VALUES (1)').kind, 'write');
@@ -112,6 +113,7 @@ test('string literals and comments cannot change classification', () => {
 
 test('CTE (WITH) statements resolve to their real data statement', () => {
   assert.equal(classifyStatement('WITH c AS (SELECT 1) SELECT * FROM c').kind, 'select');
+  assert.equal(classifyStatement('WITH c AS (SELECT 1) SELECT 1 INTO newtab').kind, 'write');
   assert.equal(
     classifyStatement('WITH c AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM c)').kind,
     'write',
