@@ -217,7 +217,7 @@ export class MysqlDriver implements DriverApi {
       onUpdate?: string; onDelete?: string;
     }>();
     for (const f of fkRows) {
-      const key = `${String(f.table_name)}:${String(f.constraint_name)}`;
+      const key = JSON.stringify([String(f.table_name), String(f.constraint_name)]);
       let entry = fkMap.get(key);
       if (!entry) {
         entry = {
