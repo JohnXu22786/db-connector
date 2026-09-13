@@ -256,12 +256,13 @@ export class ExecutionEngine {
     }
 
     const bound = this.bind(opts.sql, opts.params, opts.namedParams);
+    const openAuditKind = readLike ? 'read' : classification.kind === 'ddl' ? 'ddl' : 'write';
     const openStarted = process.hrtime();
     let driver;
     try {
       driver = await this.requireDriver(opts.connection);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'write', hrtimeMs(openStarted), opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
     const deadline = this.deadline(opts.timeoutMs, signal);
@@ -505,7 +506,7 @@ export class ExecutionEngine {
   private async auditFail(
     connection: string,
     sql: string,
-    kind: 'query' | 'write' | 'ddl' | 'schema',
+    kind: 'query' | 'write' | 'ddl' | 'read' | 'schema',
     durationMs: number,
     way: WayKind,
     err: unknown,

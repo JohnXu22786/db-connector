@@ -81,6 +81,59 @@ test('failed lazy connection open during a write is audited', async () => {
   assert.equal(records[0]!.error?.message, 'write open failed');
 });
 
+test('failed lazy connection open during DDL is audited as ddl', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver({
+    connect: async () => {
+      throw new Error('ddl open failed');
+    },
+  }));
+  h.connectors.define({ name: 'broken-ddl', driver: 'sqlite' });
+
+  await assert.rejects(
+    h.engine.exec({
+      connection: 'broken-ddl',
+      sql: 'CREATE TABLE items (id INTEGER)',
+      allowWrite: true,
+      way: 'cli',
+    }, freshSignal()),
+    /ddl open failed/,
+  );
+
+  const records = await h.audit.query({ connection: 'broken-ddl' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'ddl');
+  assert.equal(records[0]!.status, 'error');
+  assert.equal(records[0]!.error?.code, ErrorCode.QueryFailed);
+  assert.equal(records[0]!.error?.message, 'ddl open failed');
+});
+
+test('failed lazy connection open during a read-like exec is audited as read', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver({
+    connect: async () => {
+      throw new Error('read open failed');
+    },
+  }));
+  h.connectors.define({ name: 'broken-read', driver: 'sqlite' });
+
+  await assert.rejects(
+    h.engine.exec({
+      connection: 'broken-read',
+      sql: 'SELECT 1',
+      way: 'cli',
+    }, freshSignal()),
+    /read open failed/,
+  );
+
+  const records = await h.audit.query({ connection: 'broken-read' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'read');
+  assert.equal(records[0]!.status, 'error');
+  assert.equal(records[0]!.error?.code, ErrorCode.QueryFailed);
+  assert.equal(records[0]!.error?.message, 'read open failed');
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
