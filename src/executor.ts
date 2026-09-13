@@ -181,7 +181,14 @@ export class ExecutionEngine {
         : { sql: bound.sql, applied: false };
     const protectedSql = guarded.sql;
 
-    const driver = await this.requireDriver(opts.connection);
+    const openStarted = process.hrtime();
+    let driver;
+    try {
+      driver = await this.requireDriver(opts.connection);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, 'query', hrtimeMs(openStarted), opts.way, err);
+      throw err;
+    }
     const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     let outcome;
@@ -249,7 +256,14 @@ export class ExecutionEngine {
     }
 
     const bound = this.bind(opts.sql, opts.params, opts.namedParams);
-    const driver = await this.requireDriver(opts.connection);
+    const openStarted = process.hrtime();
+    let driver;
+    try {
+      driver = await this.requireDriver(opts.connection);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, 'write', hrtimeMs(openStarted), opts.way, err);
+      throw err;
+    }
     const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     const isDdl = classification.kind === 'ddl';
@@ -324,7 +338,16 @@ export class ExecutionEngine {
 
   /** Schema snapshot for one connection (cached; refresh/flush with opts). */
   async schema(opts: SchemaOptions, signal: AbortSignal): Promise<SchemaResult> {
-    const driver = await this.requireDriver(opts.connection);
+    const openStarted = process.hrtime();
+    const scope = opts.filter ? ` filter="${opts.filter}"` : '';
+    const sql = `schema introspection<${opts.connection}${scope}>`;
+    let driver;
+    try {
+      driver = await this.requireDriver(opts.connection);
+    } catch (err) {
+      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(openStarted), opts.way, err);
+      throw err;
+    }
     const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     let snapshot: SchemaResult;
@@ -334,17 +357,19 @@ export class ExecutionEngine {
         filter: opts.filter,
         signal: deadline.signal,
       });
+    } catch (err) {
+      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(started), opts.way, err);
+      throw err;
     } finally {
       deadline.clear();
     }
     const duration = hrtimeMs(started);
     this.connectors.touch(opts.connection);
-    const scope = opts.filter ? ` filter="${opts.filter}"` : '';
     await this.auditOk({
       connection: opts.connection,
       kind: 'schema',
       way: opts.way,
-      sql: `schema introspection<${opts.connection}${scope}>`,
+      sql,
       rows: snapshot.tables.length + snapshot.views.length,
       durationMs: duration,
     });
@@ -480,7 +505,7 @@ export class ExecutionEngine {
   private async auditFail(
     connection: string,
     sql: string,
-    kind: 'query' | 'write' | 'ddl',
+    kind: 'query' | 'write' | 'ddl' | 'schema',
     durationMs: number,
     way: WayKind,
     err: unknown,
