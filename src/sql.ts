@@ -35,7 +35,7 @@ export interface Token {
 }
 
 interface ScanOptions {
-  /** Treat backslashes as escapes inside single-quoted strings. */
+  /** Treat backslashes as escapes inside quoted strings. */
   backslashEscapes?: boolean;
 }
 
@@ -50,7 +50,8 @@ const WRITE_KEYWORDS = new Set(['INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE'
 /**
  * Scan SQL into tokens, tracking strings, quoted identifiers, comments, and
  * parameter markers. Paren depth is recorded on each token so callers can
- * distinguish a top-level LIMIT from a subquery LIMIT.
+ * distinguish a top-level LIMIT from a subquery LIMIT. `backslashEscapes` is
+ * enabled only for the MySQL-compatible summary pass.
  */
 export function scan(sql: string, options: ScanOptions = {}): Token[] {
   const tokens: Token[] = [];
@@ -117,6 +118,10 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
     if (c === '"') {
       i += 1;
       while (i < n) {
+        if (backslashEscapes && sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
         if (sql[i] === '"') {
           if (sql[i + 1] === '"') {
             i += 2;
@@ -143,8 +148,13 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
     // PostgreSQL dollar-quoted string: $$...$$ or $tag$...$tag$
     if (c === '$') {
       let j = i + 1;
-      while (j < n && isIdentPart(sql[j]!)) j += 1;
-      if (j < n && sql[j] === '$') {
+      const emptyTag = sql[j] === '$';
+      const namedTag = isIdentStart(sql[j] ?? '');
+      if (namedTag) {
+        j += 1;
+        while (j < n && sql[j] !== '$' && isIdentPart(sql[j]!)) j += 1;
+      }
+      if (emptyTag || (namedTag && j < n && sql[j] === '$')) {
         const delim = sql.slice(i, j + 1);
         const end = sql.indexOf(delim, j + 1);
         i = end === -1 ? n : end + delim.length;
@@ -432,19 +442,70 @@ export function assertSingleStatement(sql: string): void {
  * quoted identifiers replaced by `x`, so callers can reason about structure.
  */
 export function stripComments(sql: string, options: ScanOptions = {}): string {
+  return renderSanitized(sql, [scan(sql, options)]);
+}
+
+interface RedactionSpan {
+  start: number;
+  end: number;
+  replacement: string;
+}
+
+function renderSanitized(sql: string, tokenSets: Token[][]): string {
+  const literals = mergeSpans(
+    tokenSets.flatMap((tokens) => tokens
+      .filter((token) => token.type === 'string' || token.type === 'quotedid')
+      .map((token) => ({
+        start: token.pos,
+        end: token.pos + token.value.length,
+        replacement: token.type === 'string' ? `'x'` : `"x"`,
+      }))),
+  );
+  const comments = mergeSpans(
+    tokenSets.flatMap((tokens) => tokens
+      .filter((token) => token.type === 'comment')
+      .map((token) => ({
+        start: token.pos,
+        end: token.pos + token.value.length,
+        replacement: ' ',
+      })))
+      .filter((span) => !literals.some((literal) => overlaps(span, literal))),
+  );
+  const spans = [...literals, ...comments].sort((a, b) => a.start - b.start);
   let out = '';
-  for (const t of scan(sql, options)) {
-    if (t.type === 'comment') out += ' ';
-    else if (t.type === 'string') out += `'x'`;
-    else if (t.type === 'quotedid') out += `"x"`;
-    else out += t.value;
+  let cursor = 0;
+  for (const span of spans) {
+    if (span.start < cursor) continue;
+    out += sql.slice(cursor, span.start);
+    out += span.replacement;
+    cursor = span.end;
   }
-  return out;
+  return out + sql.slice(cursor);
+}
+
+function overlaps(a: RedactionSpan, b: RedactionSpan): boolean {
+  return a.start < b.end && b.start < a.end;
+}
+
+function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: RedactionSpan[] = [];
+  for (const span of sorted) {
+    const previous = merged[merged.length - 1];
+    if (previous && span.start <= previous.end) {
+      previous.end = Math.max(previous.end, span.end);
+    } else {
+      merged.push({ ...span });
+    }
+  }
+  return merged;
 }
 
 /** Collapse whitespace, dropping comments. Used for summaries/digests. */
 export function normalizeText(sql: string): string {
-  return stripComments(sql, { backslashEscapes: true }).replace(/\s+/g, ' ').trim();
+  return renderSanitized(sql, [scan(sql), scan(sql, { backslashEscapes: true })])
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /**
