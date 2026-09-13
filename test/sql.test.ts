@@ -197,6 +197,22 @@ test('digit-leading dollar tags do not hide placeholders or statements', () => {
   assert.throws(() => assertSingleStatement('SELECT $1$; SELECT $1$'), DbConnectorError);
 });
 
+test('repeated SQLite dollar parameters do not hide placeholders or statements', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $foo$; SELECT $foo$, ?'), {
+    sql: 'SELECT $foo$; SELECT $foo$, $1',
+    count: 1,
+  });
+  assert.throws(() => assertSingleStatement('SELECT $foo$; SELECT $foo$'), DbConnectorError);
+});
+
+test('tagged PostgreSQL dollar strings remain protected in PostgreSQL mode', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $tag$?; SELECT $tag$, ?', 'postgres'), {
+    sql: 'SELECT $tag$?; SELECT $tag$, $1',
+    count: 1,
+  });
+  assert.doesNotThrow(() => assertSingleStatement('SELECT $tag$; SELECT $tag$', 'postgres'));
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',

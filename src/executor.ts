@@ -33,6 +33,7 @@ import type {
   AuditRecord,
   ConnectionSpec,
   ConnectorStatus,
+  DriverKind,
   ExecResult,
   QueryResult,
   ResolvedConfig,
@@ -162,10 +163,11 @@ export class ExecutionEngine {
    * is denied and audited before anything reaches a database.
    */
   async query(opts: QueryOptions, signal: AbortSignal): Promise<QueryResult> {
-    assertSingleStatement(opts.sql);
-    const classification = classifyStatement(opts.sql);
+    const driverKind = this.connectors.describe(opts.connection)?.driver;
+    assertSingleStatement(opts.sql, driverKind);
+    const classification = classifyStatement(opts.sql, driverKind);
 
-    if (!isReadStatement(opts.sql)) {
+    if (!isReadStatement(opts.sql, driverKind)) {
       await this.auditDenied(opts.connection, opts.sql, classification.kind, ErrorCode.ReadOnlyViolation, opts.way);
       throw new DbConnectorError(
         ErrorCode.ReadOnlyViolation,
@@ -173,11 +175,11 @@ export class ExecutionEngine {
       );
     }
 
-    const bound = this.bind(opts.sql, opts.params, opts.namedParams);
+    const bound = this.bind(opts.sql, opts.params, opts.namedParams, driverKind);
     const limit = this.effectiveLimit(opts.limit);
     const guarded =
       classification.kind === 'select'
-        ? ensureSelectLimit(bound.sql, limit)
+        ? ensureSelectLimit(bound.sql, limit, driverKind)
         : { sql: bound.sql, applied: false };
     const protectedSql = guarded.sql;
 
@@ -240,8 +242,9 @@ export class ExecutionEngine {
    * protection where supported; some statements must run outside a transaction.
    */
   async exec(opts: ExecOptions, signal: AbortSignal): Promise<ExecResult> {
-    assertSingleStatement(opts.sql);
-    const classification = classifyStatement(opts.sql);
+    const driverKind = this.connectors.describe(opts.connection)?.driver;
+    assertSingleStatement(opts.sql, driverKind);
+    const classification = classifyStatement(opts.sql, driverKind);
     const readLike = classification.kind === 'select' || classification.kind === 'explain';
 
     if (!readLike) {
@@ -255,7 +258,7 @@ export class ExecutionEngine {
       }
     }
 
-    const bound = this.bind(opts.sql, opts.params, opts.namedParams);
+    const bound = this.bind(opts.sql, opts.params, opts.namedParams, driverKind);
     const openAuditKind = readLike ? 'read' : classification.kind === 'ddl' ? 'ddl' : 'write';
     const openStarted = process.hrtime();
     let driver;
@@ -400,7 +403,12 @@ export class ExecutionEngine {
     return this.connectors.open(name, this.resolveCredentials);
   }
 
-  private bind(sql: string, params?: unknown[], namedParams?: Record<string, unknown>): BindResult {
+  private bind(
+    sql: string,
+    params?: unknown[],
+    namedParams?: Record<string, unknown>,
+    driver?: DriverKind,
+  ): BindResult {
     if (params !== undefined && namedParams !== undefined) {
       throw new DbConnectorError(
         ErrorCode.InvalidArgs,
@@ -409,9 +417,9 @@ export class ExecutionEngine {
     }
     if (namedParams !== undefined) {
       const provided = Object.keys(namedParams);
-      const { sql: rewritten, order } = rewriteNamedToPositional(sql, provided);
+      const { sql: rewritten, order } = rewriteNamedToPositional(sql, provided, driver);
       const values = order.map((key) => normalizeParam(namedParams[key], 0));
-      this.checkArity(rewritten, values.length);
+      this.checkArity(rewritten, values.length, driver);
       return { sql: rewritten, values };
     }
     const raw = params === undefined ? [] : params;
@@ -419,13 +427,13 @@ export class ExecutionEngine {
       throw new DbConnectorError(ErrorCode.InvalidArgs, '"params" must be an array');
     }
     const values = raw.map(normalizeParam);
-    this.checkArity(sql, values.length);
+    this.checkArity(sql, values.length, driver);
     return { sql, values };
   }
 
   /** Friendly guard: placeholder count must equal bound value count. */
-  private checkArity(sql: string, length: number): void {
-    const count = countPositional(sql);
+  private checkArity(sql: string, length: number, driver?: DriverKind): void {
+    const count = countPositional(sql, driver);
     if (count !== length) {
       throw new DbConnectorError(
         ErrorCode.InvalidParams,
@@ -532,9 +540,9 @@ export class ExecutionEngine {
 }
 
 /** Count `?` markers outside strings/comments in a statement. */
-function countPositional(sql: string): number {
+function countPositional(sql: string, driver?: DriverKind): number {
   let count = 0;
-  for (const t of scan(sql)) {
+  for (const t of scan(sql, driver)) {
     if (t.type === 'param' && t.value === '?') count += 1;
   }
   return count;

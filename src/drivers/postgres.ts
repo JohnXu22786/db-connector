@@ -138,7 +138,7 @@ export class PgDriver implements DriverApi {
     signal: AbortSignal,
   ): Promise<ReadOutcome> {
     const client = this.ensure();
-    const converted = toDollarPlaceholders(sql);
+    const converted = toDollarPlaceholders(sql, 'postgres');
     try {
       // Server-side read-only backstop: even a statement that slips past the
       // classifier cannot mutate data inside a READ ONLY transaction.
@@ -177,7 +177,7 @@ export class PgDriver implements DriverApi {
     signal: AbortSignal,
   ): Promise<WriteOutcome> {
     const client = this.ensure();
-    const converted = toDollarPlaceholders(sql);
+    const converted = toDollarPlaceholders(sql, 'postgres');
     try {
       // PostgreSQL rejects VACUUM and concurrent-index operations in a transaction.
       if (isNonTransactionalStatement(sql, 'postgres')) {

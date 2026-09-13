@@ -361,6 +361,22 @@ test('parameter arity mismatch is a friendly INVALID_PARAMS', async () => {
   );
 });
 
+test('SQLite dollar parameters do not hide validation markers', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT $foo$ || ?', params: [1], way: 'cli' },
+    freshSignal(),
+  );
+  assert.equal(result.rowCount, 1);
+  await assert.rejects(
+    h.engine.query(
+      { connection: 'sample', sql: 'SELECT $foo$; SELECT $foo$', way: 'cli' },
+      freshSignal(),
+    ),
+    (e: DbConnectorError) => e.code === 'MULTI_STATEMENTS',
+  );
+});
+
 test('result cap applies and reports truncation', async () => {
   const h = await setup();
   for (let i = 0; i < 20; i += 1) {
