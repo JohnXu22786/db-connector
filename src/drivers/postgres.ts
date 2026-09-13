@@ -216,7 +216,7 @@ export class PgDriver implements DriverApi {
     const schema = this.spec.schema || 'public';
     const signalOpts = { signal } as const;
     try {
-      const [tables, views, columns, pks, indexes, fks] = await Promise.all([
+      const catalogResults = await Promise.allSettled([
         client.query({ ...QUERIES.tables, values: [schema], ...signalOpts }),
         client.query({ ...QUERIES.views, values: [schema], ...signalOpts }),
         client.query({ ...QUERIES.columns, values: [schema], ...signalOpts }),
@@ -224,6 +224,16 @@ export class PgDriver implements DriverApi {
         client.query({ ...QUERIES.indexes, values: [schema], ...signalOpts }),
         client.query({ ...QUERIES.foreignKeys, values: [schema], ...signalOpts }),
       ]);
+      const catalogResultValue = <T>(result: PromiseSettledResult<T>): T => {
+        if (result.status === 'rejected') throw result.reason;
+        return result.value;
+      };
+      const tables = catalogResultValue(catalogResults[0]);
+      const views = catalogResultValue(catalogResults[1]);
+      const columns = catalogResultValue(catalogResults[2]);
+      const pks = catalogResultValue(catalogResults[3]);
+      const indexes = catalogResultValue(catalogResults[4]);
+      const fks = catalogResultValue(catalogResults[5]);
       const pkRows = pks.rows as Array<{ table_name: string; column_name: string }>;
       const pkByTable = new Map<string, Set<string>>();
       for (const row of pkRows) {
