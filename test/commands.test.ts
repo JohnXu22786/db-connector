@@ -14,12 +14,12 @@ test('tokenize respects single and double quotes', () => {
 });
 
 test('tokenize decodes backslash escapes inside quotes', () => {
-  const input = String.raw`query --sql "SELECT \"C:\\tmp\""`;
+  const input = 'query --sql "SELECT \\"C:\\\\tmp\\""';
   assert.deepEqual(tokenize(input), ['query', '--sql', 'SELECT "C:\\tmp"']);
 });
 
 test('tokenize preserves ordinary backslashes in quoted values', () => {
-  const input = String.raw`connect app --db "C:\tmp\app.db"`;
+  const input = 'connect app --db "C:\\tmp\\app.db"';
   assert.deepEqual(tokenize(input), ['connect', 'app', '--db', 'C:\\tmp\\app.db']);
 });
 
