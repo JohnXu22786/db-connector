@@ -162,8 +162,13 @@ export class ExecutionEngine {
    * is denied and audited before anything reaches a database.
    */
   async query(opts: QueryOptions, signal: AbortSignal): Promise<QueryResult> {
-    assertSingleStatement(opts.sql);
     const classification = classifyStatement(opts.sql);
+    try {
+      assertSingleStatement(opts.sql);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      throw err;
+    }
 
     if (!isReadStatement(opts.sql)) {
       await this.auditDenied(opts.connection, opts.sql, classification.kind, ErrorCode.ReadOnlyViolation, opts.way);
@@ -173,12 +178,20 @@ export class ExecutionEngine {
       );
     }
 
-    const bound = this.bind(opts.sql, opts.params, opts.namedParams);
-    const limit = this.effectiveLimit(opts.limit);
-    const guarded =
-      classification.kind === 'select'
-        ? ensureSelectLimit(bound.sql, limit)
-        : { sql: bound.sql, applied: false };
+    let bound: BindResult;
+    let limit: number;
+    let guarded: { sql: string; applied: boolean };
+    try {
+      bound = this.bind(opts.sql, opts.params, opts.namedParams);
+      limit = this.effectiveLimit(opts.limit);
+      guarded =
+        classification.kind === 'select'
+          ? ensureSelectLimit(bound.sql, limit)
+          : { sql: bound.sql, applied: false };
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      throw err;
+    }
     const protectedSql = guarded.sql;
 
     const openStarted = process.hrtime();
@@ -189,7 +202,13 @@ export class ExecutionEngine {
       await this.auditFail(opts.connection, opts.sql, 'query', hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
-    const deadline = this.deadline(opts.timeoutMs, signal);
+    let deadline: ReturnType<ExecutionEngine['deadline']>;
+    try {
+      deadline = this.deadline(opts.timeoutMs, signal);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      throw err;
+    }
     const started = process.hrtime();
     let outcome;
     try {
@@ -240,9 +259,16 @@ export class ExecutionEngine {
    * protection where supported; some statements must run outside a transaction.
    */
   async exec(opts: ExecOptions, signal: AbortSignal): Promise<ExecResult> {
-    assertSingleStatement(opts.sql);
     const classification = classifyStatement(opts.sql);
     const readLike = classification.kind === 'select' || classification.kind === 'explain';
+    const openAuditKind = readLike ? 'read' : classification.kind === 'ddl' ? 'ddl' : 'write';
+
+    try {
+      assertSingleStatement(opts.sql);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      throw err;
+    }
 
     if (!readLike) {
       const allowed = opts.allowWrite === true || this.config.defaultAllowWrite === true;
@@ -255,8 +281,13 @@ export class ExecutionEngine {
       }
     }
 
-    const bound = this.bind(opts.sql, opts.params, opts.namedParams);
-    const openAuditKind = readLike ? 'read' : classification.kind === 'ddl' ? 'ddl' : 'write';
+    let bound: BindResult;
+    try {
+      bound = this.bind(opts.sql, opts.params, opts.namedParams);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      throw err;
+    }
     const openStarted = process.hrtime();
     let driver;
     try {
@@ -265,7 +296,13 @@ export class ExecutionEngine {
       await this.auditFail(opts.connection, opts.sql, openAuditKind, hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
-    const deadline = this.deadline(opts.timeoutMs, signal);
+    let deadline: ReturnType<ExecutionEngine['deadline']>;
+    try {
+      deadline = this.deadline(opts.timeoutMs, signal);
+    } catch (err) {
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      throw err;
+    }
     const started = process.hrtime();
     const isDdl = classification.kind === 'ddl';
     // The classifier deliberately leaves PRAGMA as unknown because it may
