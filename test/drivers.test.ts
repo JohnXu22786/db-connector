@@ -4,8 +4,11 @@
  */
 
 import { strict as assert } from 'node:assert';
+import { mkdtempSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { mock, test } from 'node:test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MysqlDriver } from '../dist/drivers/mysql.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
 import { SqliteDriver } from '../dist/drivers/sqlite.js';
@@ -781,6 +784,73 @@ test('SQLite does not retry a request after close starts', async () => {
     assert.equal(state.child, null);
   } finally {
     state.child?.kill('SIGKILL');
+  }
+});
+
+test('SQLite close rejects queued writes without executing them', async () => {
+  const database = join(mkdtempSync(join(tmpdir(), 'db-connector-')), 'pending.sqlite');
+  const spec = {
+    name: 'sqlite-test',
+    driver: 'sqlite' as const,
+    database,
+    password: '',
+    passwordSource: 'none' as const,
+    options: {},
+  };
+  const driver = new SqliteDriver(spec, logger);
+  let closing: Promise<void> | undefined;
+  let reopened: SqliteDriver | undefined;
+
+  try {
+    await driver.connect();
+    await driver.write(
+      'CREATE TABLE entries(value TEXT)',
+      [],
+      true,
+      signal(),
+    );
+
+    const active = driver.read(
+      `WITH RECURSIVE counter(value) AS (
+         VALUES(0)
+         UNION ALL
+         SELECT value + 1 FROM counter WHERE value < 1000000
+       )
+       SELECT sum(value) FROM counter`,
+      [],
+      signal(),
+    );
+    const queued = driver.write(
+      "INSERT INTO entries(value) VALUES ('queued')",
+      [],
+      false,
+      signal(),
+    );
+    closing = driver.close();
+
+    const [activeError, queuedError] = await Promise.all([
+      active.then(() => undefined, (err: unknown) => err),
+      queued.then(() => undefined, (err: unknown) => err),
+    ]);
+    await closing;
+
+    assert.ok(activeError instanceof DbConnectorError);
+    assert.equal((activeError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+    assert.ok(queuedError instanceof DbConnectorError);
+    assert.equal((queuedError as DbConnectorError).code, ErrorCode.ConnectionNotFound);
+
+    reopened = new SqliteDriver(spec, logger);
+    await reopened.connect();
+    const result = await reopened.read(
+      'SELECT COUNT(*) AS count FROM entries',
+      [],
+      signal(),
+    );
+    assert.deepEqual(result.rows, [[0]]);
+  } finally {
+    await closing?.catch(() => {});
+    await driver.close();
+    await reopened?.close();
   }
 });
 

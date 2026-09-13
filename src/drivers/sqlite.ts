@@ -42,6 +42,14 @@ interface ReplyMessage {
   error?: string;
 }
 
+interface QueuedOperation {
+  operation: () => Promise<unknown>;
+  signal: AbortSignal;
+  resolve: (value: unknown) => void;
+  reject: (reason?: unknown) => void;
+  onAbort: () => void;
+}
+
 const DB_ENV = 'DSH_DB_CONNECTOR_SQLITE_DATABASE';
 
 export class SqliteDriver implements DriverApi {
@@ -49,6 +57,9 @@ export class SqliteDriver implements DriverApi {
   private child: ChildProcess | null = null;
   /** Blocks replacement requests until a deliberately killed child exits. */
   private retiring: Promise<void> | null = null;
+  /** Serializes IPC dispatch so close can reject queued requests before send. */
+  private operationActive = false;
+  private readonly operationQueue: QueuedOperation[] = [];
   private closed = false;
   private seq = 0;
   private readonly pending = new Map<
@@ -167,6 +178,22 @@ export class SqliteDriver implements DriverApi {
         new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection is closed'),
       );
     }
+    return this.enqueueOperation(
+      () => this.requestUnlocked(op, signal, extra),
+      signal,
+    );
+  }
+
+  private async requestUnlocked(
+    op: Op,
+    signal: AbortSignal,
+    extra?: Partial<Omit<RequestMessage, 'id' | 'op'>>,
+  ): Promise<unknown> {
+    if (this.closed) {
+      return Promise.reject(
+        new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection is closed'),
+      );
+    }
     if (this.retiring) await this.retiring;
     if (this.closed) {
       return Promise.reject(
@@ -249,6 +276,67 @@ export class SqliteDriver implements DriverApi {
     });
   }
 
+  private enqueueOperation(
+    operation: () => Promise<unknown>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    if (signal.aborted) return Promise.reject(cancelError(signal));
+
+    return new Promise<unknown>((resolve, reject) => {
+      const queued: QueuedOperation = {
+        operation,
+        signal,
+        resolve,
+        reject,
+        onAbort: () => {},
+      };
+      queued.onAbort = () => {
+        const index = this.operationQueue.indexOf(queued);
+        if (index < 0) return;
+        this.operationQueue.splice(index, 1);
+        signal.removeEventListener('abort', queued.onAbort);
+        reject(cancelError(signal));
+      };
+
+      if (this.operationActive) {
+        this.operationQueue.push(queued);
+        signal.addEventListener('abort', queued.onAbort, { once: true });
+        return;
+      }
+
+      this.operationActive = true;
+      this.runOperation(queued);
+    });
+  }
+
+  private runOperation(operation: QueuedOperation): void {
+    operation.signal.removeEventListener('abort', operation.onAbort);
+    if (operation.signal.aborted) {
+      operation.reject(cancelError(operation.signal));
+      this.finishOperation();
+      return;
+    }
+
+    let result: Promise<unknown>;
+    try {
+      result = operation.operation();
+    } catch (err) {
+      result = Promise.reject(err);
+    }
+    void result
+      .then(operation.resolve, operation.reject)
+      .finally(() => this.finishOperation());
+  }
+
+  private finishOperation(): void {
+    const next = this.operationQueue.shift();
+    if (!next) {
+      this.operationActive = false;
+      return;
+    }
+    this.runOperation(next);
+  }
+
   async connect(): Promise<void> {
     if (this.child && !this.closed) return;
     // Verify the database opens and is queryable; surface failures loudly.
@@ -278,11 +366,17 @@ export class SqliteDriver implements DriverApi {
     const child = this.child;
     this.child = null;
     const retiring = this.retiring;
-    // reject any still-in-flight requests to the current (and stale) children
+    // Reject the request currently dispatched to the child. Later requests
+    // are waiting in operationQueue and have not reached the child yet.
     for (const [id, entry] of this.pending) {
       this.pending.delete(id);
       this.refDrop(entry.child);
       entry.reject(new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection closed'));
+    }
+    const queued = this.operationQueue.splice(0);
+    for (const operation of queued) {
+      operation.signal.removeEventListener('abort', operation.onAbort);
+      operation.reject(new DbConnectorError(ErrorCode.ConnectionNotFound, 'connection closed'));
     }
     if (child) this.inFlight.delete(child);
     if (child && child.exitCode === null && child.connected) {
