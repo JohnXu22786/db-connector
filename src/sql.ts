@@ -138,9 +138,11 @@ export function scan(sql: string): Token[] {
       if (j < n && sql[j] === '$') {
         const delim = sql.slice(i, j + 1);
         const end = sql.indexOf(delim, j + 1);
-        i = end === -1 ? n : end + delim.length;
-        tokens.push({ type: 'string', value: sql.slice(at, i), pos: at, depth });
-        continue;
+        if (end !== -1) {
+          i = end + delim.length;
+          tokens.push({ type: 'string', value: sql.slice(at, i), pos: at, depth });
+          continue;
+        }
       }
       tokens.push({ type: 'symbol', value: '$', pos: at, depth });
       i += 1;
