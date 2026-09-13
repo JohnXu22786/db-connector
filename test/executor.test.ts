@@ -155,6 +155,20 @@ test('read-like exec applies the row limit before calling the driver', async () 
   assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
 });
 
+test('read-like exec leaves bare VALUES valid for SQLite', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  await h.engine.connect({ name: 'values', driver: 'sqlite', database: ':memory:' });
+
+  const result = await h.engine.exec({
+    connection: 'values',
+    sql: 'VALUES (1),(2)',
+    way: 'cli',
+  }, freshSignal());
+
+  assert.equal(result.kind, 'read');
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
