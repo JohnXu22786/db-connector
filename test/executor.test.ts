@@ -179,6 +179,39 @@ test('failed lazy connection open during a read-like exec is audited as read', a
   assert.equal(records[0]!.error?.message, 'read open failed');
 });
 
+test('failed SELECT and EXPLAIN through exec are reported and audited as reads', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver({
+    read: async () => {
+      throw new Error('driver read failed');
+    },
+    write: async () => {
+      throw new Error('write should not be called');
+    },
+  }));
+
+  for (const [index, sql] of ['SELECT 1', 'EXPLAIN SELECT 1'].entries()) {
+    const connection = `broken-read-${index}`;
+    h.connectors.define({ name: connection, driver: 'sqlite' });
+
+    await assert.rejects(
+      h.engine.exec({ connection, sql, way: 'cli' }, freshSignal()),
+      (err: unknown) => {
+        assert.equal((err as Error).message, 'driver read failed');
+        assert.doesNotMatch((err as Error).message, /write|transaction|rolled back/i);
+        return true;
+      },
+    );
+
+    const records = await h.audit.query({ connection });
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.kind, 'read');
+    assert.equal(records[0]!.status, 'error');
+    assert.equal(records[0]!.error?.code, ErrorCode.QueryFailed);
+    assert.equal(records[0]!.error?.message, 'driver read failed');
+  }
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
