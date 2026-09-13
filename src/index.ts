@@ -30,7 +30,7 @@ export interface BundleConfig {
   defaultAllowWrite?: boolean;
 }
 
-/** Resolve a credential through the dsh credentials service, best-effort. */
+/** Resolve a credential through dsh, falling back to a plain env lookup. */
 async function resolveCredential(
   ctx: DshContext,
   ref: string,
@@ -40,7 +40,7 @@ async function resolveCredential(
         resolve?(r: unknown): Promise<unknown> | unknown;
       }
     | undefined;
-  if (!provider?.resolve) return undefined;
+  if (!provider?.resolve) return process.env[ref];
   const read = (out: unknown): string | undefined => {
     if (typeof out === 'string') return out;
     if (out && typeof out === 'object' && 'value' in out) {
@@ -59,9 +59,9 @@ async function resolveCredential(
   try {
     const b = await provider.resolve(ref as never);
     const value = read(b);
-    return value;
+    return value ?? process.env[ref];
   } catch {
-    return undefined;
+    return process.env[ref];
   }
 }
 

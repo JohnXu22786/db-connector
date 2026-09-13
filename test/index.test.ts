@@ -118,6 +118,32 @@ test('apply pre-registers config connections lazily', async () => {
   await f.disposed[0]!();
 });
 
+test('apply falls back to the environment for passwordRef', async () => {
+  const envName = `DB_CONNECTOR_PASSWORD_REF_FALLBACK_${process.pid}`;
+  const previous = process.env[envName];
+  process.env[envName] = 'env-secret';
+  try {
+    const f = fakeContext();
+    apply(f.ctx, {
+      connections: {
+        local: { driver: 'sqlite', database: ':memory:', passwordRef: envName },
+      },
+    });
+
+    const connect = f.tools[0]!;
+    const ex = { signal: new AbortController().signal, token: 't' };
+    const made = (await connect.execute({ action: 'connect', name: 'local' }, ex)) as {
+      status: { status: string };
+    };
+
+    assert.equal(made.status.status, 'connected');
+    await f.disposed[0]!();
+  } finally {
+    if (previous === undefined) delete process.env[envName];
+    else process.env[envName] = previous;
+  }
+});
+
 test('apply teardown closes connections so later calls fail', async () => {
   const f = fakeContext();
   apply(f.ctx, {});
