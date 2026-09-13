@@ -216,6 +216,97 @@ test('schema snapshot lists columns for SQLite views', async () => {
   );
 });
 
+test('schema snapshot includes SQLite temporary tables and views', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP TABLE temp_records (id INTEGER PRIMARY KEY, value TEXT NOT NULL)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP VIEW temp_directory AS SELECT id, value FROM temp_records',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(s.tables.map((table) => table.name), ['temp_records']);
+  assert.deepEqual(s.views.map((view) => view.name), ['temp_directory']);
+  assert.deepEqual(
+    s.columns
+      .filter((column) => column.table === 'temp_directory')
+      .map((column) => ({ name: column.name, type: column.type, ordinal: column.ordinal })),
+    [
+      { name: 'id', type: 'INTEGER', ordinal: 1 },
+      { name: 'value', type: 'TEXT', ordinal: 2 },
+    ],
+  );
+});
+
+test('schema snapshot gives SQLite temporary objects precedence over case-insensitive shadows', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE shadow_table (persistent_id INTEGER PRIMARY KEY, persistent_value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: "CREATE VIEW shadow_view AS SELECT 1 AS persistent_id, 'persistent' AS persistent_value",
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP TABLE SHADOW_VIEW (temp_id TEXT, temp_value REAL)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP VIEW SHADOW_TABLE AS SELECT temp_id, temp_value FROM SHADOW_VIEW',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(s.tables.map((table) => table.name), ['SHADOW_VIEW']);
+  assert.deepEqual(s.views.map((view) => view.name), ['SHADOW_TABLE']);
+  assert.deepEqual(
+    s.columns
+      .filter((column) => column.table === 'SHADOW_VIEW')
+      .map((column) => ({ name: column.name, type: column.type })),
+    [
+      { name: 'temp_id', type: 'TEXT' },
+      { name: 'temp_value', type: 'REAL' },
+    ],
+  );
+  assert.deepEqual(
+    s.columns
+      .filter((column) => column.table === 'SHADOW_TABLE')
+      .map((column) => ({ name: column.name, type: column.type })),
+    [
+      { name: 'temp_id', type: 'TEXT' },
+      { name: 'temp_value', type: 'REAL' },
+    ],
+  );
+});
+
 test('schema snapshots are cached within TTL and refreshable', async () => {
   const h = makeHarness({ schema: { ttlMs: 600000 } });
   await seedSqlite(h);
