@@ -410,6 +410,64 @@ test('PostgreSQL reconnects after close without leaking the new client', async (
   assert.deepEqual(endCalls, [1, 2]);
 });
 
+test('MySQL close waits before ending the connection used by an active transaction', async () => {
+  const events: string[] = [];
+  const statement = deferred<[unknown, unknown]>();
+  const started = deferred<void>();
+  let ended = false;
+  let endStarted = false;
+  const conn: MysqlConnectionStub = {
+    execute: async (input) => {
+      const sql = mysqlSql(input);
+      events.push(sql);
+      if (sql === 'SELECT first') {
+        started.resolve();
+        return statement.promise;
+      }
+      return [[], []];
+    },
+    query: async (sql) => {
+      if (ended) throw new Error('connection ended');
+      events.push(sql);
+      return [[], []];
+    },
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {
+      endStarted = true;
+      ended = true;
+    },
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  installMysqlConnection(driver, conn);
+
+  const active = driver.read('SELECT first', [], signal());
+  await started.promise;
+  const closing = driver.close();
+
+  try {
+    await nextTurn();
+    assert.equal(endStarted, false);
+    assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'SELECT first']);
+
+    statement.resolve([[[1]], [{ name: 'value' }]]);
+    await active;
+    await closing;
+
+    assert.equal(endStarted, true);
+    assert.deepEqual(events, [
+      'START TRANSACTION READ ONLY',
+      'SELECT first',
+      'ROLLBACK',
+    ]);
+  } finally {
+    statement.resolve([[], []]);
+    await Promise.allSettled([active, closing]);
+  }
+});
+
 test('PostgreSQL rejects an aborted queued request without starting a transaction', async () => {
   const events: string[] = [];
   const statement = deferred<PgResult>();
