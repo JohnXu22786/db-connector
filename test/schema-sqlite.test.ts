@@ -140,6 +140,29 @@ test('schema snapshot preserves SQLite nullability for INTEGER PRIMARY KEY DESC'
   assert.equal(key.nullable, true);
 });
 
+test('schema snapshot includes SQLite generated columns', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE measurements (raw INTEGER, doubled INTEGER GENERATED ALWAYS AS (raw * 2) STORED)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  assert.deepEqual(
+    s.columns
+      .filter((column) => column.table === 'measurements')
+      .map((column) => ({ name: column.name, type: column.type, ordinal: column.ordinal })),
+    [
+      { name: 'raw', type: 'INTEGER', ordinal: 1 },
+      { name: 'doubled', type: 'INTEGER', ordinal: 2 },
+    ],
+  );
+});
+
 test('schema snapshot lists columns for SQLite views', async () => {
   const h = makeHarness();
   await seedSqlite(h);

@@ -117,7 +117,7 @@ function runSchema(): unknown {
 
   const readColumns = (object: { name: string; sql?: string }, hasPrimaryKeyIndex = false): void => {
     const cols = db
-      .prepare(`PRAGMA table_info("${quote(object.name)}")`)
+      .prepare(`PRAGMA table_xinfo("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
     const hasAutoincrement = /AUTOINCREMENT/i.test(object.sql ?? '');
     for (const c of cols) {
