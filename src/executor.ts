@@ -257,6 +257,12 @@ export class ExecutionEngine {
 
     const bound = this.bind(opts.sql, opts.params, opts.namedParams);
     const openAuditKind = readLike ? 'read' : classification.kind === 'ddl' ? 'ddl' : 'write';
+    const readLimit = readLike ? this.effectiveLimit(undefined) : undefined;
+    const guarded =
+      classification.kind === 'select'
+        ? ensureSelectLimit(bound.sql, readLimit!)
+        : { sql: bound.sql, applied: false };
+    const protectedSql = guarded.sql;
     const openStarted = process.hrtime();
     let driver;
     try {
@@ -275,8 +281,8 @@ export class ExecutionEngine {
 
     try {
       if (readLike) {
-        const outcome = await driver.read(bound.sql, bound.values, deadline.signal);
-        const limit = this.effectiveLimit(undefined);
+        const outcome = await driver.read(protectedSql, bound.values, deadline.signal);
+        const limit = readLimit!;
         const { rows } = capRows(outcome.rows, limit);
         this.connectors.touch(opts.connection);
         const auditId = await this.auditOk({
