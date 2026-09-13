@@ -166,7 +166,8 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
       continue;
     }
 
-    // positional parameter marker
+    // Provisional positional parameter marker. PostgreSQL JSONB question
+    // operators are reclassified after the complete token stream is known.
     if (c === '?') {
       tokens.push({ type: 'param', value: '?', pos: at, depth });
       i += 1;
@@ -210,7 +211,73 @@ export function scan(sql: string, options: ScanOptions = {}): Token[] {
     i += 1;
   }
 
+  markQuestionOperators(tokens);
   return tokens;
+}
+
+/**
+ * PostgreSQL uses `?`, `?|`, `?&`, and `@?` as JSONB operators. A question mark
+ * is a positional parameter everywhere else in this package, so only
+ * reclassify it when the surrounding tokens form a binary expression. This
+ * keeps normal placeholders such as `WHERE id = ?` and `VALUES (?)` unchanged
+ * while allowing operators to pass through the placeholder rewriters.
+ */
+function markQuestionOperators(tokens: Token[]): void {
+  const meaningfulIndexes = tokens
+    .map((token, index) => token.type === 'space' || token.type === 'comment' ? -1 : index)
+    .filter((index) => index >= 0);
+
+  for (let i = 0; i < meaningfulIndexes.length; i += 1) {
+    const index = meaningfulIndexes[i]!;
+    const token = tokens[index]!;
+    if (token.type !== 'param' || token.value !== '?') continue;
+
+    const previous = i > 0 ? tokens[meaningfulIndexes[i - 1]!] : undefined;
+    const next = i + 1 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 1]!] : undefined;
+    const nextNext = i + 2 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 2]!] : undefined;
+
+    // `?|` and `?&` are also JSONB operators. The punctuation remains a
+    // separate symbol token; only the question mark needs reclassification.
+    const right = next?.type === 'symbol' && (next.value === '|' || next.value === '&')
+      ? nextNext
+      : next;
+    const left = previous?.type === 'symbol' && previous.value === '@'
+      ? (i > 1 ? tokens[meaningfulIndexes[i - 2]!] : undefined)
+      : previous;
+
+    if (isExpressionEnd(left) && isExpressionStart(right)) {
+      token.type = 'symbol';
+    }
+  }
+}
+
+const QUESTION_OPERATOR_BOUNDARIES = new Set([
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO', 'VALUES', 'SET',
+  'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'AND', 'OR', 'NOT', 'IS',
+  'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
+  'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS', 'WHEN', 'THEN', 'ELSE',
+  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'PARTITION', 'FILTER',
+  'WINDOW',
+]);
+
+function isExpressionEnd(token: Token | undefined): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') {
+    return token.value.toUpperCase() === 'END' ||
+      !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  }
+  return token.type === 'symbol' && (/^[0-9.]$/.test(token.value) || /^[)\]}]$/.test(token.value));
+}
+
+function isExpressionStart(token: Token | undefined): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') return !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  return token.type === 'symbol' && /^[([{0-9.]$/.test(token.value);
 }
 
 /** Meaningful tokens: everything except whitespace and comments. */
@@ -543,8 +610,9 @@ interface RewriteState {
 }
 
 /**
- * Run `onParam` for each `?`/`:name` marker (outside strings/comments) and
- * reconstruct the SQL with the returned text substituted in order.
+ * Run `onParam` for each positional or named parameter marker (outside
+ * strings/comments) and reconstruct the SQL with the returned text
+ * substituted in order.
  */
 function rewritePlaceholders(
   sql: string,

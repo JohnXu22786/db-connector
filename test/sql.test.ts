@@ -175,6 +175,23 @@ test('toDollarPlaceholders rewrites positional ? outside strings/comments', () =
   });
 });
 
+test('toDollarPlaceholders preserves PostgreSQL JSONB question operators', () => {
+  for (const sql of [
+    `SELECT '{"a":1}'::jsonb ? 'a'`,
+    `SELECT '{"a":1}'::jsonb ?| ARRAY['a']`,
+    `SELECT '{"a":1}'::jsonb ?& ARRAY['a']`,
+    `SELECT '{"a":1}'::jsonb @? '$.a'`,
+  ]) {
+    assert.deepEqual(toDollarPlaceholders(sql), { sql, count: 0 });
+  }
+
+  const withParam = `SELECT '{"a":1}'::jsonb ? 'a' AND value = ?`;
+  assert.deepEqual(toDollarPlaceholders(withParam), {
+    sql: `SELECT '{"a":1}'::jsonb ? 'a' AND value = $1`,
+    count: 1,
+  });
+});
+
 test('rewriteNamedToPositional maps :name markers in order', () => {
   const out = rewriteNamedToPositional(
     'INSERT INTO t(a, b) VALUES(:b, :a)',
