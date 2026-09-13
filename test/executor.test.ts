@@ -32,6 +32,51 @@ function emptyDriver(overrides: Partial<DriverApi> = {}): DriverApi {
   };
 }
 
+test('invalid query validation is audited', async () => {
+  const h = makeHarness();
+
+  await assert.rejects(
+    h.engine.query({
+      connection: 'validation-query',
+      sql: 'SELECT 1; SELECT 2',
+      way: 'cli',
+    }, freshSignal()),
+    (err: unknown) => {
+      assert.equal((err as { code?: string }).code, ErrorCode.MultiStatements);
+      return true;
+    },
+  );
+
+  const records = await h.audit.query({ connection: 'validation-query' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'query');
+  assert.equal(records[0]!.status, 'error');
+  assert.equal(records[0]!.error?.code, ErrorCode.MultiStatements);
+});
+
+test('invalid exec validation is audited', async () => {
+  const h = makeHarness();
+
+  await assert.rejects(
+    h.engine.exec({
+      connection: 'validation-exec',
+      sql: 'UPDATE items SET value = 1; DELETE FROM items',
+      allowWrite: true,
+      way: 'cli',
+    }, freshSignal()),
+    (err: unknown) => {
+      assert.equal((err as { code?: string }).code, ErrorCode.MultiStatements);
+      return true;
+    },
+  );
+
+  const records = await h.audit.query({ connection: 'validation-exec' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'write');
+  assert.equal(records[0]!.status, 'error');
+  assert.equal(records[0]!.error?.code, ErrorCode.MultiStatements);
+});
+
 test('failed lazy connection open is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
