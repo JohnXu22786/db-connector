@@ -18,6 +18,11 @@ test('tokenize decodes backslash escapes inside quotes', () => {
   assert.deepEqual(tokenize(input), ['query', '--sql', 'SELECT "C:\\tmp"']);
 });
 
+test('tokenize preserves ordinary backslashes in quoted values', () => {
+  const input = String.raw`connect app --db "C:\tmp\app.db"`;
+  assert.deepEqual(tokenize(input), ['connect', 'app', '--db', 'C:\\tmp\\app.db']);
+});
+
 test('splitFlags separates positionals from --key value pairs', () => {
   const { positionals, flags } = splitFlags(
     tokenize('connect app --driver sqlite --db ./x.db --refresh'),
