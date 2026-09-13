@@ -4,7 +4,8 @@
  */
 
 import { strict as assert } from 'node:assert';
-import { test } from 'node:test';
+import { createRequire } from 'node:module';
+import { mock, test } from 'node:test';
 import { MysqlDriver } from '../dist/drivers/mysql.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
 import { SqliteDriver } from '../dist/drivers/sqlite.js';
@@ -22,6 +23,8 @@ type PgClientStub = {
   connect(): Promise<void>;
   end(): Promise<void>;
 };
+
+const require = createRequire(import.meta.url);
 
 type MysqlConnectionStub = {
   execute(input: string | { sql: string; values?: unknown[]; rowsAsArray?: boolean }): Promise<[unknown, unknown]>;
@@ -366,6 +369,45 @@ test('PostgreSQL close waits before ending the client used by queued operations'
     'ROLLBACK',
   ]);
   assert.equal(endStarted, true);
+});
+
+test('PostgreSQL reconnects after close without leaking the new client', async (t) => {
+  let clientCreates = 0;
+  const endCalls: number[] = [];
+  class FakePgClient implements PgClientStub {
+    private readonly id = ++clientCreates;
+
+    async connect(): Promise<void> {}
+
+    async query(): Promise<PgResult> {
+      return { fields: [{ name: 'value' }], rows: [[1]], rowCount: 1 };
+    }
+
+    async end(): Promise<void> {
+      endCalls.push(this.id);
+    }
+  }
+  function createFakePgClient(): FakePgClient {
+    return new FakePgClient();
+  }
+  const pg = require('pg') as { Client: typeof FakePgClient };
+  mock.method(pg, 'Client', createFakePgClient);
+  t.after(() => mock.restoreAll());
+
+  const driver = new PgDriver(spec('postgres'), logger);
+  await driver.connect();
+  await driver.close();
+  await driver.connect();
+
+  try {
+    const result = await driver.read('SELECT 1', [], signal());
+    assert.deepEqual(result.rows, [[1]]);
+  } finally {
+    await driver.close();
+  }
+
+  assert.equal(clientCreates, 2);
+  assert.deepEqual(endCalls, [1, 2]);
 });
 
 test('PostgreSQL rejects an aborted queued request without starting a transaction', async () => {

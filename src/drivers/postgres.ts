@@ -70,6 +70,7 @@ export class PgDriver implements DriverApi {
   async connect(): Promise<void> {
     await this.withOperationLock(async () => {
       if (this.client) return;
+      this.closed = false;
       const { Client } = await loadPgModule();
       const client = new Client({
         host: this.spec.host,
