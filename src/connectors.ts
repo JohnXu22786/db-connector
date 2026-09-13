@@ -8,7 +8,12 @@
  */
 
 import { ErrorCode, DbConnectorError } from './errors.js';
-import { applyCredentialPassword, resolveConnectionSpec, summarizeSpec } from './config.js';
+import {
+  applyCredentialPassword,
+  resolveConnectionSpec,
+  summarizeSpec,
+  validateConnectionSpec,
+} from './config.js';
 import { MysqlDriver } from './drivers/mysql.js';
 import { PgDriver } from './drivers/postgres.js';
 import { SqliteDriver } from './drivers/sqlite.js';
@@ -25,7 +30,8 @@ export interface ResolveCredentials {
 }
 
 interface ConnectorRecord {
-  spec: ResolvedConnectionSpec;
+  spec: ConnectionSpec;
+  env: NodeJS.ProcessEnv;
   driver: DriverApi | null;
   status: 'defined' | 'connected';
   openedAt: string | null;
@@ -45,13 +51,13 @@ export class Connectors {
 
   constructor(private readonly logger: DriverLogger = DEFAULT_LOGGER) {}
 
-  /** Register a named connection without opening it. Throws on duplicates. */
+  /** Register a named connection without resolving environment-backed fields. */
   define(spec: ConnectionSpec, env: NodeJS.ProcessEnv = process.env): ConnectorStatus {
-    const resolved = resolveConnectionSpec(spec, env);
-    if (this.map.has(resolved.name)) {
+    validateConnectionSpec(spec);
+    if (this.map.has(spec.name)) {
       throw new DbConnectorError(
         ErrorCode.ConnectionExists,
-        `a connection named "${resolved.name}" already exists`,
+        `a connection named "${spec.name}" already exists`,
       );
     }
     if (this.closeAllPromise) {
@@ -60,8 +66,9 @@ export class Connectors {
         'connections are closing',
       );
     }
-    this.map.set(resolved.name, {
-      spec: resolved,
+    this.map.set(spec.name, {
+      spec: { ...spec },
+      env,
       driver: null,
       status: 'defined',
       openedAt: null,
@@ -72,7 +79,7 @@ export class Connectors {
       openWaiters: new Set(),
       closingPromise: null,
     });
-    return this.statusOf(resolved.name, this.map.get(resolved.name)!);
+    return this.statusOf(spec.name, this.map.get(spec.name)!);
   }
 
   /** Whether a connection name is known (defined or connected). */
@@ -141,10 +148,9 @@ export class Connectors {
     }
 
     const opening = (async () => {
-      let spec = rec.spec;
+      let spec = resolveConnectionSpec(rec.spec, rec.env);
       if (spec.passwordRef && resolveCredentials) {
         spec = (await applyCredentialPassword(spec, resolveCredentials)) as ResolvedConnectionSpec;
-        rec.spec = spec;
       }
       const driver = this.buildDriver(spec);
       try {
