@@ -89,6 +89,35 @@ test('schema snapshot lists tables, columns, indexes, foreign keys', async () =>
   assert.deepEqual(fk!.referencedColumns, ['id']);
 });
 
+test('schema snapshot resolves shorthand SQLite foreign-key references', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE parent (id INTEGER PRIMARY KEY)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE child (parent_id INTEGER REFERENCES parent)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const fk = s.foreignKeys.find((foreignKey) => foreignKey.table === 'child');
+
+  assert.ok(fk);
+  assert.deepEqual(fk!.columns, ['parent_id']);
+  assert.equal(fk!.referencedTable, 'parent');
+  assert.deepEqual(fk!.referencedColumns, ['id']);
+});
+
 test('schema snapshot preserves SQLite nullability for non-INTEGER primary keys', async () => {
   const h = makeHarness();
   await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
