@@ -226,7 +226,11 @@ export class SqliteDriver implements DriverApi {
     let child = this.ensureChild();
     const first = dispatch(++this.seq, child);
     return first.catch((err) => {
-      if (err instanceof DbConnectorError && err.code === ErrorCode.ConnectionNotFound) {
+      if (
+        !this.closed &&
+        err instanceof DbConnectorError &&
+        err.code === ErrorCode.ConnectionNotFound
+      ) {
         const fresh = this.ensureChild();
         if (fresh !== child) return dispatch(++this.seq, fresh);
       }
