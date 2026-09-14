@@ -67,7 +67,7 @@ export class PgDriver implements DriverApi {
     private readonly logger: DriverLogger,
   ) {}
 
-  async connect(): Promise<void> {
+  async connect(signal?: AbortSignal): Promise<void> {
     await this.withOperationLock(async () => {
       if (this.client) return;
       this.closed = false;
@@ -82,15 +82,29 @@ export class PgDriver implements DriverApi {
         connectionString: this.spec.connectionString,
         ...this.spec.options,
       } as never);
-      try {
-        await client.connect();
-        await client.query('SELECT 1');
-      } catch (err) {
+      let closed = false;
+      const closeClient = () => {
+        if (closed) return;
+        closed = true;
         void client.end().catch(() => {});
+      };
+      try {
+        await runAbortable(() => client.connect(), signal, closeClient);
+        await runAbortable(
+          () =>
+            signal
+              ? client.query({ text: 'SELECT 1', signal } as never)
+              : client.query('SELECT 1'),
+          signal,
+          closeClient,
+        );
+        if (signal?.aborted) throw cancelError(signal);
+      } catch (err) {
+        closeClient();
         throw toConnectorError(this.spec, err);
       }
       this.client = client;
-    });
+    }, signal);
   }
 
   private async withOperationLock<T>(
@@ -299,6 +313,61 @@ function outcomeOf(result: PgArrayQueryResult): ReadOutcome {
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function runAbortable<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): Promise<T> {
+  if (!signal) return operation();
+  if (signal.aborted) {
+    try {
+      onAbort();
+    } catch {
+      // Cancellation still wins if cleanup itself fails.
+    }
+    return Promise.reject(cancelError(signal));
+  }
+
+  let pending: Promise<T>;
+  try {
+    pending = operation();
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onSignalAbort);
+    const onSignalAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        onAbort();
+      } catch {
+        // Cancellation still wins if cleanup itself fails.
+      }
+      reject(cancelError(signal));
+    };
+
+    signal.addEventListener('abort', onSignalAbort, { once: true });
+    pending.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      },
+    );
+    if (signal.aborted) onSignalAbort();
+  });
 }
 
 function cancelError(signal: AbortSignal): DbConnectorError {
