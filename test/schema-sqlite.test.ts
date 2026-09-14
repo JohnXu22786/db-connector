@@ -169,6 +169,110 @@ test('schema snapshot preserves SQLite nullability for INTEGER PRIMARY KEY DESC'
   assert.equal(key.nullable, true);
 });
 
+test('schema snapshot ignores AUTOINCREMENT text outside column constraints', async () => {
+  for (const [table, constraint] of [
+    ['records_default', 'DEFAULT [AUTOINCREMENT]'],
+    ['records_reference', 'REFERENCES [AUTOINCREMENT]'],
+    ['records_string', "DEFAULT 'AUTOINCREMENT'"],
+    ['records_comment', '/* AUTOINCREMENT */'],
+  ] as const) {
+    const h = makeHarness();
+    await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+    await h.engine.exec({
+      connection: 'sample',
+      sql: `CREATE TABLE ${table} (id INTEGER PRIMARY KEY ${constraint})`,
+      allowWrite: true,
+      way: 'cli',
+    }, freshSignal());
+
+    const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+    const id = s.columns.find((column) => column.table === table && column.name === 'id')!;
+
+    assert.equal(id.extra, undefined, constraint);
+  }
+});
+
+test('schema snapshot treats parentheses in bracket-quoted identifiers as opaque', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE [records(AUTOINCREMENT)] (id INTEGER PRIMARY KEY)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE [records(real)] ([id(name)] [INTEGER] PRIMARY KEY AUTOINCREMENT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const falsePositive = s.columns.find(
+    (column) => column.table === 'records(AUTOINCREMENT)' && column.name === 'id',
+  )!;
+  const actual = s.columns.find(
+    (column) => column.table === 'records(real)' && column.name === 'id(name)',
+  )!;
+
+  assert.equal(falsePositive.extra, undefined);
+  assert.equal(actual.extra, 'AUTOINCREMENT');
+});
+
+test('schema snapshot recognizes quoted INTEGER type names', async () => {
+  for (const [table, type] of [
+    ['records_double_quote', '"INTEGER"'],
+    ['records_single_quote', "'INTEGER'"],
+  ] as const) {
+    const h = makeHarness();
+    await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+    await h.engine.exec({
+      connection: 'sample',
+      sql: `CREATE TABLE ${table} (id ${type} PRIMARY KEY AUTOINCREMENT)`,
+      allowWrite: true,
+      way: 'cli',
+    }, freshSignal());
+
+    const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+    const id = s.columns.find((column) => column.table === table && column.name === 'id')!;
+
+    assert.equal(id.extra, 'AUTOINCREMENT', type);
+  }
+});
+
+test('schema snapshot decodes escaped backtick identifiers in SQLite definitions', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE [backtick_table] (`i``d` `INTEGER` PRIMARY KEY AUTOINCREMENT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const id = s.columns.find((column) => column.table === 'backtick_table' && column.name === 'i`d')!;
+
+  assert.equal(id.extra, 'AUTOINCREMENT');
+});
+
+test('schema snapshot preserves AUTOINCREMENT on a table-level primary key', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE [records(table)] ([ID(name)] [INTEGER], PRIMARY KEY ([id(name)] AUTOINCREMENT))',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const id = s.columns.find((column) => column.table === 'records(table)' && column.name === 'ID(name)')!;
+
+  assert.equal(id.extra, 'AUTOINCREMENT');
+});
+
 test('schema snapshot includes SQLite generated columns', async () => {
   const h = makeHarness();
   await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });

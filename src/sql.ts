@@ -39,11 +39,14 @@ export interface ScanOptions {
   backslashEscapes?: boolean;
   /** Recognize PostgreSQL `E'...'` escape string constants. */
   postgresEscapeStrings?: boolean;
+  /** Recognize SQLite bracket-quoted identifiers. */
+  bracketIdentifiers?: boolean;
 }
 
 function scanOptionsForDriver(driver: DriverKind): ScanOptions {
   if (driver === 'mysql') return { backslashEscapes: true };
   if (driver === 'postgres') return { postgresEscapeStrings: true };
+  if (driver === 'sqlite') return { bracketIdentifiers: true };
   return {};
 }
 
@@ -70,6 +73,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
+  const bracketIdentifiers = resolvedOptions.bracketIdentifiers === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -177,7 +181,27 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     // `mysql backtick identifier`
     if (c === '`') {
       i += 1;
-      while (i < n && sql[i] !== '`') i += 1;
+      while (i < n) {
+        if (sql[i] !== '`') {
+          i += 1;
+          continue;
+        }
+        if (sql[i + 1] === '`') {
+          i += 2;
+          continue;
+        }
+        i += 1;
+        break;
+      }
+      tokens.push({ type: 'quotedid', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // SQLite bracket-quoted identifier: [name]. Brackets are not treated as
+    // identifiers for PostgreSQL, where the same syntax is array subscripting.
+    if (bracketIdentifiers && c === '[') {
+      i += 1;
+      while (i < n && sql[i] !== ']') i += 1;
       if (i < n) i += 1;
       tokens.push({ type: 'quotedid', value: sql.slice(at, i), pos: at, depth });
       continue;
