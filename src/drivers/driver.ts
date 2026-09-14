@@ -82,17 +82,33 @@ export interface DriverLogger {
   warn(...args: unknown[]): void;
 }
 
+function packageName(specifier: string): string {
+  const parts = specifier.split('/');
+  return specifier.startsWith('@') ? parts.slice(0, 2).join('/') : parts[0] ?? specifier;
+}
+
+function isMissingRequestedPackage(err: unknown, requestedName: string): boolean {
+  if (!(err instanceof Error) || !('code' in err)) return false;
+  if (err.code !== 'MODULE_NOT_FOUND' && err.code !== 'ERR_MODULE_NOT_FOUND') return false;
+
+  // Node uses these codes for missing dependencies imported by the driver too.
+  const missingName = /Cannot find (?:package|module) ['"]([^'"]+)['"]/.exec(err.message)?.[1];
+  const installName = packageName(requestedName);
+  return missingName === requestedName || missingName === installName;
+}
+
 /** Load the optional server driver package, with a friendly failure. */
 export async function importOptional<T>(name: string): Promise<T> {
   try {
     return await import(name);
   } catch (err) {
+    const installName = packageName(name);
     const friendly =
-      name === 'pg' ? 'postgres' : name === 'mysql2' ? 'mysql' : name;
-    if (err instanceof Error && 'code' in err && err.code === 'MODULE_NOT_FOUND') {
+      installName === 'pg' ? 'postgres' : installName === 'mysql2' ? 'mysql' : installName;
+    if (isMissingRequestedPackage(err, name)) {
       throw new DbConnectorError(
         ErrorCode.DriverNotInstalled,
-        `the "${name}" package is not installed; run "npm i ${name}" to enable ${friendly} connections`,
+        `the "${installName}" package is not installed; run "npm i ${installName}" to enable ${friendly} connections`,
       );
     }
     throw new DbConnectorError(

@@ -178,6 +178,57 @@ function makeEngine(driver: DriverApi): ExecutionEngine {
   });
 }
 
+test('missing optional packages reported by native ESM get an actionable error', async () => {
+  const missingPackage = 'dsh-db-connector-missing-optional-driver';
+
+  await assert.rejects(
+    importOptional<Record<string, unknown>>(missingPackage),
+    (err: unknown) => {
+      assert.ok(err instanceof DbConnectorError);
+      assert.equal(err.code, ErrorCode.DriverNotInstalled);
+      assert.equal(
+        err.message,
+        `the "${missingPackage}" package is not installed; run "npm i ${missingPackage}" to enable ${missingPackage} connections`,
+      );
+      return true;
+    },
+  );
+});
+
+test('missing optional package subpaths name the installable package', async () => {
+  const packageName = 'dsh-db-connector-missing-optional-driver';
+  const requestedName = `${packageName}/promise`;
+
+  await assert.rejects(
+    importOptional<Record<string, unknown>>(requestedName),
+    (err: unknown) => {
+      assert.ok(err instanceof DbConnectorError);
+      assert.equal(err.code, ErrorCode.DriverNotInstalled);
+      assert.equal(
+        err.message,
+        `the "${packageName}" package is not installed; run "npm i ${packageName}" to enable ${packageName} connections`,
+      );
+      return true;
+    },
+  );
+});
+
+test('nested native ESM module failures retain generic load errors', async () => {
+  const requestedName = new URL('./fixtures/missing-transitive-driver.js', import.meta.url).href;
+
+  await assert.rejects(
+    importOptional<Record<string, unknown>>(requestedName),
+    (err: unknown) => {
+      assert.ok(err instanceof DbConnectorError);
+      assert.equal(err.code, ErrorCode.DriverNotInstalled);
+      assert.match(err.message, /^failed to load "file:\/\//);
+      assert.match(err.message, /dsh-db-connector-missing-transitive-dependency/);
+      assert.doesNotMatch(err.message, /package is not installed/);
+      return true;
+    },
+  );
+});
+
 test('failed non-transactional DDL invalidates the schema cache and reports no rollback', async () => {
   let introspections = 0;
   const driver: DriverApi = {
