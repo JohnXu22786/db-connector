@@ -1,6 +1,6 @@
 -- Example schema for a quick start with dsh-db-connector (SQLite).
 -- Create the file, then: db_connect app (driver sqlite, database ./data/app.db),
--- run this via db_exec once, then query freely.
+-- run each statement in a separate db_exec call with allowWrite: true, then query freely.
 
 CREATE TABLE users (
   id         INTEGER PRIMARY KEY,
