@@ -21,8 +21,10 @@ type PgResult = {
   rowCount: number;
 };
 
+type PgQueryInput = string | { text: string; values?: unknown[] };
+
 type PgClientStub = {
-  query(input: string | { text: string }): Promise<PgResult>;
+  query(input: PgQueryInput): Promise<PgResult>;
   connect(): Promise<void>;
   end(): Promise<void>;
 };
@@ -322,6 +324,68 @@ test('PostgreSQL introspection keeps primary keys associated with their table', 
 
   assert.equal(secondTable.find((item) => item.name === 'code')?.primaryKey, true);
   assert.equal(secondTable.find((item) => item.name === 'id')?.primaryKey, false);
+});
+
+test('PostgreSQL introspection includes indexes on partitioned tables', async () => {
+  const client: PgClientStub = {
+    connect: async () => {},
+    end: async () => {},
+    query: async (input) => {
+      const text = typeof input === 'string' ? input : input.text;
+      if (text.includes('FROM pg_index')) {
+        const normalized = text.replace(/\s+/g, ' ').trim();
+        assert.match(
+          normalized,
+          /WHERE n\.nspname = \$1 AND t\.relkind IN \('r', 'p'\) GROUP BY/,
+        );
+        assert.deepEqual(typeof input === 'string' ? undefined : input.values, ['public']);
+        const rows = [
+          {
+            index_name: 'events_pkey',
+            table_name: 'events',
+            is_unique: true,
+            is_primary: true,
+            column_names: ['id'],
+          },
+          {
+            index_name: 'users_email_idx',
+            table_name: 'users',
+            is_unique: false,
+            is_primary: false,
+            column_names: ['email'],
+          },
+        ];
+        return { fields: [], rows, rowCount: rows.length } as never;
+      }
+      return { fields: [], rows: [], rowCount: 0 };
+    },
+  };
+  const driver = new PgDriver(spec('postgres'), {
+    debug() {},
+    info() {},
+    warn() {},
+  });
+  installPgClient(driver, client);
+
+  const introspection = await driver.introspect(new AbortController().signal);
+
+  const expectedIndexes = [
+    {
+      name: 'events_pkey',
+      table: 'events',
+      columns: ['id'],
+      unique: true,
+      primary: true,
+    },
+    {
+      name: 'users_email_idx',
+      table: 'users',
+      columns: ['email'],
+      unique: false,
+      primary: false,
+    },
+  ];
+  assert.deepEqual(introspection.indexes, expectedIndexes);
 });
 
 test('PostgreSQL close waits before ending the client used by queued operations', async () => {
