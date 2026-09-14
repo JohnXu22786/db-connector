@@ -152,6 +152,45 @@ test('schema snapshot preserves SQLite nullability for composite INTEGER primary
   assert.equal(keys.every((column) => column.nullable), true);
 });
 
+test('schema snapshot does not infer SQLite AUTOINCREMENT from unrelated SQL text', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: `CREATE TABLE records (
+      key TEXT,
+      scope TEXT,
+      note TEXT DEFAULT 'AUTOINCREMENT' CHECK (note <> 'AUTOINCREMENT'),
+      -- AUTOINCREMENT
+      PRIMARY KEY (key, scope)
+    )`,
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const keys = s.columns.filter((column) => column.table === 'records' && column.primaryKey);
+
+  assert.deepEqual(keys.map((column) => column.name), ['key', 'scope']);
+  assert.equal(keys.every((column) => column.extra === undefined), true);
+});
+
+test('schema snapshot preserves SQLite AUTOINCREMENT metadata for its declaring primary key', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE records (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const id = s.columns.find((column) => column.table === 'records' && column.name === 'id')!;
+
+  assert.equal(id.extra, 'AUTOINCREMENT');
+});
+
 test('schema snapshot preserves SQLite nullability for INTEGER PRIMARY KEY DESC', async () => {
   const h = makeHarness();
   await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
