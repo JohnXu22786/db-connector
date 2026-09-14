@@ -196,19 +196,20 @@ export class ExecutionEngine {
     }
     const protectedSql = guarded.sql;
 
-    const openStarted = process.hrtime();
-    let driver;
-    try {
-      driver = await this.requireDriver(opts.connection);
-    } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'query', hrtimeMs(openStarted), opts.way, err);
-      throw err;
-    }
     let deadline: ReturnType<ExecutionEngine['deadline']>;
     try {
       deadline = this.deadline(opts.timeoutMs, signal);
     } catch (err) {
       await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      throw err;
+    }
+    const openStarted = process.hrtime();
+    let driver;
+    try {
+      driver = await this.requireDriver(opts.connection, deadline.signal);
+    } catch (err) {
+      deadline.clear();
+      await this.auditFail(opts.connection, opts.sql, 'query', hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
     const started = process.hrtime();
@@ -291,19 +292,20 @@ export class ExecutionEngine {
       await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
       throw err;
     }
-    const openStarted = process.hrtime();
-    let driver;
-    try {
-      driver = await this.requireDriver(opts.connection);
-    } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, openAuditKind, hrtimeMs(openStarted), opts.way, err);
-      throw err;
-    }
     let deadline: ReturnType<ExecutionEngine['deadline']>;
     try {
       deadline = this.deadline(opts.timeoutMs, signal);
     } catch (err) {
       await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      throw err;
+    }
+    const openStarted = process.hrtime();
+    let driver;
+    try {
+      driver = await this.requireDriver(opts.connection, deadline.signal);
+    } catch (err) {
+      deadline.clear();
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
     const started = process.hrtime();
@@ -379,17 +381,24 @@ export class ExecutionEngine {
 
   /** Schema snapshot for one connection (cached; refresh/flush with opts). */
   async schema(opts: SchemaOptions, signal: AbortSignal): Promise<SchemaResult> {
-    const openStarted = process.hrtime();
     const scope = opts.filter ? ` filter="${opts.filter}"` : '';
     const sql = `schema introspection<${opts.connection}${scope}>`;
+    let deadline: ReturnType<ExecutionEngine['deadline']>;
+    try {
+      deadline = this.deadline(opts.timeoutMs, signal);
+    } catch (err) {
+      await this.auditFail(opts.connection, sql, 'schema', 0, opts.way, err);
+      throw err;
+    }
+    const openStarted = process.hrtime();
     let driver;
     try {
-      driver = await this.requireDriver(opts.connection);
+      driver = await this.requireDriver(opts.connection, deadline.signal);
     } catch (err) {
+      deadline.clear();
       await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
-    const deadline = this.deadline(opts.timeoutMs, signal);
     const started = process.hrtime();
     let snapshot: SchemaResult;
     try {
@@ -436,8 +445,11 @@ export class ExecutionEngine {
 
   // ===== internals =====
 
-  private async requireDriver(name: string): Promise<import('./drivers/driver.js').DriverApi> {
-    return this.connectors.open(name, this.resolveCredentials);
+  private async requireDriver(
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<import('./drivers/driver.js').DriverApi> {
+    return this.connectors.open(name, this.resolveCredentials, signal);
   }
 
   private bind(

@@ -57,8 +57,8 @@ export interface Introspection {
 
 export interface DriverApi {
   readonly kind: DriverKind;
-  /** Open / validate the underlying handle. Idempotent. */
-  connect(): Promise<void>;
+  /** Open / validate the underlying handle. Idempotent and cancellable. */
+  connect(signal?: AbortSignal): Promise<void>;
   /**
    * Execute a read-only statement (SELECT/EXPLAIN). Must observe `signal`
    * and settle only after its owned work reaches quiescence.
