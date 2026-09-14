@@ -68,6 +68,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const n = sql.length;
   let depth = 0;
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
+  const sqliteBracketIdentifiers = options === 'sqlite';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
 
@@ -177,7 +178,26 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     // `mysql backtick identifier`
     if (c === '`') {
       i += 1;
-      while (i < n && sql[i] !== '`') i += 1;
+      while (i < n) {
+        if (sql[i] !== '`') {
+          i += 1;
+          continue;
+        }
+        if (sql[i + 1] === '`') {
+          i += 2;
+          continue;
+        }
+        i += 1;
+        break;
+      }
+      tokens.push({ type: 'quotedid', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // SQLite bracket-quoted identifier
+    if (sqliteBracketIdentifiers && c === '[') {
+      i += 1;
+      while (i < n && sql[i] !== ']') i += 1;
       if (i < n) i += 1;
       tokens.push({ type: 'quotedid', value: sql.slice(at, i), pos: at, depth });
       continue;

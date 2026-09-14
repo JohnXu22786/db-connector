@@ -152,6 +152,126 @@ test('schema snapshot preserves SQLite nullability for composite INTEGER primary
   assert.equal(keys.every((column) => column.nullable), true);
 });
 
+test('schema snapshot recognizes quoted SQLite INTEGER type names for AUTOINCREMENT', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+
+  for (const [table, type] of [
+    ['double_quoted', '"INTEGER"'],
+    ['single_quoted', "'INTEGER'"],
+    ['backtick_quoted', '`INTEGER`'],
+  ] as const) {
+    await h.engine.exec({
+      connection: 'sample',
+      sql: `CREATE TABLE ${table} (id ${type} PRIMARY KEY AUTOINCREMENT, value TEXT)`,
+      allowWrite: true,
+      way: 'cli',
+    }, freshSignal());
+  }
+
+  await h.engine.exec({
+    connection: 'sample',
+    sql: `CREATE TABLE unrelated_text (
+      id INTEGER PRIMARY KEY,
+      note TEXT DEFAULT 'AUTOINCREMENT' CHECK (note <> 'AUTOINCREMENT'),
+      -- AUTOINCREMENT
+      value TEXT
+    )`,
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+
+  for (const table of ['double_quoted', 'single_quoted', 'backtick_quoted']) {
+    const id = s.columns.find((column) => column.table === table && column.name === 'id')!;
+    assert.equal(id.extra, 'AUTOINCREMENT', `expected ${table}.id to retain AUTOINCREMENT metadata`);
+  }
+  const unrelatedId = s.columns.find((column) => column.table === 'unrelated_text' && column.name === 'id')!;
+  assert.equal(unrelatedId.extra, undefined);
+});
+
+test('schema snapshot preserves AUTOINCREMENT for table-level keys and ignores bracket identifiers', async () => {
+  const h = makeHarness();
+  await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
+
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE table_level ("ID" "INTEGER", PRIMARY KEY (id AUTOINCREMENT))',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE bracket_default (id INTEGER PRIMARY KEY DEFAULT [AUTOINCREMENT], value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE [records(AUTOINCREMENT)] (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE doubled_backtick (`i``d` INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE empty_double ("" INTEGER PRIMARY KEY AUTOINCREMENT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE empty_bracket ([] INTEGER PRIMARY KEY AUTOINCREMENT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE unicode_names ("ß" INTEGER, "SS" INTEGER, PRIMARY KEY ("ß" AUTOINCREMENT))',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE named_constraint ("constraint" INTEGER, CONSTRAINT INTEGER UNIQUE ("constraint"), PRIMARY KEY ("constraint" AUTOINCREMENT))',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE unicode_keyword (id INTEGER PRIMARY KEY DEFAULT AUTOıNCREMENT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const tableLevelId = s.columns.find((column) => column.table === 'table_level' && column.name === 'ID')!;
+  const bracketDefaultId = s.columns.find((column) => column.table === 'bracket_default' && column.name === 'id')!;
+  const bracketNameId = s.columns.find((column) => column.table === 'records(AUTOINCREMENT)' && column.name === 'id')!;
+  const doubledBacktickId = s.columns.find((column) => column.table === 'doubled_backtick' && column.name === 'i`d')!;
+  const emptyDoubleId = s.columns.find((column) => column.table === 'empty_double' && column.name === '')!;
+  const emptyBracketId = s.columns.find((column) => column.table === 'empty_bracket' && column.name === '')!;
+  const unicodeId = s.columns.find((column) => column.table === 'unicode_names' && column.name === 'ß')!;
+  const namedConstraintId = s.columns.find((column) => column.table === 'named_constraint' && column.name === 'constraint')!;
+  const unicodeKeywordId = s.columns.find((column) => column.table === 'unicode_keyword' && column.name === 'id')!;
+
+  assert.equal(tableLevelId.extra, 'AUTOINCREMENT');
+  assert.equal(bracketDefaultId.extra, undefined);
+  assert.equal(bracketNameId.extra, 'AUTOINCREMENT');
+  assert.equal(doubledBacktickId.extra, 'AUTOINCREMENT');
+  assert.equal(emptyDoubleId.extra, 'AUTOINCREMENT');
+  assert.equal(emptyBracketId.extra, 'AUTOINCREMENT');
+  assert.equal(unicodeId.extra, 'AUTOINCREMENT');
+  assert.equal(namedConstraintId.extra, 'AUTOINCREMENT');
+  assert.equal(unicodeKeywordId.extra, undefined);
+});
+
 test('schema snapshot preserves SQLite nullability for INTEGER PRIMARY KEY DESC', async () => {
   const h = makeHarness();
   await h.engine.connect({ name: 'sample', driver: 'sqlite', database: join(h.dir, 'sample.sqlite') });
