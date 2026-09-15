@@ -13,6 +13,7 @@ import {
   isNonTransactionalStatement,
   normalizeText,
   rewriteNamedToPositional,
+  scan,
   summarizeSql,
   toDollarPlaceholders,
 } from '../dist/sql.js';
@@ -109,6 +110,44 @@ test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'crea te'").kind, 'select');
   assert.equal(classifyStatement("INSERT 'x' INTO t").kind, 'write');
   assert.equal(classifyStatement('DELETE /* c */ FROM t').kind, 'write');
+});
+
+test('scan keeps SQLite bracket quoting dialect-specific and preserves escaped backticks', () => {
+  assert.deepEqual(
+    scan('SELECT [secret(AUTOINCREMENT)] FROM t', 'sqlite')
+      .filter((token) => token.type !== 'space')
+      .map(({ type, value }) => ({ type, value })),
+    [
+      { type: 'word', value: 'SELECT' },
+      { type: 'quotedid', value: '[secret(AUTOINCREMENT)]' },
+      { type: 'word', value: 'FROM' },
+      { type: 'word', value: 't' },
+    ],
+  );
+  assert.deepEqual(
+    scan('SELECT [secret] FROM t', 'postgres')
+      .filter((token) => token.type !== 'space')
+      .map(({ type, value }) => ({ type, value })),
+    [
+      { type: 'word', value: 'SELECT' },
+      { type: 'symbol', value: '[' },
+      { type: 'word', value: 'secret' },
+      { type: 'symbol', value: ']' },
+      { type: 'word', value: 'FROM' },
+      { type: 'word', value: 't' },
+    ],
+  );
+  assert.deepEqual(
+    scan('SELECT `i``d` FROM t', 'mysql')
+      .filter((token) => token.type !== 'space')
+      .map(({ type, value }) => ({ type, value })),
+    [
+      { type: 'word', value: 'SELECT' },
+      { type: 'quotedid', value: '`i``d`' },
+      { type: 'word', value: 'FROM' },
+      { type: 'word', value: 't' },
+    ],
+  );
 });
 
 test('CTE (WITH) statements resolve to their real data statement', () => {
