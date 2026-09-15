@@ -67,6 +67,8 @@ test('non-transactional statement detection covers SQLite PRAGMAs and PostgreSQL
 test('EXPLAIN ANALYZE classifies by its real statement', () => {
   assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT * FROM t').kind, 'select');
   assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT 1 INTO newtab').kind, 'write');
+  assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT 1 INTO newtab', 'postgres').kind, 'ddl');
+  assert.equal(classifyStatement('EXPLAIN ANALYZE SELECT 1 INTO newtab', 'mysql').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN ANALYZE DELETE FROM t').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN ANALYZE UPDATE t SET a = 1').kind, 'write');
   assert.equal(classifyStatement('EXPLAIN (ANALYZE, BUFFERS) INSERT INTO t VALUES (1)').kind, 'write');
@@ -77,6 +79,18 @@ test('EXPLAIN ANALYZE classifies by its real statement', () => {
 test('data-modifying CTEs are writes even when the outer keyword is SELECT', () => {
   assert.equal(
     classifyStatement('WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement('WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x', 'postgres').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement('WITH x AS (SELECT 1) SELECT * INTO newtab FROM x', 'postgres').kind,
+    'ddl',
+  );
+  assert.equal(
+    classifyStatement('WITH x AS (SELECT 1) SELECT * INTO newtab FROM x', 'mysql').kind,
     'write',
   );
   assert.equal(

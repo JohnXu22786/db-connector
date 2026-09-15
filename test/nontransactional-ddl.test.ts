@@ -317,6 +317,62 @@ test('PostgreSQL SELECT ... INTO invalidates the schema cache as DDL', async () 
   await engine.dispose();
 });
 
+async function assertPostgresSelectIntoInvalidatesSchemaCache(sql: string): Promise<void> {
+  let introspections = 0;
+  let tableCreated = false;
+  const driver: DriverApi = {
+    kind: 'postgres',
+    async connect() {},
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write(_sql, _params, isDdl) {
+      assert.equal(isDdl, true);
+      tableCreated = true;
+      return { affectedRows: 0, isDdl };
+    },
+    async introspect() {
+      introspections += 1;
+      return tableCreated
+        ? { ...emptyIntrospection(), tables: [{ name: 'copied_users' }] }
+        : emptyIntrospection();
+    },
+    async close() {},
+  };
+  const engine = makeEngine(driver);
+
+  await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  const cached = await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  assert.equal(cached.fromCache, true);
+  assert.equal(introspections, 1);
+
+  const result = await engine.exec({
+    connection: 'pg',
+    sql,
+    allowWrite: true,
+    way: 'cli',
+  }, new AbortController().signal);
+  assert.equal(result.kind, 'ddl');
+
+  const refreshed = await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  assert.equal(refreshed.fromCache, false);
+  assert.equal(refreshed.tables.some((table) => table.name === 'copied_users'), true);
+  assert.equal(introspections, 2);
+  await engine.dispose();
+}
+
+test('PostgreSQL EXPLAIN ANALYZE SELECT ... INTO invalidates the schema cache', async () => {
+  await assertPostgresSelectIntoInvalidatesSchemaCache(
+    'EXPLAIN ANALYZE SELECT id INTO copied_users FROM users',
+  );
+});
+
+test('PostgreSQL WITH ... SELECT ... INTO invalidates the schema cache', async () => {
+  await assertPostgresSelectIntoInvalidatesSchemaCache(
+    'WITH source AS (SELECT id FROM users) SELECT id INTO copied_users FROM source',
+  );
+});
+
 test('live PostgreSQL non-transactional DDL behavior', async (t) => {
   const url = process.env.DSH_DB_CONNECTOR_TEST_POSTGRES_URL;
   if (!url) {

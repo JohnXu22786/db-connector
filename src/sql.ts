@@ -306,6 +306,12 @@ function hasTopLevelInto(sql: string, driver?: DriverKind): boolean {
   );
 }
 
+/** PostgreSQL's outer SELECT ... INTO creates a table and is therefore DDL. */
+function isPostgresSelectInto(sql: string, driver?: DriverKind): boolean {
+  if (driver !== 'postgres' || !hasTopLevelInto(sql, driver)) return false;
+  return firstDataKeyword(sql, driver)?.value.toUpperCase() === 'SELECT';
+}
+
 /**
  * Classify an EXPLAIN ANALYZE statement. Bare EXPLAIN plans never execute;
  * EXPLAIN ANALYZE does (PostgreSQL executes the underlying DML), so the
@@ -313,7 +319,8 @@ function hasTopLevelInto(sql: string, driver?: DriverKind): boolean {
  * otherwise the first top-level data keyword decides; an unresolved case is
  * treated as a write (conservative: never admitted through a read path).
  */
-function classifyAnalyzed(sql: string, driver?: DriverKind): 'select' | 'write' {
+function classifyAnalyzed(sql: string, driver?: DriverKind): 'select' | 'write' | 'ddl' {
+  if (isPostgresSelectInto(sql, driver)) return 'ddl';
   if (hasTopLevelInto(sql, driver)) return 'write';
   if (containsWriteKeyword(sql, driver)) return 'write';
   const keyword = firstDataKeyword(sql, driver);
@@ -366,9 +373,13 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
   }
 
   if (word === 'WITH') {
-    // WITH may be read (WITH ... SELECT) or a write: the outer keyword can
-    // SELECT while a data-modifying CTE (PostgreSQL) writes. Any write
-    // keyword anywhere marks the whole statement a write.
+    // WITH may be read (WITH ... SELECT) or a write: a PostgreSQL outer
+    // SELECT ... INTO creates a table, while data-modifying CTEs remain writes.
+    // Any other top-level INTO or write keyword marks the whole statement a
+    // write.
+    if (isPostgresSelectInto(sql, driver)) {
+      return { kind: 'ddl', firstWord: word };
+    }
     if (hasTopLevelInto(sql, driver) || containsWriteKeyword(sql, driver)) {
       return { kind: 'write', firstWord: word };
     }
