@@ -39,10 +39,12 @@ export interface ScanOptions {
   backslashEscapes?: boolean;
   /** Recognize PostgreSQL `E'...'` escape string constants. */
   postgresEscapeStrings?: boolean;
+  /** Recognize MySQL `#` line comments. */
+  hashComments?: boolean;
 }
 
 function scanOptionsForDriver(driver: DriverKind): ScanOptions {
-  if (driver === 'mysql') return { backslashEscapes: true };
+  if (driver === 'mysql') return { backslashEscapes: true, hashComments: true };
   if (driver === 'postgres') return { postgresEscapeStrings: true };
   return {};
 }
@@ -72,6 +74,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
+  const hashComments = resolvedOptions.hashComments === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -101,6 +104,14 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
       i += 2;
       while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
       i = Math.min(n, i + 2);
+      tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // MySQL hash comment
+    if (hashComments && c === '#') {
+      i += 1;
+      while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
       continue;
     }
@@ -894,6 +905,12 @@ export function ensureSelectLimit(
           sql.slice(existing.expressionEnd),
         applied: true,
       };
+    }
+
+    if (driver === 'mysql') {
+      // MySQL rejects derived tables with duplicate output names. The MySQL
+      // driver enforces this cap while consuming its row stream instead.
+      return { sql, applied: false };
     }
 
     // Expressions and FETCH ... WITH TIES cannot be safely reduced by

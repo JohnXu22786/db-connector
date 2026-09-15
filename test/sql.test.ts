@@ -388,6 +388,22 @@ test('ensureSelectLimit tightens oversized and unbounded existing caps', () => {
     parameterized.sql,
     'SELECT * FROM (SELECT id FROM t LIMIT ?) AS __dsh_bounded LIMIT 2',
   );
+
+  const mysqlJoined = 'SELECT * FROM t1 JOIN t2 ON t1.id = t2.id LIMIT ?';
+  assert.deepEqual(
+    ensureSelectLimit(mysqlJoined, 2, 'mysql'),
+    { sql: mysqlJoined, applied: false },
+  );
+
+  const mysqlComment = ensureSelectLimit(
+    'SELECT id FROM t # trailing comment\n',
+    2,
+    'mysql',
+  );
+  assert.deepEqual(mysqlComment, {
+    sql: 'SELECT id FROM t LIMIT 2 # trailing comment\n',
+    applied: true,
+  });
 });
 
 test('normalizeText strips comments and collapses whitespace', () => {

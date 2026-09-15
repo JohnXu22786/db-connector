@@ -173,9 +173,23 @@ export class MysqlDriver implements DriverApi {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
       try {
-        const bounded = maxRows !== undefined && Number.isFinite(maxRows) && conn.connection
-          ? await streamMysqlExecute(conn.connection, sql, params, maxRows)
-          : await conn.execute({ sql, values: params, rowsAsArray: true }).then(([rows, fields]) => ({ rows, fields }));
+        let bounded: MysqlReadResult;
+        if (maxRows !== undefined && Number.isFinite(maxRows)) {
+          if (!conn.connection) {
+            throw new DbConnectorError(
+              ErrorCode.QueryFailed,
+              'bounded MySQL reads require the event-emitting mysql2 connection',
+            );
+          }
+          bounded = await streamMysqlExecute(conn.connection, sql, params, maxRows);
+        } else {
+          const [rows, fields] = await conn.execute({
+            sql,
+            values: params,
+            rowsAsArray: true,
+          });
+          bounded = { rows: rows as unknown[][], fields: fields as Array<{ name: string }> };
+        }
         await conn.query('ROLLBACK');
         return bounded;
       } catch (err) {

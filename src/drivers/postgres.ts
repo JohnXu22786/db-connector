@@ -53,6 +53,8 @@ interface PgQueryable {
 interface PgClientLike extends PgQueryable {
   connect(): Promise<void>;
   end(): Promise<void>;
+  /** Present on the optional libpq-backed `pg.native` client. */
+  native?: unknown;
 }
 
 type PgModule = {
@@ -105,6 +107,10 @@ export class PgDriver implements DriverApi {
         connectionString: this.spec.connectionString,
         ...this.spec.options,
       } as never);
+      if (isNativePgClient(client)) {
+        await client.end().catch(() => {});
+        throw nativeModeError();
+      }
       try {
         await client.connect();
         await client.query('SELECT 1');
@@ -172,6 +178,7 @@ export class PgDriver implements DriverApi {
     maxRows?: number,
   ): Promise<ReadOutcome> {
     const client = this.ensure();
+    if (isNativePgClient(client)) throw nativeModeError();
     const converted = toDollarPlaceholders(sql, 'postgres');
     try {
       // Server-side read-only backstop: even a statement that slips past the
@@ -386,6 +393,17 @@ async function streamPgQuery(
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function isNativePgClient(client: PgClientLike): boolean {
+  return client.native !== undefined;
+}
+
+function nativeModeError(): DbConnectorError {
+  return new DbConnectorError(
+    ErrorCode.UnsupportedDriver,
+    'PostgreSQL native client mode is not supported; unset NODE_PG_FORCE_NATIVE',
+  );
 }
 
 function cancelError(signal: AbortSignal): DbConnectorError {

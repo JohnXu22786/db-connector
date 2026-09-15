@@ -8,6 +8,9 @@ import { makeHarness } from './helpers.ts';
 import { resolveConnectionSpec } from '../dist/config.js';
 
 interface FakeConnection {
+  connection?: {
+    execute(input: unknown): EventEmitter;
+  };
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   query(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   beginTransaction(): Promise<void>;
@@ -22,13 +25,19 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
   let connectionCreates = 0;
   let firstExecuteStarted = false;
   let firstDestroyed = false;
-  let releaseFirstExecute = () => {};
+  let firstCommand: EventEmitter | undefined;
   const firstConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        firstExecuteStarted = true;
+        const command = new EventEmitter();
+        firstCommand = command;
+        return command;
+      },
+    },
     execute: () => {
       firstExecuteStarted = true;
-      return new Promise<[unknown, unknown]>((resolve) => {
-        releaseFirstExecute = () => resolve([[], []]);
-      });
+      return new Promise<[unknown, unknown]>(() => {});
     },
     query: async () => [[], []],
     beginTransaction: async () => {},
@@ -36,11 +45,22 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
     rollback: async () => {},
     destroy: () => {
       firstDestroyed = true;
-      releaseFirstExecute();
+      firstCommand?.emit('end');
     },
     end: async () => {},
   };
   const secondConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('fields', [{ name: 'id' }]);
+          command.emit('result', [2]);
+          command.emit('end');
+        });
+        return command;
+      },
+    },
     execute: async () => [[[2]], [{ name: 'id' }]],
     query: async () => [[], []],
     beginTransaction: async () => {},

@@ -413,6 +413,43 @@ test('PostgreSQL reconnects after close without leaking the new client', async (
   assert.deepEqual(endCalls, [1, 2]);
 });
 
+test('PostgreSQL rejects the native client before a read can buffer rows', async (t) => {
+  let endCalls = 0;
+  class FakeNativePgClient implements PgClientStub {
+    readonly native = {};
+
+    async connect(): Promise<void> {
+      throw new Error('native client should be rejected before connect');
+    }
+
+    async query(): Promise<PgResult> {
+      return { fields: [], rows: [], rowCount: 0 };
+    }
+
+    async end(): Promise<void> {
+      endCalls += 1;
+    }
+  }
+  const pg = require('pg') as { Client: typeof FakeNativePgClient };
+  function createFakeNativeClient(): FakeNativePgClient {
+    return new FakeNativePgClient();
+  }
+  mock.method(pg, 'Client', createFakeNativeClient);
+  t.after(() => mock.restoreAll());
+
+  const driver = new PgDriver(spec('postgres'), logger);
+  await assert.rejects(
+    () => driver.connect(),
+    (error: unknown) => {
+      assert.ok(error instanceof DbConnectorError);
+      assert.equal(error.code, ErrorCode.UnsupportedDriver);
+      assert.match(error.message, /native client mode is not supported/i);
+      return true;
+    },
+  );
+  assert.equal(endCalls, 1);
+});
+
 test('MySQL close waits before ending the connection used by an active transaction', async () => {
   const events: string[] = [];
   const statement = deferred<[unknown, unknown]>();
@@ -839,10 +876,10 @@ test('MySQL bounded reads consume rows as a stream', async () => {
     execute(input: unknown): FakeMysqlCommand {
       assert.deepEqual(input, { sql: 'DESCRIBE users', values: [], rowsAsArray: true });
       queueMicrotask(() => {
-        command.emit('fields', [{ name: 'Field' }]);
-        command.emit('result', ['id']);
-        command.emit('result', ['email']);
-        command.emit('result', ['age']);
+        command.emit('fields', [{ name: 'id' }, { name: 'id' }]);
+        command.emit('result', [1, 'a']);
+        command.emit('result', [2, 'b']);
+        command.emit('result', [3, 'c']);
         command.emit('end');
       });
       return command;
@@ -870,8 +907,8 @@ test('MySQL bounded reads consume rows as a stream', async () => {
   (driver as unknown as { conn: typeof conn }).conn = conn;
 
   const result = await driver.read('DESCRIBE users', [], signal(), 2);
-  assert.deepEqual(result.columns, ['Field']);
-  assert.deepEqual(result.rows, [['id'], ['email']]);
+  assert.deepEqual(result.columns, ['id', 'id']);
+  assert.deepEqual(result.rows, [[1, 'a'], [2, 'b']]);
   assert.equal(result.truncated, true);
   assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'ROLLBACK']);
 });
