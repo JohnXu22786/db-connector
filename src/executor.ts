@@ -394,7 +394,13 @@ export class ExecutionEngine {
       await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(openStarted), opts.way, err);
       throw err;
     }
-    const deadline = this.deadline(opts.timeoutMs, signal);
+    let deadline: ReturnType<ExecutionEngine['deadline']>;
+    try {
+      deadline = this.deadline(opts.timeoutMs, signal);
+    } catch (err) {
+      await this.auditFail(opts.connection, sql, 'schema', 0, opts.way, err);
+      throw err;
+    }
     const started = process.hrtime();
     let snapshot: SchemaResult;
     try {
