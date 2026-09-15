@@ -367,6 +367,11 @@ export class ExecutionEngine {
         note: rollbackNote(isDdl, outcome.affectedRows, driver.kind, nonTransactional),
       };
     } catch (err) {
+      if (readLike) {
+        const duration = hrtimeMs(started);
+        await this.auditFail(opts.connection, opts.sql, 'read', duration, opts.way, err);
+        throw err;
+      }
       if (nonTransactional) this.schemaService.invalidate(opts.connection);
       const dbErr = wrapWriteError(err, isDdl, nonTransactional);
       const duration = hrtimeMs(started);
