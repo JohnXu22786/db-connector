@@ -89,13 +89,15 @@ test('data-modifying CTEs are writes even when the outer keyword is SELECT', () 
   );
 });
 
-test('REPLACE under a CTE and SELECT ... INTO are writes', () => {
+test('REPLACE under a CTE and SELECT ... INTO are writes or PostgreSQL DDL', () => {
   assert.equal(
     classifyStatement('WITH x AS (VALUES(1)) REPLACE INTO t SELECT * FROM x').kind,
     'write',
   );
   assert.equal(classifyStatement('REPLACE INTO t VALUES (1)').kind, 'write');
   assert.equal(classifyStatement('SELECT * INTO newtab FROM t').kind, 'write');
+  assert.equal(classifyStatement('SELECT * INTO newtab FROM t', 'postgres').kind, 'ddl');
+  assert.equal(classifyStatement('SELECT * INTO newtab FROM t', 'mysql').kind, 'write');
   // a top-level INTO inside a plain SELECT query is still a write on SELECT
   assert.equal(classifyStatement('SELECT a INTO OUTFILE "/tmp/x" FROM t').kind, 'write');
   // but an INTO inside a subquery (depth > 0) is not top-level

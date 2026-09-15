@@ -276,6 +276,47 @@ test('failed non-transactional DDL invalidates the schema cache and reports no r
   await engine.dispose();
 });
 
+test('PostgreSQL SELECT ... INTO invalidates the schema cache as DDL', async () => {
+  let introspections = 0;
+  let receivedIsDdl: boolean | undefined;
+  const driver: DriverApi = {
+    kind: 'postgres',
+    async connect() {},
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write(_sql, _params, isDdl) {
+      receivedIsDdl = isDdl;
+      return { affectedRows: 0, isDdl };
+    },
+    async introspect() {
+      introspections += 1;
+      return emptyIntrospection();
+    },
+    async close() {},
+  };
+  const engine = makeEngine(driver);
+
+  await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  const cached = await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  assert.equal(cached.fromCache, true);
+  assert.equal(introspections, 1);
+
+  const result = await engine.exec({
+    connection: 'pg',
+    sql: 'SELECT id INTO copied_users FROM users',
+    allowWrite: true,
+    way: 'cli',
+  }, new AbortController().signal);
+  assert.equal(result.kind, 'ddl');
+  assert.equal(receivedIsDdl, true);
+
+  const refreshed = await engine.schema({ connection: 'pg', way: 'cli' }, new AbortController().signal);
+  assert.equal(refreshed.fromCache, false);
+  assert.equal(introspections, 2);
+  await engine.dispose();
+});
+
 test('live PostgreSQL non-transactional DDL behavior', async (t) => {
   const url = process.env.DSH_DB_CONNECTOR_TEST_POSTGRES_URL;
   if (!url) {

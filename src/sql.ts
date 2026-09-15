@@ -337,10 +337,17 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
   const word = lead.value.toUpperCase();
 
   if (word === 'SELECT' || word === 'VALUES') {
-    // SELECT ... INTO creates a table (PostgreSQL) or writes a file
-    // (MySQL INTO OUTFILE/DUMPFILE) — a top-level INTO makes it a write.
+    // PostgreSQL SELECT ... INTO creates a table and therefore invalidates
+    // the schema cache like other DDL. Other dialects retain write handling
+    // for their INTO forms (for example, MySQL INTO OUTFILE/DUMPFILE).
     const hasInto = word === 'SELECT' && hasTopLevelInto(sql, driver);
-    return hasInto ? { kind: 'write', firstWord: word } : { kind: 'select', firstWord: word };
+    if (hasInto) {
+      return {
+        kind: driver === 'postgres' ? 'ddl' : 'write',
+        firstWord: word,
+      };
+    }
+    return { kind: 'select', firstWord: word };
   }
 
   // EXPLAIN / DESCRIBE / DESC / SHOW are plans or descriptions that never
