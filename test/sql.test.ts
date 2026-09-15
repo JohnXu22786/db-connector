@@ -199,6 +199,25 @@ test('single-statement enforcement allows semicolons inside CREATE TRIGGER bodie
   ), DbConnectorError);
 });
 
+test('SQLite dollar parameters do not hide following placeholders or statements', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $foo$ || ?; SELECT $foo$ || ?', 'sqlite'), {
+    sql: 'SELECT $foo$ || $1; SELECT $foo$ || $2',
+    count: 2,
+  });
+  assert.throws(
+    () => assertSingleStatement('SELECT $foo$; SELECT $foo$', 'sqlite'),
+    DbConnectorError,
+  );
+});
+
+test('tagged PostgreSQL dollar strings still protect placeholders and semicolons', () => {
+  assert.deepEqual(toDollarPlaceholders('SELECT $tag$?; SELECT $tag$, ?', 'postgres'), {
+    sql: 'SELECT $tag$?; SELECT $tag$, $1',
+    count: 1,
+  });
+  assert.doesNotThrow(() => assertSingleStatement('SELECT $tag$; SELECT $tag$', 'postgres'));
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',

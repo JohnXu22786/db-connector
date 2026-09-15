@@ -69,6 +69,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   let depth = 0;
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
   const sqliteBracketIdentifiers = options === 'sqlite';
+  const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
 
@@ -204,7 +205,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     }
 
     // PostgreSQL dollar-quoted string: $$...$$ or $tag$...$tag$
-    if (c === '$') {
+    if (postgresDollarQuotes && c === '$') {
       let j = i + 1;
       const emptyTag = sql[j] === '$';
       const namedTag = isIdentStart(sql[j] ?? '');
