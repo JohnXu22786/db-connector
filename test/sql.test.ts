@@ -336,12 +336,20 @@ test('ensureSelectLimit preserves SQLite VALUES and complete PostgreSQL FETCH ca
   for (const sql of [
     'SELECT id FROM t FETCH FIRST 5 ROWS ONLY',
     'SELECT id FROM t FETCH NEXT 5 ROWS ONLY',
-    'SELECT id FROM t FETCH FIRST (1 + 1) ROWS WITH TIES',
   ]) {
     const guarded = ensureSelectLimit(sql, 10, 'postgres');
     assert.equal(guarded.applied, false, sql);
     assert.equal(guarded.sql, sql);
   }
+
+  const withTies = ensureSelectLimit(
+    'SELECT id FROM t FETCH FIRST (1 + 1) ROWS WITH TIES',
+    10,
+    'postgres',
+  );
+  assert.equal(withTies.applied, true);
+  assert.match(withTies.sql, /^SELECT \* FROM \(SELECT id FROM t FETCH FIRST \(1 \+ 1\) ROWS WITH TIES\)/);
+  assert.match(withTies.sql, /LIMIT 10$/);
 
   const withFetchAlias = ensureSelectLimit('SELECT fetch first FROM t', 10, 'postgres');
   assert.equal(withFetchAlias.applied, true);
@@ -349,6 +357,36 @@ test('ensureSelectLimit preserves SQLite VALUES and complete PostgreSQL FETCH ca
   assert.equal(
     ensureSelectLimit('SELECT id FROM t', 0, 'sqlite').sql,
     'SELECT id FROM t LIMIT 0',
+  );
+});
+
+test('ensureSelectLimit tightens oversized and unbounded existing caps', () => {
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5', 2, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT ALL', 2, 'postgres'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -1', 2, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5', 0, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 0', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST 5 ROWS ONLY', 2, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST 2 ROWS ONLY', applied: true },
+  );
+
+  const parameterized = ensureSelectLimit('SELECT id FROM t LIMIT ?', 2, 'sqlite');
+  assert.equal(parameterized.applied, true);
+  assert.equal(
+    parameterized.sql,
+    'SELECT * FROM (SELECT id FROM t LIMIT ?) AS __dsh_bounded LIMIT 2',
   );
 });
 

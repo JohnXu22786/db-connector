@@ -162,6 +162,22 @@ test('read-only path accepts EXPLAIN', async () => {
   assert.ok(result.rowCount > 0);
 });
 
+test('SQLite EXPLAIN uses the bounded driver read path', async () => {
+  const h = makeHarness({ query: { maxRows: 1 } });
+  await h.engine.connect({ name: 'explain-bound', driver: 'sqlite', database: ':memory:' });
+
+  const result = await h.engine.query(
+    {
+      connection: 'explain-bound',
+      sql: 'EXPLAIN SELECT 1 UNION ALL SELECT 2',
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.equal(result.rowCount, 1);
+  assert.equal(result.truncated, true);
+});
+
 test('write approval gate denies without allowWrite and audits it', async () => {
   const h = await setup();
   await assert.rejects(
@@ -453,6 +469,52 @@ test('SQLite VALUES reads do not receive an invalid trailing LIMIT', async () =>
     assert.equal(result.kind, 'read');
     assert.match(result.note, /returned 1 row\(s\) \(capped at 1\)/);
   }
+});
+
+test('SQLite reads tighten an existing limit to the configured cap', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  await h.engine.connect({ name: 'bounded', driver: 'sqlite', database: ':memory:' });
+  await h.engine.exec(
+    {
+      connection: 'bounded',
+      sql: 'CREATE TABLE entries (id INTEGER PRIMARY KEY)',
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  await h.engine.exec(
+    {
+      connection: 'bounded',
+      sql: 'INSERT INTO entries(id) VALUES (1), (2), (3)',
+      allowWrite: true,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+
+  const result = await h.engine.query(
+    { connection: 'bounded', sql: 'SELECT id FROM entries ORDER BY id LIMIT 5', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+
+  const unbounded = await h.engine.query(
+    { connection: 'bounded', sql: 'SELECT id FROM entries ORDER BY id LIMIT -1', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(unbounded.rows, [[1], [2]]);
+  assert.equal(unbounded.truncated, true);
+
+  const zero = makeHarness({ query: { maxRows: 0 } });
+  await zero.engine.connect({ name: 'zero', driver: 'sqlite', database: ':memory:' });
+  const zeroResult = await zero.engine.query(
+    { connection: 'zero', sql: 'SELECT 1 LIMIT 5', way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(zeroResult.rows, []);
+  assert.equal(zeroResult.truncated, true);
 });
 
 test('DDL through db_exec invalidates the schema cache', async () => {

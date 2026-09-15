@@ -214,7 +214,7 @@ export class ExecutionEngine {
     const started = process.hrtime();
     let outcome;
     try {
-      outcome = await driver.read(protectedSql, bound.values, deadline.signal);
+      outcome = await driver.read(protectedSql, bound.values, deadline.signal, limit);
     } catch (err) {
       const duration = hrtimeMs(started);
       await this.auditFail(opts.connection, opts.sql, 'query', duration, opts.way, err);
@@ -230,7 +230,9 @@ export class ExecutionEngine {
     // that happens to have exactly the cap rows reads as truncated too — a
     // documented ambiguity.
     const truncated =
-      sliced || (guarded.applied && outcome.rows.length === limit);
+      sliced ||
+      outcome.truncated === true ||
+      (guarded.applied && outcome.rows.length === limit);
     const serialized = rows.map((r) => r.map(serializeValue));
     this.connectors.touch(opts.connection);
     const auditId = await this.auditOk({
@@ -320,7 +322,12 @@ export class ExecutionEngine {
 
     try {
       if (readLike) {
-        const outcome = await driver.read(protectedSql, bound.values, deadline.signal);
+        const outcome = await driver.read(
+          protectedSql,
+          bound.values,
+          deadline.signal,
+          readLimit,
+        );
         const { rows } = capRows(outcome.rows, readLimit!);
         this.connectors.touch(opts.connection);
         const auditId = await this.auditOk({

@@ -190,8 +190,10 @@ Run a **read-only** query (SELECT / EXPLAIN / DESCRIBE / SHOW).
   driver is touched. This covers INSERT/UPDATE/DELETE/DDL/PRAGMA, and also the
   sneaky forms: `EXPLAIN ANALYZE <dml>` (which executes its statement) and
   data-modifying CTEs (`WITH x AS (DELETE ...) SELECT ...`).
-- **Result cap**: rows are capped at `limit` (or `query.maxRows`). For a plain
-  top-level SELECT without its own LIMIT a guard `LIMIT` is appended.
+- **Result cap**: rows are capped at `limit` (or `query.maxRows`). A plain
+  top-level SELECT receives a guard `LIMIT`; an existing oversized or
+  unbounded row cap is tightened when the dialect permits it, and other
+  read-like results are consumed through a bounded driver stream.
 - **Timeouts**: `timeoutMs` (or the default) is enforced through an
   AbortSignal; SQLite genuinely terminates via child-process teardown.
 

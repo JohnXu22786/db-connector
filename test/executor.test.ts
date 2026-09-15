@@ -245,7 +245,7 @@ test('read-like exec applies the configured row limit before calling the driver'
   assert.equal(records[0]!.statement.summary, 'SELECT id FROM items WHERE owner_id = ?');
 });
 
-test('read-like exec preserves an existing top-level row limit', async () => {
+test('read-like exec tightens an oversized existing top-level row limit', async () => {
   const h = makeHarness({ query: { maxRows: 2 } });
   let receivedSql: string | undefined;
   installDriver(h, emptyDriver({
@@ -262,7 +262,7 @@ test('read-like exec preserves an existing top-level row limit', async () => {
     way: 'cli',
   }, freshSignal());
 
-  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 5');
+  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 2');
   assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
   const records = await h.audit.query({ connection: 'prelimited-read' });
   assert.equal(records[0]!.rows, 2);
@@ -289,6 +289,36 @@ test('read-like exec preserves a zero row cap in the driver guard', async () => 
   assert.match(result.note, /returned 0 row\(s\) \(capped at 0\)/);
   const records = await h.audit.query({ connection: 'zero-read' });
   assert.equal(records[0]!.rows, 0);
+});
+
+test('read-like exec passes its cap to administrative reads before materialization', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  const received: Array<{ sql: string; maxRows: number | undefined }> = [];
+  installDriver(h, emptyDriver({
+    read: async (sql, _params, _signal, maxRows) => {
+      received.push({ sql, maxRows });
+      return {
+        columns: ['id'],
+        rows: Array.from({ length: 100 }, (_, id) => [id]),
+        rowCount: 100,
+      };
+    },
+  }));
+  h.connectors.define({ name: 'administrative-read', driver: 'sqlite' });
+
+  for (const sql of ['EXPLAIN QUERY PLAN SELECT 1', 'SHOW TABLES', 'DESCRIBE users']) {
+    const result = await h.engine.exec(
+      { connection: 'administrative-read', sql, way: 'cli' },
+      freshSignal(),
+    );
+    assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/, sql);
+  }
+
+  assert.deepEqual(received, [
+    { sql: 'EXPLAIN QUERY PLAN SELECT 1', maxRows: 2 },
+    { sql: 'SHOW TABLES', maxRows: 2 },
+    { sql: 'DESCRIBE users', maxRows: 2 },
+  ]);
 });
 
 test('failed schema introspection is audited', async () => {

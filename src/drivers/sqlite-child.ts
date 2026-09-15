@@ -21,6 +21,7 @@ interface Request {
   sql?: string;
   params?: unknown[];
   isDdl?: boolean;
+  maxRows?: number;
 }
 
 interface ColumnRow {
@@ -91,9 +92,29 @@ function runQuery(req: Request): unknown {
   const stmt = db.prepare(req.sql ?? '');
   const columns = stmt.columns().map((column) => column.name);
   stmt.setReturnArrays(true);
-  const rows = stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][];
-  const data = rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows: data, rowCount: data.length };
+  const maxRows = boundedRowLimit(req.maxRows);
+  if (maxRows === undefined) {
+    const rows = stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][];
+    const data = rows.map((row) => row.map((value) => value ?? null));
+    return { columns, rows: data, rowCount: data.length };
+  }
+
+  const data: unknown[][] = [];
+  let truncated = false;
+  for (const row of stmt.iterate(...(req.params ?? []) as never[]) as Iterable<unknown[]>) {
+    if (data.length >= maxRows) {
+      truncated = true;
+      break;
+    }
+    data.push(row.map((value) => value ?? null));
+  }
+  return { columns, rows: data, rowCount: data.length, truncated };
+}
+
+function boundedRowLimit(value: number | undefined): number | undefined {
+  if (value === undefined || !Number.isFinite(value)) return undefined;
+  if (value < 0) throw new RangeError('maxRows must be a non-negative number');
+  return Math.floor(value);
 }
 
 function runWrite(req: Request): unknown {

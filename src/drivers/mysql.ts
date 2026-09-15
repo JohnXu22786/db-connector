@@ -14,6 +14,8 @@ import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
   config?: { database?: string };
+  /** The promise wrapper exposes its event-emitting core connection here. */
+  connection?: MysqlCoreConnection;
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   execute(options: {
     sql: string;
@@ -26,6 +28,18 @@ interface MysqlConnection {
   rollback(): Promise<void>;
   destroy(): void;
   end(): Promise<void>;
+}
+
+interface MysqlCommand {
+  on(event: string, listener: (...args: any[]) => void): MysqlCommand;
+}
+
+interface MysqlCoreConnection {
+  execute(input: {
+    sql: string;
+    values?: unknown[];
+    rowsAsArray?: boolean;
+  }): MysqlCommand;
 }
 
 interface MysqlModule {
@@ -150,13 +164,20 @@ export class MysqlDriver implements DriverApi {
     );
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
       try {
-        const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
+        const bounded = maxRows !== undefined && Number.isFinite(maxRows) && conn.connection
+          ? await streamMysqlExecute(conn.connection, sql, params, maxRows)
+          : await conn.execute({ sql, values: params, rowsAsArray: true }).then(([rows, fields]) => ({ rows, fields }));
         await conn.query('ROLLBACK');
-        return { rows, fields };
+        return bounded;
       } catch (err) {
         await conn.query('ROLLBACK').catch(() => {});
         throw err;
@@ -271,6 +292,7 @@ export class MysqlDriver implements DriverApi {
 interface MysqlReadResult {
   rows: unknown[][];
   fields: Array<{ name: string }>;
+  truncated?: boolean;
 }
 
 export function indexesFromStatistics(
@@ -309,7 +331,56 @@ export function indexesFromStatistics(
 function outcomeOf(result: MysqlReadResult): ReadOutcome {
   const columns = result.fields.map((field) => field.name);
   const aligned = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows: aligned, rowCount: aligned.length };
+  return {
+    columns,
+    rows: aligned,
+    rowCount: aligned.length,
+    ...(result.truncated ? { truncated: true } : {}),
+  };
+}
+
+async function streamMysqlExecute(
+  connection: MysqlCoreConnection,
+  sql: string,
+  params: unknown[],
+  maxRows: number,
+): Promise<MysqlReadResult> {
+  if (!Number.isFinite(maxRows) || maxRows < 0) {
+    throw new RangeError('maxRows must be a non-negative number');
+  }
+  const limit = Math.floor(maxRows);
+  const command = connection.execute({ sql, values: params, rowsAsArray: true });
+  return new Promise<MysqlReadResult>((resolve, reject) => {
+    let settled = false;
+    let fields: Array<{ name: string }> = [];
+    const rows: unknown[][] = [];
+    let truncated = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    command.on('fields', (value: unknown) => {
+      if (!Array.isArray(value)) return;
+      fields = value.map((field) => ({ name: String((field as { name?: unknown }).name ?? '') }));
+    });
+    command.on('result', (value: unknown) => {
+      if (!Array.isArray(value)) return;
+      if (rows.length < limit) rows.push(value);
+      else truncated = true;
+    });
+    command.on('error', (err: unknown) => {
+      finish(() => reject(err));
+    });
+    command.on('end', () => {
+      finish(() => resolve({
+        fields,
+        rows,
+        truncated,
+      }));
+    });
+  });
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {

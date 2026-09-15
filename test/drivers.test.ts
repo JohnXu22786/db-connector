@@ -665,6 +665,41 @@ test('MySQL invalidates an active connection abort before a queued request runs'
 
 const logger = { debug() {}, info() {}, warn() {} };
 
+class FakePgStreamQuery {
+  readonly config: { text: string };
+  private readonly listeners = new Map<string, Array<(...args: any[]) => void>>();
+
+  constructor(config: { text: string }) {
+    this.config = config;
+  }
+
+  on(event: string, listener: (...args: any[]) => void): this {
+    const listeners = this.listeners.get(event) ?? [];
+    listeners.push(listener);
+    this.listeners.set(event, listeners);
+    return this;
+  }
+
+  emit(event: string, ...args: any[]): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(...args);
+  }
+}
+
+class FakeMysqlCommand {
+  private readonly listeners = new Map<string, Array<(...args: any[]) => void>>();
+
+  on(event: string, listener: (...args: any[]) => void): this {
+    const listeners = this.listeners.get(event) ?? [];
+    listeners.push(listener);
+    this.listeners.set(event, listeners);
+    return this;
+  }
+
+  emit(event: string, ...args: any[]): void {
+    for (const listener of this.listeners.get(event) ?? []) listener(...args);
+  }
+}
+
 test('MySQL read conversion preserves empty columns and duplicate values', async () => {
   const driver = new MysqlDriver(
     { name: 'mysql-test', driver: 'mysql', database: 'test' } as never,
@@ -755,6 +790,133 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     ],
   );
   assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+});
+
+test('PostgreSQL bounded reads consume rows as a stream', async () => {
+  const events: string[] = [];
+  const driver = new PgDriver(
+    { name: 'postgres-stream', driver: 'postgres', database: 'test' } as never,
+    logger,
+  );
+  const client = {
+    async query(input: unknown): Promise<unknown> {
+      if (typeof input === 'string') {
+        events.push(input);
+        return { fields: [], rows: [], rowCount: null };
+      }
+      const query = input as FakePgStreamQuery;
+      events.push(query.config.text);
+      queueMicrotask(() => {
+        const fields = [{ name: 'id' }];
+        query.emit('row', [1], { fields });
+        query.emit('row', [2], { fields });
+        query.emit('row', [3], { fields });
+        query.emit('end', { fields });
+      });
+      return query;
+    },
+    async connect() {},
+    async end() {},
+  };
+  const state = driver as unknown as {
+    client: typeof client;
+    queryConstructor: typeof FakePgStreamQuery;
+  };
+  state.client = client;
+  state.queryConstructor = FakePgStreamQuery;
+
+  const result = await driver.read('SHOW ALL', [], signal(), 2);
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['BEGIN TRANSACTION READ ONLY', 'SHOW ALL', 'ROLLBACK']);
+});
+
+test('MySQL bounded reads consume rows as a stream', async () => {
+  const events: string[] = [];
+  const command = new FakeMysqlCommand();
+  const core = {
+    execute(input: unknown): FakeMysqlCommand {
+      assert.deepEqual(input, { sql: 'DESCRIBE users', values: [], rowsAsArray: true });
+      queueMicrotask(() => {
+        command.emit('fields', [{ name: 'Field' }]);
+        command.emit('result', ['id']);
+        command.emit('result', ['email']);
+        command.emit('result', ['age']);
+        command.emit('end');
+      });
+      return command;
+    },
+  };
+  const conn = {
+    connection: core,
+    async query(sql: string): Promise<[unknown, unknown]> {
+      events.push(sql);
+      return [[], []];
+    },
+    async execute(): Promise<[unknown, unknown]> {
+      throw new Error('bounded read should use the core stream');
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(
+    { name: 'mysql-stream', driver: 'mysql', database: 'test' } as never,
+    logger,
+  );
+  (driver as unknown as { conn: typeof conn }).conn = conn;
+
+  const result = await driver.read('DESCRIBE users', [], signal(), 2);
+  assert.deepEqual(result.columns, ['Field']);
+  assert.deepEqual(result.rows, [['id'], ['email']]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'ROLLBACK']);
+});
+
+test('SQLite bounded reads retain only the configured rows and report truncation', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'bounded-sqlite',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+
+  try {
+    await driver.connect();
+    await driver.write(
+      'CREATE TABLE entries (id INTEGER PRIMARY KEY)',
+      [],
+      true,
+      signal(),
+    );
+    await driver.write(
+      'INSERT INTO entries(id) VALUES (1), (2), (3)',
+      [],
+      false,
+      signal(),
+    );
+
+    const result = await driver.read(
+      'SELECT id FROM entries ORDER BY id',
+      [],
+      signal(),
+      2,
+    );
+    assert.deepEqual(result.columns, ['id']);
+    assert.deepEqual(result.rows, [[1], [2]]);
+    assert.equal(result.rowCount, 2);
+    assert.equal(result.truncated, true);
+  } finally {
+    await driver.close();
+  }
 });
 
 test('SQLite close waits for a dispatched request before exiting', async () => {
