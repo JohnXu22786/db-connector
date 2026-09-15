@@ -21,7 +21,7 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
   let connectCalls = 0;
   let connectionCreates = 0;
   let firstExecuteStarted = false;
-  let firstDestroyed = false;
+  let firstDestroyCalls = 0;
   let releaseFirstExecute = () => {};
   const firstConnection: FakeConnection = {
     execute: () => {
@@ -35,7 +35,7 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
     commit: async () => {},
     rollback: async () => {},
     destroy: () => {
-      firstDestroyed = true;
+      firstDestroyCalls += 1;
       releaseFirstExecute();
     },
     end: async () => {},
@@ -76,7 +76,7 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
       abortedQuery,
       (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Cancelled,
     );
-    assert.equal(firstDestroyed, true);
+    assert.equal(firstDestroyCalls, 1);
 
     const result = await h.engine.query(
       { connection: 'mysql-test', sql: 'SELECT id FROM users', way: 'cli' },
@@ -219,6 +219,7 @@ test('MysqlDriver releases its lifecycle lock after a failed connection', async 
 test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
   let createCalls = 0;
   let failedExecuteCalls = 0;
+  let failedDestroyCalls = 0;
   const failedConnection: FakeConnection = {
     execute: async () => {
       failedExecuteCalls += 1;
@@ -228,7 +229,9 @@ test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
     beginTransaction: async () => {},
     commit: async () => {},
     rollback: async () => {},
-    destroy: () => {},
+    destroy: () => {
+      failedDestroyCalls += 1;
+    },
     end: async () => {},
   };
   const workingConnection: FakeConnection = {
@@ -257,6 +260,7 @@ test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
     (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.QueryFailed,
   );
   assert.equal(failedExecuteCalls, 1);
+  assert.equal(failedDestroyCalls, 1);
   assert.equal((driver as unknown as { conn: FakeConnection | null }).conn, null);
 
   await driver.connect();
