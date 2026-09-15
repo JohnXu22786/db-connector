@@ -234,6 +234,61 @@ test('failed schema introspection is audited', async () => {
   assert.equal(records[0]!.error?.message, 'schema failed');
 });
 
+test('invalid schema timeout validation is audited for every rejected value', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver());
+
+  for (const [index, timeoutMs] of [0, -1, Number.NaN, Number.POSITIVE_INFINITY].entries()) {
+    const connection = `invalid-schema-timeout-${index}`;
+    h.connectors.define({ name: connection, driver: 'sqlite' });
+
+    await assert.rejects(
+      h.engine.schema({ connection, timeoutMs, way: 'cli' }, freshSignal()),
+      (err: unknown) => {
+        assert.equal((err as { code?: string }).code, ErrorCode.InvalidArgs);
+        return true;
+      },
+    );
+
+    const records = await h.audit.query({ connection });
+    assert.equal(records.length, 1);
+    assert.equal(records[0]!.kind, 'schema');
+    assert.equal(records[0]!.status, 'error');
+    assert.equal(records[0]!.error?.code, ErrorCode.InvalidArgs);
+    assert.equal(records[0]!.error?.message, '"timeoutMs" must be a positive number');
+  }
+});
+
+test('valid schema timeout still completes normally', async () => {
+  const h = makeHarness();
+  let introspections = 0;
+  installDriver(h, emptyDriver({
+    introspect: async () => {
+      introspections += 1;
+      return {
+        tables: [],
+        views: [],
+        columns: [],
+        indexes: [],
+        foreignKeys: [],
+      };
+    },
+  }));
+  h.connectors.define({ name: 'valid-schema-timeout', driver: 'sqlite' });
+
+  const result = await h.engine.schema(
+    { connection: 'valid-schema-timeout', timeoutMs: 1000, way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(introspections, 1);
+  assert.deepEqual(result.tables, []);
+  const records = await h.audit.query({ connection: 'valid-schema-timeout' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.kind, 'schema');
+  assert.equal(records[0]!.status, 'ok');
+});
+
 test('executor binds markers using the MySQL escaped-string dialect', async () => {
   const h = makeHarness();
   let received: { sql: string; params: unknown[] } | undefined;
