@@ -212,6 +212,62 @@ test('failed SELECT and EXPLAIN through exec are reported and audited as reads',
   }
 });
 
+test('read-like exec applies the configured row limit before calling the driver', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let received: { sql: string; params: unknown[] } | undefined;
+  installDriver(h, emptyDriver({
+    read: async (sql, params) => {
+      received = { sql, params };
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'limited-read', driver: 'sqlite' });
+  const signal = freshSignal();
+
+  const result = await h.engine.exec({
+    connection: 'limited-read',
+    sql: 'SELECT id FROM items WHERE owner_id = ?',
+    params: [7],
+    way: 'cli',
+  }, signal);
+
+  assert.deepEqual(received, {
+    sql: 'SELECT id FROM items WHERE owner_id = ? LIMIT 2',
+    params: [7],
+  });
+  assert.equal(result.kind, 'read');
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+
+  const records = await h.audit.query({ connection: 'limited-read' });
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.status, 'ok');
+  assert.equal(records[0]!.rows, 2);
+  assert.equal(records[0]!.statement.summary, 'SELECT id FROM items WHERE owner_id = ?');
+});
+
+test('read-like exec preserves an existing top-level row limit', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedSql: string | undefined;
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      receivedSql = sql;
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'prelimited-read', driver: 'sqlite' });
+
+  const result = await h.engine.exec({
+    connection: 'prelimited-read',
+    sql: 'SELECT id FROM items LIMIT 5',
+    way: 'cli',
+  }, freshSignal());
+
+  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 5');
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+  const records = await h.audit.query({ connection: 'prelimited-read' });
+  assert.equal(records[0]!.rows, 2);
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
