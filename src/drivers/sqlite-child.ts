@@ -13,7 +13,7 @@
  */
 
 import { DatabaseSync } from 'node:sqlite';
-import { isNonTransactionalStatement } from '../sql.js';
+import { isNonTransactionalStatement, scan, type Token } from '../sql.js';
 
 interface Request {
   id: number;
@@ -116,6 +116,93 @@ function runWrite(req: Request): unknown {
   }
 }
 
+function isSqliteWord(token: Token, word: string): boolean {
+  return token.type === 'word' && token.value.toUpperCase() === word;
+}
+
+function readSqliteIdentifier(tokens: Token[], sql: string): string | undefined {
+  const first = tokens[0];
+  if (!first) return undefined;
+  if (first.type === 'word') return first.value;
+  if (first.type === 'quotedid') {
+    if (first.value.startsWith('"') && first.value.endsWith('"')) {
+      return first.value.slice(1, -1).replaceAll('""', '"');
+    }
+    if (first.value.startsWith('`') && first.value.endsWith('`')) {
+      return first.value.slice(1, -1).replaceAll('``', '`');
+    }
+  }
+  if (first.type === 'string' && first.value.startsWith("'") && first.value.endsWith("'")) {
+    return first.value.slice(1, -1).replaceAll("''", "'");
+  }
+  if (first.type === 'symbol' && first.value === '[') {
+    const close = tokens.find(
+      (token, index) => index > 0 && token.type === 'symbol' && token.value === ']',
+    );
+    if (close) return sql.slice(first.pos + 1, close.pos);
+  }
+  return undefined;
+}
+
+/** Find columns whose own top-level definition declares AUTOINCREMENT. */
+function readSqliteAutoincrementColumns(sql: string): Set<string> {
+  const tokens = scan(sql, 'sqlite').filter(
+    (token) => token.type !== 'space' && token.type !== 'comment',
+  );
+  const openIndex = tokens.findIndex(
+    (token) => token.type === 'symbol' && token.value === '(',
+  );
+  if (openIndex < 0) return new Set();
+
+  const bodyDepth = tokens[openIndex]!.depth;
+  const autoincrementColumns = new Set<string>();
+  let definition: Token[] = [];
+  let nestedDepth = 0;
+  const inspectDefinition = (): void => {
+    const topLevel = definition.filter((token) => token.depth === bodyDepth);
+    const name = readSqliteIdentifier(topLevel, sql);
+    if (!name) return;
+
+    const integerIndex = topLevel.findIndex(
+      (token, index) => index > 0 && isSqliteWord(token, 'INTEGER'),
+    );
+    if (integerIndex < 0) return;
+    const primaryIndex = topLevel.findIndex(
+      (token, index) => index > integerIndex && isSqliteWord(token, 'PRIMARY'),
+    );
+    if (primaryIndex < 0) return;
+    const keyIndex = topLevel.findIndex(
+      (token, index) => index > primaryIndex && isSqliteWord(token, 'KEY'),
+    );
+    if (keyIndex < 0) return;
+    const autoincrementIndex = topLevel.findIndex(
+      (token, index) => index > keyIndex && isSqliteWord(token, 'AUTOINCREMENT'),
+    );
+    if (autoincrementIndex >= 0) autoincrementColumns.add(name);
+  };
+
+  for (const token of tokens.slice(openIndex + 1)) {
+    if (token.type === 'symbol' && token.value === '(') {
+      nestedDepth += 1;
+      definition.push(token);
+    } else if (token.type === 'symbol' && token.value === ')') {
+      if (nestedDepth === 0) {
+        inspectDefinition();
+        break;
+      }
+      nestedDepth -= 1;
+      definition.push(token);
+    } else if (token.type === 'symbol' && token.value === ',' && nestedDepth === 0) {
+      inspectDefinition();
+      definition = [];
+    } else {
+      definition.push(token);
+    }
+  }
+
+  return autoincrementColumns;
+}
+
 function runSchema(): unknown {
   const master = db
     .prepare(
@@ -188,7 +275,7 @@ function runSchema(): unknown {
     const cols = db
       .prepare(`PRAGMA table_xinfo("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
-    const hasAutoincrement = /AUTOINCREMENT/i.test(object.sql ?? '');
+    const autoincrementColumns = readSqliteAutoincrementColumns(object.sql ?? '');
     for (const c of cols) {
       const isRowidAlias = c.pk > 0 && c.type.toUpperCase() === 'INTEGER' && !hasPrimaryKeyIndex;
       columns.push({
@@ -199,7 +286,7 @@ function runSchema(): unknown {
         ordinal: c.cid + 1,
         default: c.dflt_value ?? null,
         primaryKey: c.pk > 0,
-        extra: c.pk > 0 && hasAutoincrement ? 'AUTOINCREMENT' : undefined,
+        extra: c.pk > 0 && autoincrementColumns.has(c.name) ? 'AUTOINCREMENT' : undefined,
       });
     }
   };
