@@ -268,6 +268,29 @@ test('read-like exec preserves an existing top-level row limit', async () => {
   assert.equal(records[0]!.rows, 2);
 });
 
+test('read-like exec preserves a zero row cap in the driver guard', async () => {
+  const h = makeHarness({ query: { maxRows: 0 } });
+  let receivedSql: string | undefined;
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      receivedSql = sql;
+      return { columns: ['id'], rows: [[1]], rowCount: 1 };
+    },
+  }));
+  h.connectors.define({ name: 'zero-read', driver: 'sqlite' });
+
+  const result = await h.engine.exec({
+    connection: 'zero-read',
+    sql: 'SELECT id FROM items',
+    way: 'cli',
+  }, freshSignal());
+
+  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 0');
+  assert.match(result.note, /returned 0 row\(s\) \(capped at 0\)/);
+  const records = await h.audit.query({ connection: 'zero-read' });
+  assert.equal(records[0]!.rows, 0);
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
