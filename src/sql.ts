@@ -277,6 +277,43 @@ function meaningful(sql: string, driver?: DriverKind): Token[] {
   return scan(sql, driver ?? {}).filter((t) => t.type !== 'space' && t.type !== 'comment');
 }
 
+function isFetchCountToken(token: Token, next?: Token): boolean {
+  if (token.depth !== 0) return false;
+  if (token.type === 'param') return true;
+  if (token.type !== 'symbol') return false;
+  if (/^\d$/.test(token.value)) return true;
+  return (
+    token.value === '$' &&
+    next?.type === 'symbol' &&
+    next.depth === 0 &&
+    /^\d$/.test(next.value)
+  );
+}
+
+function skipFetchCount(tokens: Token[], start: number): number {
+  const first = tokens[start];
+  if (first?.type === 'symbol' && first.value === '(' && first.depth === 1) {
+    let depth = 0;
+    for (let cursor = start; cursor < tokens.length; cursor += 1) {
+      const token = tokens[cursor]!;
+      if (token.type !== 'symbol') continue;
+      if (token.value === '(') depth += 1;
+      else if (token.value === ')') {
+        depth -= 1;
+        if (depth === 0) return cursor + 1;
+      }
+    }
+    return start;
+  }
+
+  let cursor = start;
+  while (
+    cursor < tokens.length &&
+    isFetchCountToken(tokens[cursor]!, tokens[cursor + 1])
+  ) cursor += 1;
+  return cursor;
+}
+
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
 function firstDataKeyword(sql: string, driver?: DriverKind): Token | undefined {
   const tokens = meaningful(sql, driver);
@@ -690,9 +727,9 @@ export function rewriteNamedToPositional(
 }
 
 /**
- * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * already. Used only as a courtesy guard: the executor always caps rows on the
- * consuming side no matter what this returns.
+ * Append `LIMIT <n>` to a single top-level SELECT that has no top-level row
+ * cap already. Used only as a courtesy guard: the executor always caps rows
+ * on the consuming side no matter what this returns.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -703,13 +740,51 @@ export function ensureSelectLimit(
   if (kind !== 'select') return { sql, applied: false };
 
   const tokens = meaningful(sql, driver);
-  const hasTopLevelLimit = tokens.some(
-    (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
+  const dataKeywords = tokens.filter(
+    (t) => t.type === 'word' && t.depth === 0 &&
+      (t.value.toUpperCase() === 'SELECT' || t.value.toUpperCase() === 'VALUES'),
   );
-  if (hasTopLevelLimit) return { sql, applied: false };
+  const finalReadKeyword = dataKeywords[dataKeywords.length - 1];
+  if (finalReadKeyword?.value.toUpperCase() !== 'SELECT') {
+    return { sql, applied: false };
+  }
+
+  const hasTopLevelRowCap = tokens.some((t, index) => {
+    if (t.type !== 'word' || t.depth !== 0) return false;
+    const word = t.value.toUpperCase();
+    if (word === 'LIMIT') return true;
+    if (word !== 'FETCH') return false;
+
+    const modifier = tokens[index + 1];
+    if (
+      modifier?.type !== 'word' ||
+      modifier.depth !== 0 ||
+      (modifier.value.toUpperCase() !== 'FIRST' && modifier.value.toUpperCase() !== 'NEXT')
+    ) {
+      return false;
+    }
+
+    const cursor = skipFetchCount(tokens, index + 2);
+    const row = tokens[cursor];
+    if (
+      row?.type !== 'word' ||
+      row.depth !== 0 ||
+      (row.value.toUpperCase() !== 'ROW' && row.value.toUpperCase() !== 'ROWS')
+    ) {
+      return false;
+    }
+    const ending = tokens[cursor + 1];
+    if (ending?.type !== 'word' || ending.depth !== 0) return false;
+    if (ending.value.toUpperCase() === 'ONLY') return true;
+    return ending.value.toUpperCase() === 'WITH' &&
+      tokens[cursor + 2]?.type === 'word' &&
+      tokens[cursor + 2]?.depth === 0 &&
+      tokens[cursor + 2]?.value.toUpperCase() === 'TIES';
+  });
+  if (hasTopLevelRowCap) return { sql, applied: false };
 
   assertSingleStatement(sql, driver);
-  const upper = Math.max(1, Math.floor(limit));
+  const upper = Math.max(0, Math.floor(limit));
   const insertAt = insertionPoint(sql, driver);
   const out =
     sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);

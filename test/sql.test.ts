@@ -323,6 +323,35 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit preserves SQLite VALUES and complete PostgreSQL FETCH caps', () => {
+  for (const sql of [
+    'VALUES (1), (2)',
+    'SELECT 1 UNION ALL VALUES (2), (3)',
+  ]) {
+    const guarded = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(guarded.applied, false, sql);
+    assert.equal(guarded.sql, sql);
+  }
+
+  for (const sql of [
+    'SELECT id FROM t FETCH FIRST 5 ROWS ONLY',
+    'SELECT id FROM t FETCH NEXT 5 ROWS ONLY',
+    'SELECT id FROM t FETCH FIRST (1 + 1) ROWS WITH TIES',
+  ]) {
+    const guarded = ensureSelectLimit(sql, 10, 'postgres');
+    assert.equal(guarded.applied, false, sql);
+    assert.equal(guarded.sql, sql);
+  }
+
+  const withFetchAlias = ensureSelectLimit('SELECT fetch first FROM t', 10, 'postgres');
+  assert.equal(withFetchAlias.applied, true);
+  assert.equal(withFetchAlias.sql, 'SELECT fetch first FROM t LIMIT 10');
+  assert.equal(
+    ensureSelectLimit('SELECT id FROM t', 0, 'sqlite').sql,
+    'SELECT id FROM t LIMIT 0',
+  );
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');

@@ -441,6 +441,20 @@ test('executing reads through db_exec returns kind "read"', async () => {
   assert.equal(result.committed, true);
 });
 
+test('SQLite VALUES reads do not receive an invalid trailing LIMIT', async () => {
+  const h = makeHarness({ query: { maxRows: 1 } });
+  await h.engine.connect({ name: 'values', driver: 'sqlite', database: ':memory:' });
+
+  for (const sql of ['VALUES (1), (2)', 'SELECT 1 UNION ALL VALUES (2), (3)']) {
+    const result = await h.engine.exec(
+      { connection: 'values', sql, way: 'cli' },
+      freshSignal(),
+    );
+    assert.equal(result.kind, 'read');
+    assert.match(result.note, /returned 1 row\(s\) \(capped at 1\)/);
+  }
+});
+
 test('DDL through db_exec invalidates the schema cache', async () => {
   const h = await setup();
   const before = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
