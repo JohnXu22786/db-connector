@@ -323,6 +323,89 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit preserves SQLite VALUES and complete PostgreSQL FETCH caps', () => {
+  for (const sql of [
+    'VALUES (1), (2)',
+    'SELECT 1 UNION ALL VALUES (2), (3)',
+  ]) {
+    const guarded = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(guarded.applied, false, sql);
+    assert.equal(guarded.sql, sql);
+  }
+
+  for (const sql of [
+    'SELECT id FROM t FETCH FIRST 5 ROWS ONLY',
+    'SELECT id FROM t FETCH NEXT 5 ROWS ONLY',
+  ]) {
+    const guarded = ensureSelectLimit(sql, 10, 'postgres');
+    assert.equal(guarded.applied, false, sql);
+    assert.equal(guarded.sql, sql);
+  }
+
+  const withTies = ensureSelectLimit(
+    'SELECT id FROM t FETCH FIRST (1 + 1) ROWS WITH TIES',
+    10,
+    'postgres',
+  );
+  assert.equal(withTies.applied, true);
+  assert.match(withTies.sql, /^SELECT \* FROM \(SELECT id FROM t FETCH FIRST \(1 \+ 1\) ROWS WITH TIES\)/);
+  assert.match(withTies.sql, /LIMIT 10$/);
+
+  const withFetchAlias = ensureSelectLimit('SELECT fetch first FROM t', 10, 'postgres');
+  assert.equal(withFetchAlias.applied, true);
+  assert.equal(withFetchAlias.sql, 'SELECT fetch first FROM t LIMIT 10');
+  assert.equal(
+    ensureSelectLimit('SELECT id FROM t', 0, 'sqlite').sql,
+    'SELECT id FROM t LIMIT 0',
+  );
+});
+
+test('ensureSelectLimit tightens oversized and unbounded existing caps', () => {
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5', 2, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT ALL', 2, 'postgres'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -1', 2, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 2', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5', 0, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 0', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST 5 ROWS ONLY', 2, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST 2 ROWS ONLY', applied: true },
+  );
+
+  const parameterized = ensureSelectLimit('SELECT id FROM t LIMIT ?', 2, 'sqlite');
+  assert.equal(parameterized.applied, true);
+  assert.equal(
+    parameterized.sql,
+    'SELECT * FROM (SELECT id FROM t LIMIT ?) AS __dsh_bounded LIMIT 2',
+  );
+
+  const mysqlJoined = 'SELECT * FROM t1 JOIN t2 ON t1.id = t2.id LIMIT ?';
+  assert.deepEqual(
+    ensureSelectLimit(mysqlJoined, 2, 'mysql'),
+    { sql: mysqlJoined, applied: false },
+  );
+
+  const mysqlComment = ensureSelectLimit(
+    'SELECT id FROM t # trailing comment\n',
+    2,
+    'mysql',
+  );
+  assert.deepEqual(mysqlComment, {
+    sql: 'SELECT id FROM t LIMIT 2 # trailing comment\n',
+    applied: true,
+  });
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');

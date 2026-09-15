@@ -39,10 +39,12 @@ export interface ScanOptions {
   backslashEscapes?: boolean;
   /** Recognize PostgreSQL `E'...'` escape string constants. */
   postgresEscapeStrings?: boolean;
+  /** Recognize MySQL `#` line comments. */
+  hashComments?: boolean;
 }
 
 function scanOptionsForDriver(driver: DriverKind): ScanOptions {
-  if (driver === 'mysql') return { backslashEscapes: true };
+  if (driver === 'mysql') return { backslashEscapes: true, hashComments: true };
   if (driver === 'postgres') return { postgresEscapeStrings: true };
   return {};
 }
@@ -72,6 +74,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
+  const hashComments = resolvedOptions.hashComments === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
   const isIdentPart = (c: string): boolean =>
@@ -101,6 +104,14 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
       i += 2;
       while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
       i = Math.min(n, i + 2);
+      tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // MySQL hash comment
+    if (hashComments && c === '#') {
+      i += 1;
+      while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
       continue;
     }
@@ -275,6 +286,163 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
 /** Meaningful tokens: everything except whitespace and comments. */
 function meaningful(sql: string, driver?: DriverKind): Token[] {
   return scan(sql, driver ?? {}).filter((t) => t.type !== 'space' && t.type !== 'comment');
+}
+
+interface ExistingRowCap {
+  kind: 'limit' | 'fetch';
+  /** The expression that controls the number of rows, excluding comments. */
+  expressionStart: number;
+  expressionEnd: number;
+  /** A literal row count, Infinity for an unbounded cap, or unknown. */
+  value: number | undefined;
+  withTies: boolean;
+}
+
+function tokenEnd(token: Token): number {
+  return token.pos + token.value.length;
+}
+
+function statementEndIndex(tokens: Token[], start: number): number {
+  for (let index = start; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.type === 'symbol' && token.value === ';' && token.depth === 0) {
+      return index;
+    }
+  }
+  return tokens.length;
+}
+
+function firstTopLevelIndex(
+  tokens: Token[],
+  start: number,
+  end: number,
+  predicate: (token: Token) => boolean,
+): number | undefined {
+  for (let index = start; index < end; index += 1) {
+    const token = tokens[index]!;
+    if (token.depth === 0 && predicate(token)) return index;
+  }
+  return undefined;
+}
+
+function stripOuterParens(tokens: Token[]): Token[] {
+  let out = tokens;
+  while (out.length >= 2) {
+    const first = out[0];
+    const last = out[out.length - 1];
+    if (
+      first?.type !== 'symbol' ||
+      first.value !== '(' ||
+      last?.type !== 'symbol' ||
+      last.value !== ')'
+    ) break;
+    let depth = 0;
+    let closesAtEnd = false;
+    for (let index = 0; index < out.length; index += 1) {
+      const token = out[index]!;
+      if (token.type !== 'symbol') continue;
+      if (token.value === '(') depth += 1;
+      else if (token.value === ')') {
+        depth -= 1;
+        if (depth === 0) {
+          closesAtEnd = index === out.length - 1;
+          break;
+        }
+      }
+    }
+    if (!closesAtEnd) break;
+    out = out.slice(1, -1);
+  }
+  return out;
+}
+
+function literalRowCount(tokens: Token[]): number | undefined {
+  const literal = stripOuterParens(tokens);
+  if (
+    literal.length === 1 &&
+    literal[0]?.type === 'word' &&
+    literal[0].value.toUpperCase() === 'ALL'
+  ) {
+    return Infinity;
+  }
+  if (literal.length === 0) return undefined;
+  const text = literal.map((token) => token.value).join('');
+  if (!/^[+-]?\d+$/.test(text)) return undefined;
+  return Number(text);
+}
+
+function parseLimit(tokens: Token[], index: number): ExistingRowCap {
+  const end = statementEndIndex(tokens, index + 1);
+  const tail = new Set(['OFFSET', 'FOR', 'INTO', 'PROCEDURE', 'LOCK']);
+  const delimiter = firstTopLevelIndex(tokens, index + 1, end, (token) =>
+    (token.type === 'symbol' && token.value === ',') ||
+    (token.type === 'word' && tail.has(token.value.toUpperCase())),
+  );
+  const firstDelimiter = delimiter ?? end;
+  const comma = delimiter !== undefined &&
+    tokens[delimiter]?.type === 'symbol' &&
+    tokens[delimiter]?.value === ',';
+  const expressionStartIndex = comma ? delimiter + 1 : index + 1;
+  const expressionEndIndex = comma ? end : firstDelimiter;
+  const first = tokens[expressionStartIndex];
+  const last = tokens[expressionEndIndex - 1];
+  return {
+    kind: 'limit',
+    expressionStart: first?.pos ?? tokenEnd(tokens[index]!),
+    expressionEnd: last ? tokenEnd(last) : first?.pos ?? tokenEnd(tokens[index]!),
+    value: literalRowCount(tokens.slice(expressionStartIndex, expressionEndIndex)),
+    withTies: false,
+  };
+}
+
+function parseFetch(tokens: Token[], index: number): ExistingRowCap | undefined {
+  const modifier = tokens[index + 1];
+  if (
+    modifier?.type !== 'word' ||
+    modifier.depth !== 0 ||
+    (modifier.value.toUpperCase() !== 'FIRST' && modifier.value.toUpperCase() !== 'NEXT')
+  ) {
+    return undefined;
+  }
+
+  const end = statementEndIndex(tokens, index + 2);
+  const rowIndex = firstTopLevelIndex(tokens, index + 2, end, (token) =>
+    token.type === 'word' &&
+    (token.value.toUpperCase() === 'ROW' || token.value.toUpperCase() === 'ROWS'),
+  );
+  if (rowIndex === undefined) return undefined;
+  const ending = tokens[rowIndex + 1];
+  const withTies = ending?.type === 'word' && ending.value.toUpperCase() === 'WITH' &&
+    tokens[rowIndex + 2]?.type === 'word' &&
+    tokens[rowIndex + 2]?.value.toUpperCase() === 'TIES';
+  const only = ending?.type === 'word' && ending.value.toUpperCase() === 'ONLY';
+  if (!only && !withTies) return undefined;
+
+  const expressionStartIndex = index + 2;
+  const first = tokens[expressionStartIndex];
+  const last = tokens[rowIndex - 1];
+  const hasCount = expressionStartIndex < rowIndex;
+  return {
+    kind: 'fetch',
+    expressionStart: first?.pos ?? tokenEnd(modifier),
+    expressionEnd: last ? tokenEnd(last) : first?.pos ?? tokenEnd(modifier),
+    value: hasCount ? literalRowCount(tokens.slice(expressionStartIndex, rowIndex)) : 1,
+    withTies,
+  };
+}
+
+function findTopLevelRowCap(tokens: Token[]): ExistingRowCap | undefined {
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.type !== 'word' || token.depth !== 0) continue;
+    const word = token.value.toUpperCase();
+    if (word === 'LIMIT') return parseLimit(tokens, index);
+    if (word === 'FETCH') {
+      const parsed = parseFetch(tokens, index);
+      if (parsed) return parsed;
+    }
+  }
+  return undefined;
 }
 
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
@@ -690,9 +858,11 @@ export function rewriteNamedToPositional(
 }
 
 /**
- * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * already. Used only as a courtesy guard: the executor always caps rows on the
- * consuming side no matter what this returns.
+ * Enforce `LIMIT <n>` on a single top-level SELECT. Existing row caps are
+ * retained when they are provably no larger than `n`; oversized or unbounded
+ * caps are tightened in place when possible, otherwise the statement is
+ * wrapped in a derived table with an outer limit. The executor still caps
+ * rows on the consuming side as a final defense.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -703,13 +873,60 @@ export function ensureSelectLimit(
   if (kind !== 'select') return { sql, applied: false };
 
   const tokens = meaningful(sql, driver);
-  const hasTopLevelLimit = tokens.some(
-    (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
+  const dataKeywords = tokens.filter(
+    (t) => t.type === 'word' && t.depth === 0 &&
+      (t.value.toUpperCase() === 'SELECT' || t.value.toUpperCase() === 'VALUES'),
   );
-  if (hasTopLevelLimit) return { sql, applied: false };
+  const finalReadKeyword = dataKeywords[dataKeywords.length - 1];
+  if (finalReadKeyword?.value.toUpperCase() !== 'SELECT') {
+    return { sql, applied: false };
+  }
+
+  const existing = findTopLevelRowCap(tokens);
+  const upper = Math.max(0, Math.floor(limit));
+
+  if (existing) {
+    const needsTightening =
+      existing.withTies ||
+      existing.value === undefined ||
+      existing.value < 0 ||
+      existing.value > upper;
+    if (!needsTightening) return { sql, applied: false };
+
+    if (
+      existing.expressionStart < existing.expressionEnd &&
+      !existing.withTies &&
+      existing.value !== undefined
+    ) {
+      return {
+        sql:
+          sql.slice(0, existing.expressionStart) +
+          String(upper) +
+          sql.slice(existing.expressionEnd),
+        applied: true,
+      };
+    }
+
+    if (driver === 'mysql') {
+      // MySQL rejects derived tables with duplicate output names. The MySQL
+      // driver enforces this cap while consuming its row stream instead.
+      return { sql, applied: false };
+    }
+
+    // Expressions and FETCH ... WITH TIES cannot be safely reduced by
+    // replacing a token. Keep their semantics inside the statement and put
+    // the hard configured cap around the complete result instead.
+    assertSingleStatement(sql, driver);
+    const end = insertionPoint(sql, driver);
+    return {
+      sql:
+        `SELECT * FROM (${sql.slice(0, end)}) AS __dsh_bounded LIMIT ${upper}` +
+        sql.slice(end),
+      applied: true,
+    };
+  }
 
   assertSingleStatement(sql, driver);
-  const upper = Math.max(1, Math.floor(limit));
   const insertAt = insertionPoint(sql, driver);
   const out =
     sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);

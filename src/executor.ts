@@ -214,7 +214,7 @@ export class ExecutionEngine {
     const started = process.hrtime();
     let outcome;
     try {
-      outcome = await driver.read(protectedSql, bound.values, deadline.signal);
+      outcome = await driver.read(protectedSql, bound.values, deadline.signal, limit);
     } catch (err) {
       const duration = hrtimeMs(started);
       await this.auditFail(opts.connection, opts.sql, 'query', duration, opts.way, err);
@@ -230,7 +230,9 @@ export class ExecutionEngine {
     // that happens to have exactly the cap rows reads as truncated too — a
     // documented ambiguity.
     const truncated =
-      sliced || (guarded.applied && outcome.rows.length === limit);
+      sliced ||
+      outcome.truncated === true ||
+      (guarded.applied && outcome.rows.length === limit);
     const serialized = rows.map((r) => r.map(serializeValue));
     this.connectors.touch(opts.connection);
     const auditId = await this.auditOk({
@@ -291,6 +293,11 @@ export class ExecutionEngine {
       await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
       throw err;
     }
+    const readLimit = readLike ? this.effectiveLimit(undefined) : undefined;
+    const protectedSql =
+      classification.kind === 'select'
+        ? ensureSelectLimit(bound.sql, readLimit!, driverKind).sql
+        : bound.sql;
     const openStarted = process.hrtime();
     let driver;
     try {
@@ -315,9 +322,13 @@ export class ExecutionEngine {
 
     try {
       if (readLike) {
-        const outcome = await driver.read(bound.sql, bound.values, deadline.signal);
-        const limit = this.effectiveLimit(undefined);
-        const { rows } = capRows(outcome.rows, limit);
+        const outcome = await driver.read(
+          protectedSql,
+          bound.values,
+          deadline.signal,
+          readLimit,
+        );
+        const { rows } = capRows(outcome.rows, readLimit!);
         this.connectors.touch(opts.connection);
         const auditId = await this.auditOk({
           connection: opts.connection,
@@ -335,7 +346,7 @@ export class ExecutionEngine {
           rolledBack: false,
           durationMs: hrtimeMs(started),
           auditId,
-          note: `read-only statement executed; returned ${rows.length} row(s) (capped at ${limit})`,
+          note: `read-only statement executed; returned ${rows.length} row(s) (capped at ${readLimit})`,
         };
       }
 

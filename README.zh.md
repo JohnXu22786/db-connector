@@ -166,7 +166,9 @@ host:port / 库名与 `auth=env|credentials|inline|none`；错误信息只报环
 运行**只读**查询（SELECT / EXPLAIN / DESCRIBE / SHOW）。
 
 - **强制只读**：任何写/DDL 语句都会以 `READ_ONLY_VIOLATION` 拒绝，并在接触驱动前记录为 `denied` 审计。涵盖 INSERT/UPDATE/DELETE/DDL/PRAGMA，以及隐蔽形式：`EXPLAIN ANALYZE <dml>`（会真实执行其语句）与数据修改型 CTE（`WITH x AS (DELETE ...) SELECT ...`）。
-- **结果上限**：行数以 `limit`（或 `query.maxRows`）封顶；对无自身 LIMIT 的顶层 SELECT 会追加 guard `LIMIT`。
+- **结果上限**：行数以 `limit`（或 `query.maxRows`）封顶；顶层 SELECT 会追加
+  guard `LIMIT`，已有但过大的或无限制的行数上限会在方言允许时收紧，其他
+  只读结果则通过有界驱动流读取。
 - **超时**：`timeoutMs`（或默认值）通过 AbortSignal 执行；SQLite 通过子进程拆解实现真实终止。
 
 ```json
