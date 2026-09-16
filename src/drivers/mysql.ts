@@ -108,7 +108,13 @@ export class MysqlDriver implements DriverApi {
         return new Promise((resolve, reject) => {
           let settled = false;
           let abortError: DbConnectorError | undefined;
+          let destroyed = false;
           const cleanup = () => signal.removeEventListener('abort', onAbort);
+          const destroy = () => {
+            if (destroyed) return;
+            destroyed = true;
+            conn.destroy();
+          };
           const succeed = (value: unknown) => {
             if (settled) return;
             settled = true;
@@ -119,13 +125,16 @@ export class MysqlDriver implements DriverApi {
             if (settled) return;
             settled = true;
             cleanup();
-            if (!abortError && this.conn === conn) this.conn = null;
+            if (!abortError) {
+              if (this.conn === conn) this.conn = null;
+              destroy();
+            }
             reject(toConnectorError(this.spec, err));
           };
           const onAbort = () => {
             if (settled || abortError) return;
             if (this.conn === conn) this.conn = null;
-            conn.destroy(); // kills the in-flight query server-side
+            destroy(); // kills the in-flight query server-side
             abortError = cancelError(signal);
           };
           if (signal.aborted) {
