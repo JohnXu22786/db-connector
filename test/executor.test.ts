@@ -212,6 +212,52 @@ test('failed SELECT and EXPLAIN through exec are reported and audited as reads',
   }
 });
 
+test('db_query passes its cap to the driver and preserves bounded truncation', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedMaxRows: number | undefined;
+  installDriver(h, emptyDriver({
+    read: async (_sql, _params, _signal, maxRows) => {
+      receivedMaxRows = maxRows;
+      return {
+        columns: ['id'],
+        rows: [[1], [2]],
+        rowCount: 2,
+        truncated: true,
+      } as never;
+    },
+  }));
+  h.connectors.define({ name: 'bounded-query', driver: 'sqlite' });
+
+  const result = await h.engine.query(
+    { connection: 'bounded-query', sql: 'EXPLAIN SELECT 1', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(receivedMaxRows, 2);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+});
+
+test('db_exec read-like statements pass the configured cap to the driver', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedMaxRows: number | undefined;
+  installDriver(h, emptyDriver({
+    read: async (_sql, _params, _signal, maxRows) => {
+      receivedMaxRows = maxRows;
+      return { columns: ['id'], rows: [[1], [2]], rowCount: 2 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-read', driver: 'sqlite' });
+
+  const result = await h.engine.exec(
+    { connection: 'bounded-read', sql: 'EXPLAIN SELECT 1', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(receivedMaxRows, 2);
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({

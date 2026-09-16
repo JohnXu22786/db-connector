@@ -413,6 +413,43 @@ test('PostgreSQL reconnects after close without leaking the new client', async (
   assert.deepEqual(endCalls, [1, 2]);
 });
 
+test('PostgreSQL rejects the native client before a read can buffer rows', async (t) => {
+  let endCalls = 0;
+  class FakeNativePgClient implements PgClientStub {
+    readonly native = {};
+
+    async connect(): Promise<void> {
+      throw new Error('native client should be rejected before connect');
+    }
+
+    async query(): Promise<PgResult> {
+      return { fields: [], rows: [], rowCount: 0 };
+    }
+
+    async end(): Promise<void> {
+      endCalls += 1;
+    }
+  }
+  const pg = require('pg') as { Client: typeof FakeNativePgClient };
+  function createFakeNativeClient(): FakeNativePgClient {
+    return new FakeNativePgClient();
+  }
+  mock.method(pg, 'Client', createFakeNativeClient);
+  t.after(() => mock.restoreAll());
+
+  const driver = new PgDriver(spec('postgres'), logger);
+  await assert.rejects(
+    () => driver.connect(),
+    (error: unknown) => {
+      assert.ok(error instanceof DbConnectorError);
+      assert.equal(error.code, ErrorCode.UnsupportedDriver);
+      assert.match(error.message, /native client mode is not supported/i);
+      return true;
+    },
+  );
+  assert.equal(endCalls, 1);
+});
+
 test('MySQL close waits before ending the connection used by an active transaction', async () => {
   const events: string[] = [];
   const statement = deferred<[unknown, unknown]>();
@@ -755,6 +792,157 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     ],
   );
   assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+});
+
+test('PostgreSQL bounded reads stream administrative results', async () => {
+  class FakePgStreamQuery {
+    readonly config: { text: string };
+    private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+    constructor(config: { text: string }) {
+      this.config = config;
+    }
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+      return this;
+    }
+
+    emit(event: string, ...args: unknown[]): void {
+      for (const listener of this.listeners.get(event) ?? []) listener(...args);
+    }
+  }
+
+  const events: string[] = [];
+  const client = {
+    async query(input: unknown): Promise<unknown> {
+      if (typeof input === 'string') {
+        events.push(input);
+        return { fields: [], rows: [], rowCount: null };
+      }
+      if (input instanceof FakePgStreamQuery) {
+        events.push(input.config.text);
+        queueMicrotask(() => {
+          const fields = [{ name: 'id' }];
+          input.emit('row', [1], { fields });
+          input.emit('row', [2], { fields });
+          input.emit('row', [3], { fields });
+          input.emit('end', { fields });
+        });
+        return input;
+      }
+      return {
+        fields: [{ name: 'id' }],
+        rows: [[1], [2], [3]],
+        rowCount: 3,
+      };
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as {
+    client: typeof client;
+    queryConstructor: typeof FakePgStreamQuery;
+  }).client = client;
+  (driver as unknown as { queryConstructor: typeof FakePgStreamQuery }).queryConstructor =
+    FakePgStreamQuery;
+
+  const result = await driver.read('SHOW ALL', [], signal(), 2);
+
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['BEGIN TRANSACTION READ ONLY', 'SHOW ALL', 'ROLLBACK']);
+});
+
+test('MySQL bounded reads stream administrative results', async () => {
+  class FakeMysqlCommand {
+    private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+      return this;
+    }
+
+    emit(event: string, ...args: unknown[]): void {
+      for (const listener of this.listeners.get(event) ?? []) listener(...args);
+    }
+  }
+
+  const events: string[] = [];
+  const command = new FakeMysqlCommand();
+  const connection = {
+    execute(input: unknown): FakeMysqlCommand {
+      assert.deepEqual(input, { sql: 'DESCRIBE users', values: [], rowsAsArray: true });
+      queueMicrotask(() => {
+        command.emit('fields', [{ name: 'Field' }]);
+        command.emit('result', ['id']);
+        command.emit('result', ['email']);
+        command.emit('result', ['age']);
+        command.emit('end');
+      });
+      return command;
+    },
+  };
+  const conn = {
+    connection,
+    async query(sql: string): Promise<[unknown, unknown]> {
+      events.push(sql);
+      return [[], []];
+    },
+    async execute(): Promise<[unknown, unknown]> {
+      throw new Error('bounded read should use the event-emitting connection');
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  (driver as unknown as { conn: typeof conn }).conn = conn;
+
+  const result = await driver.read('DESCRIBE users', [], signal(), 2);
+
+  assert.deepEqual(result.columns, ['Field']);
+  assert.deepEqual(result.rows, [['id'], ['email']]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'ROLLBACK']);
+});
+
+test('SQLite bounded reads retain only the configured rows', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'bounded-sqlite',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+
+  try {
+    await driver.connect();
+    const result = await driver.read(
+      'EXPLAIN SELECT 1 UNION ALL SELECT 2',
+      [],
+      signal(),
+      1,
+    );
+
+    assert.equal(result.rows.length, 1);
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.truncated, true);
+  } finally {
+    await driver.close();
+  }
 });
 
 test('SQLite close waits for a dispatched request before exiting', async () => {
