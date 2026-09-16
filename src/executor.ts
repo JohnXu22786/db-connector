@@ -642,6 +642,9 @@ function wrapWriteError(err: unknown, isDdl: boolean, nonTransactional: boolean)
       if (nonTransactional) {
         return new DbConnectorError(err.code, `${prefix} failed without a transaction; partial changes were not rolled back: ${err.message}`, err.details);
       }
+      if (rollbackFailed(err)) {
+        return new DbConnectorError(err.code, `${prefix} failed and the transaction outcome is unknown because rollback failed: ${err.message}`, err.details);
+      }
       return new DbConnectorError(err.code, `${prefix} failed and the transaction was rolled back: ${err.message}`, err.details);
     }
     return err;
@@ -651,4 +654,12 @@ function wrapWriteError(err: unknown, isDdl: boolean, nonTransactional: boolean)
     return new DbConnectorError(ErrorCode.QueryFailed, `${isDdl ? 'DDL' : 'write'} failed without a transaction; partial changes were not rolled back: ${message}`);
   }
   return new DbConnectorError(ErrorCode.QueryFailed, `write failed and the transaction was rolled back: ${message}`);
+}
+
+function rollbackFailed(err: DbConnectorError): boolean {
+  return (
+    typeof err.details === 'object' &&
+    err.details !== null &&
+    (err.details as { rollbackFailed?: unknown }).rollbackFailed === true
+  );
 }

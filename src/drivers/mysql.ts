@@ -148,7 +148,7 @@ export class MysqlDriver implements DriverApi {
               if (abortError) fail(abortError);
               else succeed(value);
             },
-            (err) => fail(abortError ?? err),
+            (err) => fail(errorAfterAbort(abortError, err)),
           );
         });
       },
@@ -162,13 +162,21 @@ export class MysqlDriver implements DriverApi {
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
+      const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true }).catch(
+        async (err) => {
+          try {
+            await conn.query('ROLLBACK');
+          } catch (rollbackErr) {
+            throw new MysqlRollbackFailure(err, rollbackErr);
+          }
+          throw err;
+        },
+      );
       try {
-        const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
         await conn.query('ROLLBACK');
         return { rows, fields };
-      } catch (err) {
-        await conn.query('ROLLBACK').catch(() => {});
-        throw err;
+      } catch (rollbackErr) {
+        throw new MysqlRollbackFailure(undefined, rollbackErr);
       }
     }, signal);
     return outcomeOf(result as MysqlReadResult);
@@ -187,7 +195,11 @@ export class MysqlDriver implements DriverApi {
         await conn.commit();
         return rows as { affectedRows?: number };
       } catch (err) {
-        await conn.rollback().catch(() => {});
+        try {
+          await conn.rollback();
+        } catch (rollbackErr) {
+          throw new MysqlRollbackFailure(err, rollbackErr);
+        }
         throw err;
       }
     }, signal);
@@ -353,13 +365,48 @@ function isFatalMysqlError(err: unknown): boolean {
   );
 }
 
+class MysqlRollbackFailure extends Error {
+  readonly fatal = true;
+  readonly rollbackFailed = true;
+
+  constructor(originalErr: unknown, rollbackErr: unknown) {
+    super(
+      originalErr === undefined
+        ? `rollback failed: ${errorMessage(rollbackErr)}`
+        : `operation error: ${errorMessage(originalErr)}; ` +
+          `rollback failed: ${errorMessage(rollbackErr)}`,
+    );
+    this.name = 'MysqlRollbackFailure';
+  }
+}
+
 function toConnectorError(
   spec: ResolvedConnectionSpec,
   err: unknown,
 ): DbConnectorError {
   if (err instanceof DbConnectorError) return err;
-  const message = err instanceof Error ? err.message : String(err);
-  return new DbConnectorError(ErrorCode.QueryFailed, redactSpecMessage(spec, message));
+  const message = errorMessage(err);
+  const details = err instanceof MysqlRollbackFailure ? { rollbackFailed: true } : undefined;
+  return new DbConnectorError(
+    ErrorCode.QueryFailed,
+    redactSpecMessage(spec, message),
+    details,
+  );
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function errorAfterAbort(
+  abortError: DbConnectorError | undefined,
+  err: unknown,
+): unknown {
+  if (!abortError) return err;
+  if (err instanceof MysqlRollbackFailure) {
+    return new DbConnectorError(abortError.code, abortError.message, { rollbackFailed: true });
+  }
+  return abortError;
 }
 
 /** Introspection queries, parameterized by database (placeholder `?`). */

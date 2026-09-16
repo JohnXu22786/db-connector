@@ -341,6 +341,288 @@ test('MysqlDriver reuses a connection after a nonfatal statement error', async (
   await driver.close();
 });
 
+test('MySQL exec reconnects after a write rollback failure', async (t) => {
+  let createCalls = 0;
+  let failedExecuteCalls = 0;
+  let failedRollbackCalls = 0;
+  let failedDestroyCalls = 0;
+  const failedConnection: FakeConnection = {
+    execute: async () => {
+      failedExecuteCalls += 1;
+      throw Object.assign(new Error('duplicate entry'), {
+        code: 'ER_DUP_ENTRY',
+        errno: 1062,
+        sqlState: '23000',
+      });
+    },
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {
+      failedRollbackCalls += 1;
+      throw Object.assign(new Error('connection lost during rollback'), {
+        code: 'PROTOCOL_CONNECTION_LOST',
+      });
+    },
+    destroy: () => {
+      failedDestroyCalls += 1;
+    },
+    end: async () => {},
+  };
+  const workingConnection: FakeConnection = {
+    execute: async () => [{ affectedRows: 1 }, []],
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {},
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return createCalls === 1 ? failedConnection : workingConnection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const h = makeHarness();
+  await h.engine.connect({ name: 'write-rollback-retry', driver: 'mysql', database: 'test' });
+  await assert.rejects(
+    () => h.engine.exec(
+      {
+        connection: 'write-rollback-retry',
+        sql: 'INSERT INTO users (id) VALUES (?)',
+        params: [1],
+        allowWrite: true,
+        way: 'cli',
+      },
+      new AbortController().signal,
+    ),
+    (error: unknown) => {
+      return (
+        error instanceof DbConnectorError &&
+        error.code === ErrorCode.QueryFailed &&
+        /transaction outcome is unknown because rollback failed/i.test(error.message) &&
+        /duplicate entry/i.test(error.message) &&
+        /connection lost during rollback/i.test(error.message)
+      );
+    },
+  );
+  assert.equal(failedExecuteCalls, 1);
+  assert.equal(failedRollbackCalls, 1);
+  assert.equal(failedDestroyCalls, 1);
+  const result = await h.engine.exec(
+    {
+      connection: 'write-rollback-retry',
+      sql: 'INSERT INTO users (id) VALUES (?)',
+      params: [2],
+      allowWrite: true,
+      way: 'cli',
+    },
+    new AbortController().signal,
+  );
+
+  assert.equal(createCalls, 2);
+  assert.equal(result.affectedRows, 1);
+});
+
+test('MySQL query reconnects after a read rollback failure', async (t) => {
+  let createCalls = 0;
+  let failedExecuteCalls = 0;
+  let failedRollbackCalls = 0;
+  let failedDestroyCalls = 0;
+  const failedConnection: FakeConnection = {
+    execute: async () => {
+      failedExecuteCalls += 1;
+      throw Object.assign(new Error('table does not exist'), {
+        code: 'ER_NO_SUCH_TABLE',
+        errno: 1146,
+        sqlState: '42S02',
+      });
+    },
+    query: async (sql) => {
+      if (sql === 'ROLLBACK') {
+        failedRollbackCalls += 1;
+        throw Object.assign(new Error('connection lost during rollback'), {
+          code: 'PROTOCOL_CONNECTION_LOST',
+        });
+      }
+      return [[], []];
+    },
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {
+      failedDestroyCalls += 1;
+    },
+    end: async () => {},
+  };
+  const workingConnection: FakeConnection = {
+    execute: async () => [[[2]], [{ name: 'id' }]],
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {},
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return createCalls === 1 ? failedConnection : workingConnection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const h = makeHarness();
+  await h.engine.connect({ name: 'read-rollback-retry', driver: 'mysql', database: 'test' });
+  await assert.rejects(
+    () => h.engine.query(
+      { connection: 'read-rollback-retry', sql: 'SELECT id FROM users', way: 'cli' },
+      new AbortController().signal,
+    ),
+    (error: unknown) => {
+      return (
+        error instanceof DbConnectorError &&
+        error.code === ErrorCode.QueryFailed &&
+        /table does not exist/i.test(error.message) &&
+        /connection lost during rollback/i.test(error.message)
+      );
+    },
+  );
+  assert.equal(failedExecuteCalls, 1);
+  assert.equal(failedRollbackCalls, 1);
+  assert.equal(failedDestroyCalls, 1);
+  const result = await h.engine.query(
+    { connection: 'read-rollback-retry', sql: 'SELECT id FROM users', way: 'cli' },
+    new AbortController().signal,
+  );
+
+  assert.equal(createCalls, 2);
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[2]]);
+});
+
+test('MySQL query reconnects when successful-read cleanup rollback fails', async (t) => {
+  let createCalls = 0;
+  let rollbackCalls = 0;
+  let failedDestroyCalls = 0;
+  const failedConnection: FakeConnection = {
+    execute: async () => [[[1]], [{ name: 'id' }]],
+    query: async (sql) => {
+      if (sql === 'ROLLBACK') {
+        rollbackCalls += 1;
+        throw Object.assign(new Error('connection lost during rollback'), {
+          code: 'PROTOCOL_CONNECTION_LOST',
+        });
+      }
+      return [[], []];
+    },
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {
+      failedDestroyCalls += 1;
+    },
+    end: async () => {},
+  };
+  const workingConnection: FakeConnection = {
+    execute: async () => [[[2]], [{ name: 'id' }]],
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {},
+    destroy: () => {},
+    end: async () => {},
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => {
+    createCalls += 1;
+    return createCalls === 1 ? failedConnection : workingConnection;
+  });
+  t.after(() => mock.restoreAll());
+
+  const h = makeHarness();
+  await h.engine.connect({ name: 'read-cleanup-rollback-retry', driver: 'mysql', database: 'test' });
+  await assert.rejects(
+    () => h.engine.query(
+      { connection: 'read-cleanup-rollback-retry', sql: 'SELECT id FROM users', way: 'cli' },
+      new AbortController().signal,
+    ),
+    (error: unknown) => {
+      return (
+        error instanceof DbConnectorError &&
+        error.code === ErrorCode.QueryFailed &&
+        /rollback failed: connection lost during rollback/i.test(error.message)
+      );
+    },
+  );
+  assert.equal(rollbackCalls, 1);
+  assert.equal(failedDestroyCalls, 1);
+
+  const result = await h.engine.query(
+    { connection: 'read-cleanup-rollback-retry', sql: 'SELECT id FROM users', way: 'cli' },
+    new AbortController().signal,
+  );
+  assert.equal(createCalls, 2);
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[2]]);
+});
+
+test('MySQL exec preserves rollback uncertainty after cancellation', async (t) => {
+  const executionStarted = deferred<void>();
+  let rejectExecution!: (error: unknown) => void;
+  let rollbackCalls = 0;
+  let destroyCalls = 0;
+  const connection: FakeConnection = {
+    execute: async () => {
+      executionStarted.resolve();
+      return new Promise<[unknown, unknown]>((_, reject) => {
+        rejectExecution = reject;
+      });
+    },
+    query: async () => [[], []],
+    beginTransaction: async () => {},
+    commit: async () => {},
+    rollback: async () => {
+      rollbackCalls += 1;
+      throw new Error('rollback unavailable');
+    },
+    destroy: () => {
+      destroyCalls += 1;
+      rejectExecution(new Error('query interrupted'));
+    },
+    end: async () => {},
+  };
+  mock.method(mysqlPromise, 'createConnection', async () => connection);
+  t.after(() => mock.restoreAll());
+
+  const h = makeHarness();
+  await h.engine.connect({ name: 'cancelled-rollback', driver: 'mysql', database: 'test' });
+  const controller = new AbortController();
+  const execution = h.engine.exec(
+    {
+      connection: 'cancelled-rollback',
+      sql: 'INSERT INTO users (id) VALUES (?)',
+      params: [1],
+      allowWrite: true,
+      way: 'cli',
+    },
+    controller.signal,
+  );
+  await executionStarted.promise;
+  controller.abort(new Error('query timeout'));
+
+  await assert.rejects(
+    execution,
+    (error: unknown) => {
+      return (
+        error instanceof DbConnectorError &&
+        error.code === ErrorCode.Timeout &&
+        /transaction outcome is unknown because rollback failed/i.test(error.message)
+      );
+    },
+  );
+  assert.equal(rollbackCalls, 1);
+  assert.equal(destroyCalls, 1);
+});
+
 test('MysqlDriver uses the URI host and port for mysql2 connections', async (t) => {
   let target: { host: unknown; port: unknown } | undefined;
   mock.method(net, 'connect', (...args: unknown[]) => {
