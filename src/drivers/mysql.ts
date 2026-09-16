@@ -162,22 +162,24 @@ export class MysqlDriver implements DriverApi {
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
-      const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true }).catch(
-        async (err) => {
-          try {
-            await conn.query('ROLLBACK');
-          } catch (rollbackErr) {
-            throw new MysqlRollbackFailure(err, rollbackErr);
-          }
-          throw err;
-        },
-      );
+      let rows: unknown;
+      let fields: unknown;
+      try {
+        [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
+      } catch (err) {
+        try {
+          await conn.query('ROLLBACK');
+        } catch (rollbackErr) {
+          throw new MysqlRollbackFailure(err, rollbackErr);
+        }
+        throw err;
+      }
       try {
         await conn.query('ROLLBACK');
-        return { rows, fields };
       } catch (rollbackErr) {
         throw new MysqlRollbackFailure(undefined, rollbackErr);
       }
+      return { rows, fields };
     }, signal);
     return outcomeOf(result as MysqlReadResult);
   }
