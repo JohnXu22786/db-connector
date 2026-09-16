@@ -113,6 +113,7 @@ export class Connectors {
   async open(
     name: string,
     resolveCredentials?: ResolveCredentials,
+    signal?: AbortSignal,
   ): Promise<DriverApi> {
     const rec = this.map.get(name);
     if (!rec) {
@@ -122,17 +123,24 @@ export class Connectors {
       );
     }
     if (rec.closing) throw this.connectionClosingError(name);
+    if (signal?.aborted) throw cancelError(signal);
     if (rec.driver) {
       const driver = rec.driver;
-      const opening = rec.opening ?? (rec.opening = driver.connect().then(
-        () => driver,
+      const opening = rec.opening ?? (rec.opening = driver.connect(signal).then(
+        () => {
+          if (signal?.aborted) {
+            void driver.close().catch(() => {});
+            throw cancelError(signal);
+          }
+          return driver;
+        },
         (error) => {
           rec.status = 'defined';
-          throw error;
+          throw signal?.aborted ? cancelError(signal) : error;
         },
       ));
       try {
-        await this.waitForOpen(rec, opening);
+        await this.waitForOpen(rec, opening, signal);
         if (rec.closing) throw this.connectionClosingError(name);
       } finally {
         if (rec.opening === opening) rec.opening = null;
@@ -142,7 +150,7 @@ export class Connectors {
       return driver;
     }
     if (rec.opening) {
-      const driver = await this.waitForOpen(rec, rec.opening);
+      const driver = await this.waitForOpen(rec, rec.opening, signal);
       if (rec.closing) throw this.connectionClosingError(name);
       return driver;
     }
@@ -154,10 +162,14 @@ export class Connectors {
       }
       const driver = this.buildDriver(spec);
       try {
-        await driver.connect();
+        await driver.connect(signal);
+        if (signal?.aborted) {
+          void driver.close().catch(() => {});
+          throw cancelError(signal);
+        }
       } catch (err) {
         rec.opening = null;
-        throw err;
+        throw signal?.aborted ? cancelError(signal) : err;
       }
       rec.driver = driver;
       rec.status = 'connected';
@@ -169,7 +181,7 @@ export class Connectors {
     rec.opening = opening;
 
     try {
-      const driver = await this.waitForOpen(rec, opening);
+      const driver = await this.waitForOpen(rec, opening, signal);
       if (rec.closing) throw this.connectionClosingError(name);
       return driver;
     } finally {
@@ -180,26 +192,37 @@ export class Connectors {
   private async waitForOpen(
     rec: ConnectorRecord,
     opening: Promise<DriverApi>,
+    signal?: AbortSignal,
   ): Promise<DriverApi> {
     if (rec.closing) throw this.connectionClosingError(rec.spec.name);
+    if (signal?.aborted) throw cancelError(signal);
     return new Promise<DriverApi>((resolve, reject) => {
-      const cancel = () => {
-        if (!rec.openWaiters.delete(cancel)) return;
-        reject(this.connectionClosingError(rec.spec.name));
+      let settled = false;
+      const cleanup = () => {
+        rec.openWaiters.delete(cancel);
+        signal?.removeEventListener('abort', onAbort);
       };
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback();
+      };
+      const cancel = () => {
+        finish(() => reject(this.connectionClosingError(rec.spec.name)));
+      };
+      const onAbort = () => finish(() => reject(cancelError(signal!)));
       rec.openWaiters.add(cancel);
+      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       opening.then(
         (driver) => {
-          if (!rec.openWaiters.delete(cancel)) return;
-          if (rec.closing) {
-            reject(this.connectionClosingError(rec.spec.name));
-          } else {
-            resolve(driver);
-          }
+          finish(() => {
+            if (rec.closing) reject(this.connectionClosingError(rec.spec.name));
+            else resolve(driver);
+          });
         },
         (error) => {
-          if (!rec.openWaiters.delete(cancel)) return;
-          reject(error);
+          finish(() => reject(error));
         },
       );
     });
@@ -297,4 +320,13 @@ export class Connectors {
       executions: rec.executions,
     };
   }
+}
+
+function cancelError(signal: AbortSignal): DbConnectorError {
+  const reason = signal.reason;
+  const isTimeout = reason instanceof Error && /timeout/i.test(reason.message);
+  return new DbConnectorError(
+    isTimeout ? ErrorCode.Timeout : ErrorCode.Cancelled,
+    isTimeout ? 'connection exceeded its time limit' : 'connection was cancelled',
+  );
 }

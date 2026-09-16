@@ -4,7 +4,7 @@
 
 import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
-import { ErrorCode } from '../dist/errors.js';
+import { DbConnectorError, ErrorCode } from '../dist/errors.js';
 import type { DriverApi } from '../dist/drivers/driver.js';
 import { freshSignal, makeHarness, type Harness } from './helpers.ts';
 
@@ -31,6 +31,117 @@ function emptyDriver(overrides: Partial<DriverApi> = {}): DriverApi {
     ...overrides,
   };
 }
+
+function connectAbortError(signal: AbortSignal): DbConnectorError {
+  const isTimeout = signal.reason instanceof Error && /timeout/i.test(signal.reason.message);
+  return new DbConnectorError(
+    isTimeout ? ErrorCode.Timeout : ErrorCode.Cancelled,
+    isTimeout ? 'connection exceeded its time limit' : 'connection was cancelled',
+  );
+}
+
+function waitForConnectAbort(signal: AbortSignal | undefined): Promise<never> {
+  if (!signal) return Promise.reject(new Error('connect signal missing'));
+  if (signal.aborted) return Promise.reject(connectAbortError(signal));
+  return new Promise<never>((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(connectAbortError(signal)), { once: true });
+  });
+}
+
+test('lazy query applies its timeout while opening the connection', async () => {
+  const h = makeHarness();
+  const keepAlive = setTimeout(() => {}, 1000);
+  let receivedSignal: AbortSignal | undefined;
+  installDriver(h, emptyDriver({
+    connect: async (signal) => {
+      receivedSignal = signal;
+      await waitForConnectAbort(signal);
+    },
+  }));
+  h.connectors.define({ name: 'slow-query-open', driver: 'sqlite' });
+
+  try {
+    await assert.rejects(
+      h.engine.query(
+        { connection: 'slow-query-open', sql: 'SELECT 1', timeoutMs: 20, way: 'cli' },
+        freshSignal(),
+      ),
+      (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Timeout,
+    );
+    assert.ok(receivedSignal);
+    assert.equal(receivedSignal.aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+test('lazy exec applies caller cancellation while opening the connection', async () => {
+  const h = makeHarness();
+  const keepAlive = setTimeout(() => {}, 1000);
+  let receivedSignal: AbortSignal | undefined;
+  let resolveConnectStarted!: () => void;
+  const connectStarted = new Promise<void>((resolve) => {
+    resolveConnectStarted = resolve;
+  });
+  installDriver(h, emptyDriver({
+    connect: async (signal) => {
+      receivedSignal = signal;
+      resolveConnectStarted();
+      await waitForConnectAbort(signal);
+    },
+  }));
+  h.connectors.define({ name: 'cancelled-exec-open', driver: 'sqlite' });
+  const controller = new AbortController();
+  const execution = h.engine.exec(
+    {
+      connection: 'cancelled-exec-open',
+      sql: 'UPDATE items SET value = 1',
+      allowWrite: true,
+      way: 'cli',
+    },
+    controller.signal,
+  );
+
+  try {
+    await connectStarted;
+    controller.abort();
+    await assert.rejects(
+      execution,
+      (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Cancelled,
+    );
+    assert.ok(receivedSignal);
+    assert.equal(receivedSignal.aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
+
+test('lazy schema applies its timeout while opening the connection', async () => {
+  const h = makeHarness();
+  const keepAlive = setTimeout(() => {}, 1000);
+  let receivedSignal: AbortSignal | undefined;
+  installDriver(h, emptyDriver({
+    connect: async (signal) => {
+      receivedSignal = signal;
+      await waitForConnectAbort(signal);
+    },
+  }));
+  h.connectors.define({ name: 'slow-schema-open', driver: 'sqlite' });
+
+  try {
+    await assert.rejects(
+      h.engine.schema(
+        { connection: 'slow-schema-open', timeoutMs: 20, way: 'cli' },
+        freshSignal(),
+      ),
+      (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Timeout,
+    );
+    assert.ok(receivedSignal);
+    assert.equal(receivedSignal.aborted, true);
+  } finally {
+    clearTimeout(keepAlive);
+  }
+});
 
 test('invalid query validation is audited', async () => {
   const h = makeHarness();

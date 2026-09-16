@@ -55,7 +55,7 @@ export class MysqlDriver implements DriverApi {
     private readonly logger: DriverLogger,
   ) {}
 
-  async connect(): Promise<void> {
+  async connect(signal?: AbortSignal): Promise<void> {
     await this.lifecycleMutex.runExclusive(async () => {
       if (this.closed) {
         throw new DbConnectorError(
@@ -66,25 +66,31 @@ export class MysqlDriver implements DriverApi {
       if (this.conn) return;
       const { createConnection } = await loadMysqlModule();
       const hasConnectionString = Boolean(this.spec.connectionString);
-      const conn = await createConnection({
-        host: hasConnectionString ? undefined : this.spec.host ?? 'localhost',
-        port: hasConnectionString ? undefined : this.spec.port ?? 3306,
-        user: this.spec.user,
-        password: this.spec.password || undefined,
-        database: this.spec.database || undefined,
-        uri: this.spec.connectionString,
-        ssl: normalizeSsl(this.spec.ssl),
-        connectTimeout: 10000,
-        ...this.spec.options,
-      });
+      const conn = await runAbortable(
+        () => createConnection({
+          host: hasConnectionString ? undefined : this.spec.host ?? 'localhost',
+          port: hasConnectionString ? undefined : this.spec.port ?? 3306,
+          user: this.spec.user,
+          password: this.spec.password || undefined,
+          database: this.spec.database || undefined,
+          uri: this.spec.connectionString,
+          ssl: normalizeSsl(this.spec.ssl),
+          connectTimeout: 10000,
+          ...this.spec.options,
+        }),
+        signal,
+        () => {},
+        (lateConn) => lateConn.destroy(),
+      );
       try {
-        await conn.query('SELECT 1');
+        await runAbortable(() => conn.query('SELECT 1'), signal, () => conn.destroy());
+        if (signal?.aborted) throw cancelError(signal);
       } catch (err) {
         conn.destroy();
         throw toConnectorError(this.spec, err);
       }
       this.conn = conn;
-    });
+    }, signal ? { signal, onAbort: () => cancelError(signal) } : undefined);
   }
 
   private ensure(): MysqlConnection {
@@ -324,6 +330,69 @@ function outcomeOf(result: MysqlReadResult): ReadOutcome {
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
   if (ssl === undefined || ssl === null) return undefined;
   return ssl;
+}
+
+function runAbortable<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+  onLateResolve?: (value: T) => void,
+): Promise<T> {
+  if (!signal) return operation();
+  if (signal.aborted) {
+    try {
+      onAbort();
+    } catch {
+      // Cancellation still wins if cleanup itself fails.
+    }
+    return Promise.reject(cancelError(signal));
+  }
+
+  let pending: Promise<T>;
+  try {
+    pending = operation();
+  } catch (err) {
+    return Promise.reject(err);
+  }
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener('abort', onSignalAbort);
+    const onSignalAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        onAbort();
+      } catch {
+        // Cancellation still wins if cleanup itself fails.
+      }
+      reject(cancelError(signal));
+    };
+
+    signal.addEventListener('abort', onSignalAbort, { once: true });
+    pending.then(
+      (value) => {
+        if (settled) {
+          try {
+            onLateResolve?.(value);
+          } catch {
+            // A late cleanup failure cannot change the already returned error.
+          }
+          return;
+        }
+        settled = true;
+        cleanup();
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      },
+    );
+    if (signal.aborted) onSignalAbort();
+  });
 }
 
 function databaseFromConnectionString(connectionString: string | undefined): string | undefined {
