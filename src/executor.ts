@@ -315,8 +315,12 @@ export class ExecutionEngine {
 
     try {
       if (readLike) {
-        const outcome = await driver.read(bound.sql, bound.values, deadline.signal);
         const limit = this.effectiveLimit(undefined);
+        const guarded =
+          classification.kind === 'select'
+            ? ensureSelectLimit(bound.sql, limit, driverKind)
+            : { sql: bound.sql, applied: false };
+        const outcome = await driver.read(guarded.sql, bound.values, deadline.signal);
         const { rows } = capRows(outcome.rows, limit);
         this.connectors.touch(opts.connection);
         const auditId = await this.auditOk({

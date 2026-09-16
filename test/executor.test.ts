@@ -212,6 +212,27 @@ test('failed SELECT and EXPLAIN through exec are reported and audited as reads',
   }
 });
 
+test('read-like exec applies the server-side result limit before reading', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedSql: string | undefined;
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      receivedSql = sql;
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-read-exec', driver: 'sqlite' });
+
+  const result = await h.engine.exec(
+    { connection: 'bounded-read-exec', sql: 'SELECT id FROM items', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 2');
+  assert.equal(result.kind, 'read');
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+});
+
 test('failed schema introspection is audited', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({
