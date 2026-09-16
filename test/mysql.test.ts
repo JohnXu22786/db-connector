@@ -223,7 +223,10 @@ test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
   const failedConnection: FakeConnection = {
     execute: async () => {
       failedExecuteCalls += 1;
-      throw new Error('connection lost');
+      throw Object.assign(new Error('connection lost'), {
+        code: 'PROTOCOL_CONNECTION_LOST',
+        fatal: true,
+      });
     },
     query: async () => [[], []],
     beginTransaction: async () => {},
@@ -273,6 +276,68 @@ test('MysqlDriver reconnects after a non-abort query failure', async (t) => {
   assert.equal(createCalls, 2);
   assert.deepEqual(result.columns, ['id']);
   assert.deepEqual(result.rows, [[2]]);
+  await driver.close();
+});
+
+test('MysqlDriver reuses a connection after a nonfatal statement error', async () => {
+  let executeCalls = 0;
+  let beginCalls = 0;
+  let rollbackCalls = 0;
+  let commitCalls = 0;
+  let destroyCalls = 0;
+  const connection: FakeConnection = {
+    execute: async () => {
+      executeCalls += 1;
+      if (executeCalls === 1) {
+        throw Object.assign(new Error('duplicate entry'), {
+          code: 'ER_DUP_ENTRY',
+          errno: 1062,
+          sqlState: '23000',
+          fatal: false,
+        });
+      }
+      return [{ affectedRows: 1 }, []];
+    },
+    query: async () => [[], []],
+    beginTransaction: async () => {
+      beginCalls += 1;
+    },
+    commit: async () => {
+      commitCalls += 1;
+    },
+    rollback: async () => {
+      rollbackCalls += 1;
+    },
+    destroy: () => {
+      destroyCalls += 1;
+    },
+    end: async () => {},
+  };
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'recoverable-query', driver: 'mysql', database: 'test' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+  (driver as unknown as { conn: FakeConnection | null }).conn = connection;
+
+  await assert.rejects(
+    () => driver.write('INSERT INTO users (id) VALUES (?)', [1], false, new AbortController().signal),
+    (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.QueryFailed,
+  );
+  const result = await driver.write(
+    'INSERT INTO users (id) VALUES (?)',
+    [2],
+    false,
+    new AbortController().signal,
+  );
+
+  assert.equal(executeCalls, 2);
+  assert.equal(beginCalls, 2);
+  assert.equal(rollbackCalls, 1);
+  assert.equal(commitCalls, 1);
+  assert.equal(destroyCalls, 0);
+  assert.equal((driver as unknown as { conn: FakeConnection | null }).conn, connection);
+  assert.deepEqual(result, { affectedRows: 1, isDdl: false });
+
   await driver.close();
 });
 

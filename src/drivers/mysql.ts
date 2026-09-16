@@ -97,7 +97,7 @@ export class MysqlDriver implements DriverApi {
     return this.conn;
   }
 
-  /** Run a query, rejecting (and destroying the connection) on abort. */
+  /** Run a query, destroying the connection only on abort or fatal errors. */
   private run(
     fn: (conn: MysqlConnection) => Promise<unknown>,
     signal: AbortSignal,
@@ -125,7 +125,7 @@ export class MysqlDriver implements DriverApi {
             if (settled) return;
             settled = true;
             cleanup();
-            if (!abortError) {
+            if (!abortError && isFatalMysqlError(err)) {
               if (this.conn === conn) this.conn = null;
               destroy();
             }
@@ -342,6 +342,14 @@ function cancelError(signal: AbortSignal): DbConnectorError {
   return new DbConnectorError(
     isTimeout ? ErrorCode.Timeout : ErrorCode.Cancelled,
     isTimeout ? `query exceeded its time limit` : 'execution was cancelled',
+  );
+}
+
+function isFatalMysqlError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { fatal?: unknown }).fatal === true
   );
 }
 
