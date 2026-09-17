@@ -343,6 +343,14 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit places the MySQL guard before # comments', () => {
+  const sql = 'SELECT * FROM t # trailing comment';
+  assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
+    sql: 'SELECT * FROM t LIMIT 10 # trailing comment',
+    applied: true,
+  });
+});
+
 test('ensureSelectLimit recognizes PostgreSQL FETCH FIRST/NEXT row limits', () => {
   for (const clause of ['FETCH FIRST 5 ROWS ONLY', 'FETCH NEXT 5 ROWS ONLY']) {
     const sql = `SELECT id FROM t ${clause}`;
