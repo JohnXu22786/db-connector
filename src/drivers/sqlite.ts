@@ -61,6 +61,7 @@ export class SqliteDriver implements DriverApi {
   private operationActive = false;
   private readonly operationQueue: QueuedOperation[] = [];
   private closed = false;
+  private connecting: Promise<void> | null = null;
   private seq = 0;
   private readonly pending = new Map<
     number,
@@ -338,9 +339,17 @@ export class SqliteDriver implements DriverApi {
   }
 
   async connect(): Promise<void> {
+    if (this.connecting && !this.closed) return this.connecting;
     if (this.child && !this.closed) return;
     // Verify the database opens and is queryable; surface failures loudly.
-    await this.request('query', new AbortController().signal, { sql: 'SELECT 1' });
+    const validation = this.request('query', new AbortController().signal, { sql: 'SELECT 1' });
+    const connecting = validation.then(() => undefined);
+    this.connecting = connecting;
+    try {
+      await this.connecting;
+    } finally {
+      if (this.connecting === connecting) this.connecting = null;
+    }
   }
 
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
