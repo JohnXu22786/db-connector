@@ -281,6 +281,12 @@ test('PostgreSQL FETCH row-limit placeholders remain positional parameters', () 
       },
     );
   }
+
+  const orderBy = 'SELECT id FROM t ORDER BY ? NULLS FIRST';
+  assert.deepEqual(toDollarPlaceholders(orderBy, 'postgres'), {
+    sql: 'SELECT id FROM t ORDER BY $1 NULLS FIRST',
+    count: 1,
+  });
 });
 
 test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESCAPE', () => {
@@ -295,11 +301,15 @@ test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESC
 
 test('PostgreSQL JSONB operators accept keyword operands', () => {
   for (const operand of [
-    'first', 'row', 'rows', 'filter', 'over', 'escape', 'between', 'by', 'values', 'partition',
+    'limit', 'returning', 'first', 'row', 'rows', 'filter', 'over', 'escape', 'between', 'by',
+    'values', 'partition',
   ]) {
     const sql = `SELECT payload ? ${operand} FROM t`;
     assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 }, operand);
   }
+
+  const bareKeyword = "SELECT first ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(bareKeyword, 'postgres'), { sql: bareKeyword, count: 0 });
 
   const qualified = "SELECT t.where ? 'key' FROM t";
   assert.deepEqual(toDollarPlaceholders(qualified, 'postgres'), { sql: qualified, count: 0 });

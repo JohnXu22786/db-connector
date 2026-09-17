@@ -320,36 +320,58 @@ function markQuestionOperators(tokens: Token[]): void {
       ? tokens[meaningfulIndexes[leftIndex - 1]!]
       : undefined;
 
-    if (isExpressionEnd(left, leftPrevious) && isExpressionStart(right)) {
+    if (
+      !isFetchRowLimitParameter(tokens, meaningfulIndexes, i) &&
+      !isByClauseParameter(tokens, meaningfulIndexes, i) &&
+      isExpressionEnd(left, leftPrevious) &&
+      isExpressionStart(right)
+    ) {
       token.type = 'symbol';
     }
   }
 }
 
 const QUESTION_OPERATOR_BOUNDARIES = new Set([
-  'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
-  'FIRST', 'NEXT', 'ROW', 'ROWS',
-  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO', 'VALUES', 'SET',
-  'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'AND', 'OR', 'NOT', 'IS',
-  'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO', 'ESCAPE', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
-  'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS', 'WHEN', 'THEN', 'ELSE',
-  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'FILTER', 'PARTITION',
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO',
+  'AND', 'OR', 'NOT', 'IS', 'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO',
+  'AS', 'ON', 'USING', 'JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
+  'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'COLLATE',
   'WINDOW',
 ]);
 
 /**
  * PostgreSQL permits non-reserved keywords as bare column names. Keep only
  * reserved/type-function keywords as unconditional expression-start
- * boundaries; the broader set above is still needed on the left of a
- * parameter because those words can introduce clauses such as BETWEEN.
+ * boundaries. Clause-specific checks above preserve parameters in FETCH and
+ * GROUP/ORDER/PARTITION BY forms without rejecting keyword operands.
  */
 const QUESTION_OPERATOR_START_BOUNDARIES = new Set([
-  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
-  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO',
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'INTO',
   'AND', 'OR', 'NOT', 'IS', 'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO',
   'AS', 'ON', 'USING', 'JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
   'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'COLLATE', 'WINDOW',
 ]);
+
+function isFetchRowLimitParameter(tokens: Token[], indexes: number[], index: number): boolean {
+  const fetch = index >= 2 ? tokens[indexes[index - 2]!] : undefined;
+  const direction = index >= 1 ? tokens[indexes[index - 1]!] : undefined;
+  const row = index + 1 < indexes.length ? tokens[indexes[index + 1]!] : undefined;
+  const only = index + 2 < indexes.length ? tokens[indexes[index + 2]!] : undefined;
+  return fetch?.type === 'word' && fetch.value.toUpperCase() === 'FETCH' &&
+    direction?.type === 'word' && ['FIRST', 'NEXT'].includes(direction.value.toUpperCase()) &&
+    row?.type === 'word' && ['ROW', 'ROWS'].includes(row.value.toUpperCase()) &&
+    only?.type === 'word' && only.value.toUpperCase() === 'ONLY';
+}
+
+function isByClauseParameter(tokens: Token[], indexes: number[], index: number): boolean {
+  if (index < 2) return false;
+  const by = tokens[indexes[index - 1]!];
+  const clause = tokens[indexes[index - 2]!];
+  return by?.type === 'word' && by.value.toUpperCase() === 'BY' &&
+    clause?.type === 'word' && ['GROUP', 'ORDER', 'PARTITION'].includes(clause.value.toUpperCase());
+}
 
 function isExpressionEnd(token: Token | undefined, previous?: Token): boolean {
   if (!token) return false;
