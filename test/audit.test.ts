@@ -266,6 +266,22 @@ test('tolerates a malformed line in the middle of the log', async () => {
   assert.equal(recs.length, 2);
 });
 
+test('ignores valid JSON values that are not audit records', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'db-connector-audit-'));
+  const path = join(dir, 'audit.jsonl');
+  const log = new AuditLog(path);
+  await writeFile(path, 'null\n[]\n"not-record"\n42\n{}\n');
+  await log.append(input({ connection: 'valid' }));
+
+  const records = await log.query({});
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.connection, 'valid');
+
+  const filtered = await log.query({ connection: 'valid' });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0]!.connection, 'valid');
+});
+
 test('an append failure never throws and does not poison later attempts', async () => {
   // Point the log at a directory: every append fails with EISDIR.
   const dir = mkdtempSync(join(tmpdir(), 'db-connector-audit-'));
