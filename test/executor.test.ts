@@ -338,3 +338,27 @@ test("executor binds markers using PostgreSQL E'...' strings", async () => {
     params: [42],
   });
 });
+
+test('server VALUES guards preserve exact-limit truncation', async () => {
+  const h = makeHarness();
+  let received: string | undefined;
+  installDriver(h, emptyDriver({
+    kind: 'postgres',
+    read: async (sql) => {
+      received = sql;
+      return { columns: ['value'], rows: [[1]], rowCount: 1 };
+    },
+  }));
+  h.connectors.define({ name: 'postgres-values', driver: 'postgres', database: 'test' });
+
+  const result = await h.engine.query({
+    connection: 'postgres-values',
+    sql: 'VALUES (1)',
+    limit: 1,
+    way: 'cli',
+  }, freshSignal());
+
+  assert.equal(received, 'VALUES (1) LIMIT 1');
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.rows, [[1]]);
+});

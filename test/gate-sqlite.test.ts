@@ -31,6 +31,21 @@ test('db query returns columns, JSON-safe rows, and an audit id', async () => {
   assert.ok(result.durationMs >= 0);
 });
 
+test('SQLite compounds ending in VALUES execute without an appended LIMIT', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    {
+      connection: 'sample',
+      sql: 'SELECT 0 UNION ALL VALUES (1)',
+      limit: 1,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [[0]]);
+  assert.equal(result.truncated, true);
+});
+
 test('empty query results retain column metadata', async () => {
   const h = await setup();
   const result = await h.engine.query(

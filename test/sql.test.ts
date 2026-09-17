@@ -327,6 +327,16 @@ test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
   const values = ensureSelectLimit('VALUES (1), (2)', 1, 'sqlite');
   assert.equal(values.applied, false);
   assert.equal(values.sql, 'VALUES (1), (2)');
+
+  const compound = ensureSelectLimit('SELECT 0 UNION ALL VALUES (1)', 1, 'sqlite');
+  assert.equal(compound.applied, false);
+  assert.equal(compound.sql, 'SELECT 0 UNION ALL VALUES (1)');
+
+  for (const driver of ['postgres', 'mysql'] as const) {
+    const serverValues = ensureSelectLimit('VALUES (1), (2)', 1, driver);
+    assert.equal(serverValues.applied, true);
+    assert.equal(serverValues.sql, 'VALUES (1), (2) LIMIT 1');
+  }
 });
 
 test('normalizeText strips comments and collapses whitespace', () => {
