@@ -236,8 +236,12 @@ function decodeCsv(text: string): unknown[] {
 }
 
 function flagNumber(flags: Record<string, string | boolean>, key: string): number | undefined {
-  const v = flagStr(flags, key);
-  if (v === undefined) return undefined;
+  const raw = flags[key];
+  if (raw === undefined) return undefined;
+  if (raw === true) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, `"${key}" must be a number`);
+  }
+  const v = raw;
   const n = Number(v);
   if (!Number.isFinite(n)) {
     throw new DbConnectorError(ErrorCode.InvalidArgs, `"${key}" must be a number`);
