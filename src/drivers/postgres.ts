@@ -48,6 +48,7 @@ interface PgQueryable {
 interface PgClientLike extends PgQueryable {
   activeQuery?: PgQueryHandle;
   _activeQuery?: PgQueryHandle;
+  _pipelineInFlight?: boolean;
   pipeline?: boolean;
   host?: string;
   port?: number;
@@ -55,6 +56,9 @@ interface PgClientLike extends PgQueryable {
   sslNegotiation?: string;
   processID?: number | null;
   secretKey?: number | null;
+  native?: {
+    cancel(callback: (err?: unknown) => void): unknown;
+  };
   connection?: PgConnectionLike;
   cancel(...args: unknown[]): unknown;
   connect(): Promise<void>;
@@ -212,7 +216,15 @@ export class PgDriver implements DriverApi {
     try {
       // Server-side read-only backstop: even a statement that slips past the
       // classifier cannot mutate data inside a READ ONLY transaction.
-      await client.query('BEGIN TRANSACTION READ ONLY');
+      await queryWithCancellation(
+        client,
+        this.clientConstructor!,
+        this.queryConstructor!,
+        this.clientConfig!,
+        { text: 'BEGIN TRANSACTION READ ONLY' },
+        signal,
+        (err) => this.invalidateClient(client, err),
+      );
       try {
         const result = await queryWithCancellation(
           client,
@@ -223,17 +235,34 @@ export class PgDriver implements DriverApi {
           signal,
           (err) => this.invalidateClient(client, err),
         );
-        await client.query('ROLLBACK');
+        await queryWithCancellation(
+          client,
+          this.clientConstructor!,
+          this.queryConstructor!,
+          this.clientConfig!,
+          { text: 'ROLLBACK' },
+          signal,
+          (err) => this.invalidateClient(client, err),
+        );
         return outcomeOf(result as unknown as PgArrayQueryResult);
       } catch (err) {
-        if (isCancellationFailure(err)) {
+        if (isCancellationFailure(err) || signal.aborted) {
           this.invalidateClient(client, err);
         } else {
-          await client.query('ROLLBACK').catch(() => {});
+          await queryWithCancellation(
+            client,
+            this.clientConstructor!,
+            this.queryConstructor!,
+            this.clientConfig!,
+            { text: 'ROLLBACK' },
+            signal,
+            (rollbackErr) => this.invalidateClient(client, rollbackErr),
+          ).catch(() => {});
         }
         throw err;
       }
     } catch (err) {
+      if (signal.aborted) this.invalidateClient(client, err);
       throw toConnectorError(this.spec, err);
     }
   }
@@ -270,7 +299,15 @@ export class PgDriver implements DriverApi {
         return { affectedRows: result.rowCount ?? 0, isDdl };
       }
 
-      await client.query('BEGIN');
+      await queryWithCancellation(
+        client,
+        this.clientConstructor!,
+        this.queryConstructor!,
+        this.clientConfig!,
+        { text: 'BEGIN' },
+        signal,
+        (err) => this.invalidateClient(client, err),
+      );
       try {
         const result = await queryWithCancellation(
           client,
@@ -293,14 +330,23 @@ export class PgDriver implements DriverApi {
         );
         return { affectedRows: result.rowCount ?? 0, isDdl };
       } catch (err) {
-        if (isCancellationFailure(err)) {
+        if (isCancellationFailure(err) || signal.aborted) {
           this.invalidateClient(client, err);
         } else {
-          await client.query('ROLLBACK').catch(() => {});
+          await queryWithCancellation(
+            client,
+            this.clientConstructor!,
+            this.queryConstructor!,
+            this.clientConfig!,
+            { text: 'ROLLBACK' },
+            signal,
+            (rollbackErr) => this.invalidateClient(client, rollbackErr),
+          ).catch(() => {});
         }
         throw err;
       }
     } catch (err) {
+      if (signal.aborted) this.invalidateClient(client, err);
       throw toConnectorError(this.spec, err);
     }
   }
@@ -436,56 +482,118 @@ function cancelQuery(
   onError: (err: unknown) => void,
 ): () => void {
   if (client.cancel.length <= 1) {
-    client.cancel(query);
+    if (client.pipeline && client._pipelineInFlight && client.native?.cancel) {
+      try {
+        const result = client.native.cancel((err) => {
+          if (err) onError(err);
+        });
+        if (isThenable(result)) void result.then(undefined, onError);
+      } catch (err) {
+        onError(err);
+      }
+    } else {
+      client.cancel(query);
+    }
     return () => {};
   }
 
   const cancelClient = new Client({ ...clientConfig });
   const connection = cancelClient.connection;
+  if (!connection?.cancel) {
+    throw new Error('pg cancellation connection does not support cancellation');
+  }
   const sources: PgEventSource[] = [];
   const cancelClientEvents = cancelClient as unknown as PgEventSource;
   if (typeof cancelClientEvents.on === 'function') sources.push(cancelClientEvents);
-  if (connection) sources.push(connection);
+  if (typeof connection.on === 'function') sources.push(connection);
+
+  let closed = false;
+  let cancelSent = false;
+  const transportListeners: Array<{
+    source: PgEventSource;
+    event: string;
+    listener: PgEventListener;
+  }> = [];
+  const removeTransportListeners = () => {
+    for (const { source, event, listener } of transportListeners) {
+      source.removeListener?.(event, listener);
+    }
+    transportListeners.length = 0;
+  };
+  const addTransportListener = (
+    source: PgEventSource,
+    event: string,
+    listener: PgEventListener,
+  ) => {
+    source.on(event, listener);
+    transportListeners.push({ source, event, listener });
+  };
 
   const listeners = sources.map((source) => {
-    const listener: PgEventListener = (err) => onError(err);
+    const listener: PgEventListener = (err) => reportError(err);
     source.on('error', listener);
     return { source, listener };
   });
-  const cleanup = () => {
+
+  const removeErrorListeners = () => {
     for (const { source, listener } of listeners) {
       source.removeListener?.('error', listener);
     }
   };
 
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    removeTransportListeners();
+    try {
+      const ending = cancelClient.end();
+      if (isThenable(ending)) {
+        void ending.then(removeErrorListeners, removeErrorListeners);
+      } else {
+        removeErrorListeners();
+      }
+    } catch {
+      removeErrorListeners();
+    }
+  };
+  const reportError = (err: unknown) => {
+    close();
+    onError(err);
+  };
+  const cleanup = () => close();
+  const sendCancel = () => {
+    if (closed || cancelSent) return;
+    try {
+      if (client.processID == null || client.secretKey == null) {
+        throw new Error('pg client did not expose cancellation credentials');
+      }
+      connection.cancel!(client.processID, client.secretKey);
+      cancelSent = true;
+      close();
+    } catch (err) {
+      reportError(err);
+    }
+  };
+
   try {
     if (cancelClient.ssl) {
-      if (!connection?.cancel) {
-        throw new Error('pg cancellation connection does not support TLS cancellation');
-      }
       const sslNegotiation = cancelClient.sslNegotiation ?? connection.sslNegotiation ?? 'postgres';
       if (sslNegotiation !== 'direct' && !connection.requestSsl) {
         throw new Error('pg cancellation connection does not support TLS cancellation');
       }
       const onConnect: PgEventListener = () => {
+        if (closed) return;
         try {
           if (sslNegotiation !== 'direct') connection.requestSsl!();
         } catch (err) {
-          onError(err);
+          reportError(err);
         }
       };
       const onSslConnect: PgEventListener = () => {
-        try {
-          if (client.processID == null || client.secretKey == null) {
-            throw new Error('pg client did not expose cancellation credentials');
-          }
-          connection.cancel!(client.processID, client.secretKey);
-        } catch (err) {
-          onError(err);
-        }
+        sendCancel();
       };
-      if (sslNegotiation !== 'direct') connection.on('connect', onConnect);
-      connection.on('sslconnect', onSslConnect);
+      if (sslNegotiation !== 'direct') addTransportListener(connection, 'connect', onConnect);
+      addTransportListener(connection, 'sslconnect', onSslConnect);
       const port = cancelClient.port ?? client.port ?? 5432;
       const host = cancelClient.host ?? client.host;
       if (host?.startsWith('/')) {
@@ -494,11 +602,18 @@ function cancelQuery(
         connection.connect(port, host);
       }
     } else {
-      const result = cancelClient.cancel(client, query);
-      if (isThenable(result)) void result.then(undefined, onError);
+      const onConnect: PgEventListener = () => sendCancel();
+      addTransportListener(connection, 'connect', onConnect);
+      const port = cancelClient.port ?? client.port ?? 5432;
+      const host = cancelClient.host ?? client.host;
+      if (host?.startsWith('/')) {
+        connection.connect(`${host}/.s.PGSQL.${port}`);
+      } else {
+        connection.connect(port, host);
+      }
     }
   } catch (err) {
-    cleanup();
+    reportError(err);
     throw err;
   }
   return cleanup;
@@ -626,6 +741,7 @@ function queryWithCancellation(
 }
 
 function isActiveQuery(client: PgClientLike, query: PgQueryHandle): boolean {
+  if (client.pipeline && client._pipelineInFlight) return true;
   const privateActiveQuery = client._activeQuery;
   return privateActiveQuery !== undefined
     ? privateActiveQuery === query

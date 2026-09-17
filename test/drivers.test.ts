@@ -734,6 +734,13 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
       if (typeof query === 'string') {
         return { fields: [], rows: [], rowCount: null };
       }
+      const queryConfig = query as { text?: string };
+      if (
+        queryConfig.text === 'BEGIN TRANSACTION READ ONLY' ||
+        queryConfig.text === 'ROLLBACK'
+      ) {
+        return { fields: [], rows: [], rowCount: null };
+      }
       queryConfigs.push(query);
       return results.shift()!;
     },
