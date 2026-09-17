@@ -689,6 +689,36 @@ export function rewriteNamedToPositional(
   return { sql: state.out, order };
 }
 
+function isSqliteParameterWord(tokens: Token[], index: number): boolean {
+  const token = tokens[index];
+  if (token?.type !== 'word') return false;
+
+  const directlyBefore = (previous: Token | undefined, next: Token): boolean =>
+    previous !== undefined && previous.pos + previous.value.length === next.pos;
+  const isParameterPrefix = (candidate: Token | undefined): boolean =>
+    candidate?.type === 'symbol' && (candidate.value === '$' || candidate.value === '@');
+
+  let current = index;
+  while (current >= 0) {
+    const prefix = tokens[current - 1];
+    if (isParameterPrefix(prefix) && directlyBefore(prefix, tokens[current]!)) return true;
+
+    const separator = tokens[current - 1];
+    const name = tokens[current - 2];
+    if (
+      separator?.type !== 'symbol' ||
+      separator.value !== '::' ||
+      !directlyBefore(separator, tokens[current]!) ||
+      name?.type !== 'word' ||
+      !directlyBefore(name, separator)
+    ) {
+      return false;
+    }
+    current -= 2;
+  }
+  return false;
+}
+
 /**
  * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
  * or PostgreSQL FETCH row limit already. Used only as a courtesy guard: the
@@ -706,16 +736,11 @@ export function ensureSelectLimit(
       if (t.type !== 'word' || t.depth !== 0 || !DATA_KEYWORDS.has(t.value.toUpperCase())) {
         return false;
       }
-      const prefix = tokens[index - 1];
-      // SQLite `$name` and `@name` parameters are tokenized as a prefix
-      // symbol followed by a word. Do not mistake `$VALUES`/`@VALUES` for a
+      // SQLite `$name`/`@name` parameters can also have one or more
+      // adjacent `::suffix` segments.
+      // Do not mistake `$VALUES`, `$name::VALUES`, or their `@` forms for a
       // compound query term.
-      return !(
-        driver === 'sqlite' &&
-        prefix?.type === 'symbol' &&
-        (prefix.value === '$' || prefix.value === '@') &&
-        prefix.pos + prefix.value.length === t.pos
-      );
+      return !(driver === 'sqlite' && isSqliteParameterWord(tokens, index));
     },
   );
   // SQLite does not allow LIMIT on a compound whose final term is VALUES.

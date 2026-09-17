@@ -338,6 +338,17 @@ test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
     assert.equal(parameter.sql, `${sql} LIMIT 1`);
   }
 
+  for (const sql of [
+    'SELECT $foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT $foo::bar::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::bar::VALUES FROM (VALUES (1), (2))',
+  ]) {
+    const parameterSuffix = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameterSuffix.applied, true);
+    assert.equal(parameterSuffix.sql, `${sql} LIMIT 1`);
+  }
+
   for (const driver of ['postgres', 'mysql'] as const) {
     const serverValues = ensureSelectLimit('VALUES (1), (2)', 1, driver);
     assert.equal(serverValues.applied, true);
