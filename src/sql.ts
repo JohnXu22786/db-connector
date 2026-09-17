@@ -39,6 +39,8 @@ export interface ScanOptions {
   backslashEscapes?: boolean;
   /** Recognize MySQL comment syntax when options are passed as an object. */
   mysqlComments?: boolean;
+  /** Treat backslashes as escapes inside MySQL executable-comment bodies. */
+  mysqlExecutableBackslashEscapes?: boolean;
   /** Recognize PostgreSQL `E'...'` escape string constants. */
   postgresEscapeStrings?: boolean;
 }
@@ -127,6 +129,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const sqliteBracketIdentifiers = options === 'sqlite';
   const postgresDollarQuotes = !mysqlComments && options !== 'sqlite';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
+  const executableBackslashEscapes = resolvedOptions.mysqlExecutableBackslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
 
   const isIdentStart = (c: string): boolean => /[A-Za-z_\u0080-\uffff]/.test(c);
@@ -171,10 +174,14 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
         const versionStart = i;
         while (i < n && i - versionStart < 5 && /[0-9]/.test(sql[i]!)) i += 1;
         const bodyStart = i;
-        // The connection's SQL mode is not available here. Treat backslashes
-        // as ordinary characters in executable bodies so NO_BACKSLASH_ESCAPES
-        // cannot hide a delimiter or a write from the read-only classifier.
-        const end = findMySqlExecutableCommentEnd(sql, bodyStart, false);
+        // The primary scan uses conservative NO_BACKSLASH_ESCAPES semantics;
+        // classification also reruns with normal MySQL escapes below because
+        // the connection's SQL mode is not available here.
+        const end = findMySqlExecutableCommentEnd(
+          sql,
+          bodyStart,
+          executableBackslashEscapes,
+        );
         const bodyEnd = end === -1 ? n : end;
 
         // MySQL executes the contents of `/*!...*/`; retain the wrapper as
@@ -182,8 +189,9 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
         // preserve the original executable comment text.
         tokens.push({ type: 'symbol', value: sql.slice(at, bodyStart), pos: at, depth });
         for (const token of scan(sql.slice(bodyStart, bodyEnd), {
-          backslashEscapes: false,
+          backslashEscapes: executableBackslashEscapes,
           mysqlComments: true,
+          mysqlExecutableBackslashEscapes: executableBackslashEscapes,
         })) {
           tokens.push({
             ...token,
@@ -379,13 +387,23 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
 }
 
 /** Meaningful tokens: everything except whitespace and comments. */
-function meaningful(sql: string, driver?: DriverKind): Token[] {
-  return scan(sql, driver ?? {}).filter((t) => t.type !== 'space' && t.type !== 'comment');
+function meaningful(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): Token[] {
+  return scan(sql, scanOptions ?? driver ?? {}).filter(
+    (t) => t.type !== 'space' && t.type !== 'comment',
+  );
 }
 
 /** First data-statement keyword at paren depth 0 (WITH/CTE aware). */
-function firstDataKeyword(sql: string, driver?: DriverKind): Token | undefined {
-  const tokens = meaningful(sql, driver);
+function firstDataKeyword(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): Token | undefined {
+  const tokens = meaningful(sql, driver, scanOptions);
   return tokens.find(
     (t) => t.type === 'word' && t.depth === 0 && DATA_KEYWORDS.has(t.value.toUpperCase()),
   );
@@ -401,22 +419,34 @@ const LEADING_READ = new Set([
  * unquoted occurrence is never a plain identifier, and the scanner never
  * emits them from strings, comments, or quoted identifiers.
  */
-function containsWriteKeyword(sql: string, driver?: DriverKind): boolean {
-  return meaningful(sql, driver).some(
+function containsWriteKeyword(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): boolean {
+  return meaningful(sql, driver, scanOptions).some(
     (t) => t.type === 'word' && WRITE_KEYWORDS.has(t.value.toUpperCase()),
   );
 }
 
-function hasTopLevelInto(sql: string, driver?: DriverKind): boolean {
-  return meaningful(sql, driver).some(
+function hasTopLevelInto(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): boolean {
+  return meaningful(sql, driver, scanOptions).some(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'INTO',
   );
 }
 
 /** PostgreSQL's outer SELECT ... INTO creates a table and is therefore DDL. */
-function isPostgresSelectInto(sql: string, driver?: DriverKind): boolean {
-  if (driver !== 'postgres' || !hasTopLevelInto(sql, driver)) return false;
-  return firstDataKeyword(sql, driver)?.value.toUpperCase() === 'SELECT';
+function isPostgresSelectInto(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): boolean {
+  if (driver !== 'postgres' || !hasTopLevelInto(sql, driver, scanOptions)) return false;
+  return firstDataKeyword(sql, driver, scanOptions)?.value.toUpperCase() === 'SELECT';
 }
 
 /**
@@ -426,11 +456,15 @@ function isPostgresSelectInto(sql: string, driver?: DriverKind): boolean {
  * otherwise the first top-level data keyword decides; an unresolved case is
  * treated as a write (conservative: never admitted through a read path).
  */
-function classifyAnalyzed(sql: string, driver?: DriverKind): 'select' | 'write' | 'ddl' {
-  if (isPostgresSelectInto(sql, driver)) return 'ddl';
-  if (hasTopLevelInto(sql, driver)) return 'write';
-  if (containsWriteKeyword(sql, driver)) return 'write';
-  const keyword = firstDataKeyword(sql, driver);
+function classifyAnalyzed(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): 'select' | 'write' | 'ddl' {
+  if (isPostgresSelectInto(sql, driver, scanOptions)) return 'ddl';
+  if (hasTopLevelInto(sql, driver, scanOptions)) return 'write';
+  if (containsWriteKeyword(sql, driver, scanOptions)) return 'write';
+  const keyword = firstDataKeyword(sql, driver, scanOptions);
   const kw = keyword?.value.toUpperCase() ?? '';
   if (kw === 'SELECT' || kw === 'VALUES') return 'select';
   return 'write';
@@ -441,11 +475,17 @@ function classifyAnalyzed(sql: string, driver?: DriverKind): 'select' | 'write' 
  * input; anything unrecognized classifies as `unknown` (conservative — the
  * read-only path rejects it).
  */
-export function classifyStatement(sql: string, driver?: DriverKind): {
+type StatementClassification = {
   kind: 'select' | 'explain' | 'write' | 'ddl' | 'unknown';
   firstWord: string;
-} {
-  const tokens = meaningful(sql, driver);
+};
+
+function classifyStatementWithOptions(
+  sql: string,
+  driver?: DriverKind,
+  scanOptions?: ScanOptions,
+): StatementClassification {
+  const tokens = meaningful(sql, driver, scanOptions);
   const lead = tokens.find((t) => t.type === 'word');
   if (!lead) return { kind: 'unknown', firstWord: '' };
   const word = lead.value.toUpperCase();
@@ -454,7 +494,7 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
     // PostgreSQL SELECT ... INTO creates a table and therefore invalidates
     // the schema cache like other DDL. Other dialects retain write handling
     // for their INTO forms (for example, MySQL INTO OUTFILE/DUMPFILE).
-    const hasInto = word === 'SELECT' && hasTopLevelInto(sql, driver);
+    const hasInto = word === 'SELECT' && hasTopLevelInto(sql, driver, scanOptions);
     if (hasInto) {
       return {
         kind: driver === 'postgres' ? 'ddl' : 'write',
@@ -474,7 +514,12 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
       const hasAnalyze = tokens.some(
         (t) => t.type === 'word' && t.value.toUpperCase() === 'ANALYZE',
       );
-      if (hasAnalyze) return { kind: classifyAnalyzed(sql, driver), firstWord: word };
+      if (hasAnalyze) {
+        return {
+          kind: classifyAnalyzed(sql, driver, scanOptions),
+          firstWord: word,
+        };
+      }
     }
     return { kind: 'explain', firstWord: word };
   }
@@ -484,13 +529,16 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
     // SELECT ... INTO creates a table, while data-modifying CTEs remain writes.
     // Any other top-level INTO or write keyword marks the whole statement a
     // write.
-    if (isPostgresSelectInto(sql, driver)) {
+    if (isPostgresSelectInto(sql, driver, scanOptions)) {
       return { kind: 'ddl', firstWord: word };
     }
-    if (hasTopLevelInto(sql, driver) || containsWriteKeyword(sql, driver)) {
+    if (
+      hasTopLevelInto(sql, driver, scanOptions) ||
+      containsWriteKeyword(sql, driver, scanOptions)
+    ) {
       return { kind: 'write', firstWord: word };
     }
-    const next = firstDataKeyword(sql, driver);
+    const next = firstDataKeyword(sql, driver, scanOptions);
     if (next) return { kind: 'select', firstWord: word };
     return { kind: 'unknown', firstWord: word };
   }
@@ -506,6 +554,34 @@ export function classifyStatement(sql: string, driver?: DriverKind): {
   if (DDL.has(word)) return { kind: 'ddl', firstWord: word };
 
   return { kind: 'unknown', firstWord: word };
+}
+
+export function classifyStatement(sql: string, driver?: DriverKind): StatementClassification {
+  const primary = classifyStatementWithOptions(sql, driver);
+  if (driver !== 'mysql') return primary;
+
+  // A MySQL connection may use either backslash-escape mode. Reclassify with
+  // the alternate executable-comment lexer and keep the more conservative
+  // result so either mode cannot hide a write from the read-only gate.
+  const alternate = classifyStatementWithOptions(sql, driver, {
+    backslashEscapes: true,
+    mysqlComments: true,
+    mysqlExecutableBackslashEscapes: true,
+  });
+  if (alternate.kind === 'write' || alternate.kind === 'ddl') {
+    return {
+      kind: alternate.kind,
+      firstWord: primary.firstWord || alternate.firstWord,
+    };
+  }
+  if (primary.kind === 'write' || primary.kind === 'ddl') return primary;
+  if (primary.kind === 'unknown' || alternate.kind === 'unknown') {
+    return {
+      kind: 'unknown',
+      firstWord: primary.firstWord || alternate.firstWord,
+    };
+  }
+  return primary;
 }
 
 /**
@@ -874,8 +950,66 @@ function insertionPoint(source: string, driver?: DriverKind): number {
   const tokens = scan(source, driver ?? {}).filter(
     (t) => t.type !== 'space' && t.type !== 'comment',
   );
+  if (driver === 'mysql') {
+    const lockingStart = mysqlExecutableLockingSuffixStart(source, tokens);
+    if (lockingStart !== undefined) return lockingStart;
+  }
   const last = tokens[tokens.length - 1];
   if (!last) return source.length;
   if (last.type === 'symbol' && last.value === ';') return last.pos;
   return last.pos + last.value.length;
+}
+
+function mysqlExecutableLockingSuffixStart(
+  source: string,
+  tokens: Token[],
+): number | undefined {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const opener = tokens[i];
+    if (
+      opener?.type !== 'symbol' ||
+      opener.depth !== 0 ||
+      !opener.value.startsWith('/*!')
+    ) {
+      continue;
+    }
+
+    let hasForUpdate = false;
+    let closerIndex = -1;
+    for (let j = i + 1; j < tokens.length; j += 1) {
+      const token = tokens[j]!;
+      if (token.type === 'symbol' && token.value === '*/') {
+        closerIndex = j;
+        break;
+      }
+      if (
+        token.type === 'word' &&
+        token.depth === 0 &&
+        token.value.toUpperCase() === 'FOR'
+      ) {
+        const next = tokens[j + 1];
+        if (
+          next?.type === 'word' &&
+          next.depth === 0 &&
+          next.value.toUpperCase() === 'UPDATE'
+        ) {
+          hasForUpdate = true;
+        }
+      }
+    }
+
+    if (
+      !hasForUpdate ||
+      closerIndex === -1 ||
+      tokens.slice(closerIndex + 1).some(
+        (token) => token.type !== 'symbol' || token.value !== ';',
+      )
+    ) {
+      continue;
+    }
+    let start = opener.pos;
+    while (start > 0 && /\s/.test(source[start - 1]!)) start -= 1;
+    return start;
+  }
+  return undefined;
 }

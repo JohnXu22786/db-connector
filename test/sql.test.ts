@@ -134,10 +134,14 @@ test('MySQL executable comment terminators ignore quoted delimiters', () => {
   }
 });
 
-test('MySQL executable comments remain conservative with NO_BACKSLASH_ESCAPES', () => {
-  const sql = "SELECT /*!50000 'safe \\' */ INTO OUTFILE '/tmp/x' FROM t";
-  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
-  assert.equal(isReadStatement(sql, 'mysql'), false);
+test('MySQL executable comments account for both backslash modes', () => {
+  for (const sql of [
+    String.raw`SELECT /*!50000 'safe \' */ INTO OUTFILE '/tmp/x' FROM t`,
+    String.raw`SELECT /*!50000 'a\' b' INTO OUTFILE '/tmp/x' */ FROM src`,
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
 });
 
 test('string literals and comments cannot change classification', () => {
@@ -369,6 +373,14 @@ test('ensureSelectLimit places the MySQL guard before # comments', () => {
   const sql = 'SELECT * FROM t # trailing comment';
   assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
     sql: 'SELECT * FROM t LIMIT 10 # trailing comment',
+    applied: true,
+  });
+});
+
+test('ensureSelectLimit places the MySQL guard before executable locking clauses', () => {
+  const sql = 'SELECT * FROM t /*!80000 FOR UPDATE */';
+  assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
+    sql: 'SELECT * FROM t LIMIT 10 /*!80000 FOR UPDATE */',
     applied: true,
   });
 });
