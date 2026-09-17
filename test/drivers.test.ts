@@ -55,12 +55,18 @@ function installMysqlConnection(driver: MysqlDriver, conn: MysqlConnectionStub):
   (driver as unknown as { conn: MysqlConnectionStub }).conn = conn;
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function nextTurn(): Promise<void> {
@@ -783,6 +789,44 @@ test('SQLite close waits for a dispatched request before exiting', async () => {
     assert.equal(state.child, null);
   } finally {
     state.child?.kill('SIGKILL');
+  }
+});
+
+test('SQLite concurrent connect calls share the pending validation result', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  const state = driver as unknown as {
+    child: object | null;
+    request: (...args: unknown[]) => Promise<unknown>;
+  };
+  const validation = deferred<unknown>();
+  const originalRequest = state.request;
+  state.request = async () => {
+    state.child = {};
+    return validation.promise;
+  };
+
+  try {
+    const first = driver.connect();
+    const second = driver.connect();
+
+    validation.reject(new Error('validation failed'));
+
+    await assert.rejects(first, /validation failed/);
+    await assert.rejects(second, /validation failed/);
+  } finally {
+    state.request = originalRequest;
+    state.child = null;
+    await driver.close();
   }
 });
 
