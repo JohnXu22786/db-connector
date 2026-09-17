@@ -88,6 +88,8 @@ interface PgConnectionLike extends PgEventSource {
   cancel?(processID: number | null, secretKey: number | null): void;
 }
 
+const DEFAULT_CANCEL_CONNECTION_TIMEOUT_MS = 1000;
+
 async function loadPgModule(): Promise<PgModule> {
   const raw = await importOptional<Record<string, unknown>>('pg');
   const holder = raw as unknown as { default?: unknown };
@@ -482,7 +484,7 @@ function cancelQuery(
   onError: (err: unknown) => void,
 ): () => void {
   if (client.cancel.length <= 1) {
-    if (client.pipeline && client._pipelineInFlight && client.native?.cancel) {
+    if (client.native?.cancel) {
       try {
         const result = client.native.cancel((err) => {
           if (err) onError(err);
@@ -509,6 +511,7 @@ function cancelQuery(
 
   let closed = false;
   let cancelSent = false;
+  let connectionTimeout: ReturnType<typeof setTimeout> | undefined;
   const transportListeners: Array<{
     source: PgEventSource;
     event: string;
@@ -541,9 +544,16 @@ function cancelQuery(
     }
   };
 
+  const clearConnectionTimeout = () => {
+    if (connectionTimeout === undefined) return;
+    clearTimeout(connectionTimeout);
+    connectionTimeout = undefined;
+  };
+
   const close = () => {
     if (closed) return;
     closed = true;
+    clearConnectionTimeout();
     removeTransportListeners();
     try {
       const ending = cancelClient.end();
@@ -561,6 +571,19 @@ function cancelQuery(
     onError(err);
   };
   const cleanup = () => close();
+  const armConnectionTimeout = () => {
+    const configuredTimeout = clientConfig.connectionTimeoutMillis;
+    const timeoutMs =
+      typeof configuredTimeout === 'number' &&
+      Number.isFinite(configuredTimeout) &&
+      configuredTimeout > 0
+        ? Math.max(1, Math.floor(configuredTimeout))
+        : DEFAULT_CANCEL_CONNECTION_TIMEOUT_MS;
+    connectionTimeout = setTimeout(() => {
+      reportError(new Error('pg cancellation connection timed out'));
+    }, timeoutMs);
+    connectionTimeout.unref?.();
+  };
   const sendCancel = () => {
     if (closed || cancelSent) return;
     try {
@@ -576,6 +599,7 @@ function cancelQuery(
   };
 
   try {
+    armConnectionTimeout();
     if (cancelClient.ssl) {
       const sslNegotiation = cancelClient.sslNegotiation ?? connection.sslNegotiation ?? 'postgres';
       if (sslNegotiation !== 'direct' && !connection.requestSsl) {

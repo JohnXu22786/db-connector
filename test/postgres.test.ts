@@ -159,6 +159,20 @@ class FailingCancellationClient extends PgClientStub {
   }
 }
 
+class FailingNativeCancellationClient extends PgClientStub {
+  nativeCancelled = 0;
+  readonly native = {
+    cancel: (callback: (err?: unknown) => void): void => {
+      this.nativeCancelled += 1;
+      callback(new Error('native cancellation failed'));
+    },
+  };
+
+  override cancel = (_query: PgClientStub | PgQueryStub): void => {
+    throw new Error('client.cancel should not be used for native cancellation');
+  };
+}
+
 class DelayedCancellationClient extends PgClientStub {
   constructor() {
     super();
@@ -206,7 +220,10 @@ const cancellationSpec = resolveConnectionSpec({
   database: 'test',
 });
 
-function driverWithCancellationStub(client: PgClientStub): PgDriver {
+function driverWithCancellationStub(
+  client: PgClientStub,
+  clientConfig: Record<string, unknown> = {},
+): PgDriver {
   const driver = new PgDriver(cancellationSpec, { debug() {}, info() {}, warn() {} });
   const internals = driver as unknown as {
     client: PgClientStub;
@@ -217,7 +234,7 @@ function driverWithCancellationStub(client: PgClientStub): PgDriver {
   internals.client = client;
   internals.clientConstructor = PgClientStub;
   internals.queryConstructor = PgQueryStub;
-  internals.clientConfig = {};
+  internals.clientConfig = clientConfig;
   PgClientStub.cancelTarget = client;
   return driver;
 }
@@ -416,6 +433,54 @@ test('PostgreSQL cancellation connection failures do not become unhandled client
   assert.ok(outcome instanceof DbConnectorError);
   assert.equal(outcome.code, ErrorCode.QueryFailed);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  await driver.close();
+});
+
+test('PostgreSQL native cancellation failures invalidate the client', async () => {
+  const client = new FailingNativeCancellationClient();
+  const driver = driverWithCancellationStub(client);
+  const controller = new AbortController();
+  const operation = driver.read('SELECT pg_sleep(10)', [], controller.signal);
+
+  for (let attempt = 0; attempt < 20 && client.configs.length < 2; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.configs.length, 2);
+
+  controller.abort(new Error('query timeout'));
+  const outcome = await Promise.race([
+    operation.then(() => undefined, (err: unknown) => err),
+    new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol('still-pending')), 100)),
+  ]);
+  assert.ok(outcome instanceof DbConnectorError);
+  assert.equal(outcome.code, ErrorCode.QueryFailed);
+  assert.equal(client.nativeCancelled, 1);
+  await driver.close();
+});
+
+test('PostgreSQL cancellation connection timeouts invalidate the client', async () => {
+  const client = new PgClientStub();
+  const driver = driverWithCancellationStub(client, { connectionTimeoutMillis: 10 });
+  (driver as unknown as { clientConstructor: typeof DelayedCancellationClient }).clientConstructor =
+    DelayedCancellationClient;
+  const controller = new AbortController();
+  const operation = driver.read('SELECT pg_sleep(10)', [], controller.signal);
+
+  for (let attempt = 0; attempt < 20 && client.queries.length < 2; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.queries.length, 2);
+  controller.abort(new Error('query timeout'));
+  const outcome = await Promise.race([
+    operation.then(() => undefined, (err: unknown) => err),
+    new Promise<symbol>((resolve) => setTimeout(() => resolve(Symbol('still-pending')), 100)),
+  ]);
+  assert.ok(outcome instanceof DbConnectorError);
+  assert.equal(outcome.code, ErrorCode.QueryFailed);
+  const cancellationClient = PgClientStub.lastCreated as DelayedCancellationClient;
+  assert.ok(cancellationClient instanceof DelayedCancellationClient);
+  assert.equal(cancellationClient.endCalls, 1);
+  assert.equal(cancellationClient.connection.listenerCount('connect'), 0);
   await driver.close();
 });
 
