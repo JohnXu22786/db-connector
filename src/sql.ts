@@ -68,6 +68,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const n = sql.length;
   let depth = 0;
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
+  const mysqlDashComments = options === 'mysql';
   const sqliteBracketIdentifiers = options === 'sqlite';
   const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
@@ -89,7 +90,11 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     }
 
     // -- line comment
-    if (c === '-' && sql[i + 1] === '-') {
+    if (
+      c === '-' &&
+      sql[i + 1] === '-' &&
+      (!mysqlDashComments || /[\u0000-\u0020\u007f]/.test(sql[i + 2] ?? ''))
+    ) {
       i += 2;
       while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });

@@ -128,6 +128,22 @@ test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement('DELETE /* c */ FROM t').kind, 'write');
 });
 
+test('MySQL double-dash comments require following whitespace or control', () => {
+  assert.equal(
+    classifyStatement("SELECT 1--2 INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement("SELECT 1--\u00a0 INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement("SELECT 1--\x7f INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'select',
+  );
+  assert.equal(classifyStatement('SELECT 1-- 2', 'mysql').kind, 'select');
+});
+
 test('scan keeps SQLite bracket quoting dialect-specific and preserves escaped backticks', () => {
   assert.deepEqual(
     scan('SELECT [secret(AUTOINCREMENT)] FROM t', 'sqlite')
