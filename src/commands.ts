@@ -8,6 +8,7 @@
  */
 
 import type { ExecutionEngine } from './executor.js';
+import { DbConnectorError, ErrorCode } from './errors.js';
 import type { DshContext } from './types.js';
 
 const HELP = `db — SQL database operations
@@ -238,7 +239,9 @@ function flagNumber(flags: Record<string, string | boolean>, key: string): numbe
   const v = flagStr(flags, key);
   if (v === undefined) return undefined;
   const n = Number(v);
-  if (!Number.isFinite(n)) return undefined;
+  if (!Number.isFinite(n)) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, `"${key}" must be a number`);
+  }
   return n;
 }
 

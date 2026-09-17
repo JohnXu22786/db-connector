@@ -88,6 +88,22 @@ test('unknown subcommand and missing args produce friendly errors', async () => 
   );
 });
 
+test('query rejects an invalid numeric limit flag', async () => {
+  const h = await makeHarnessAndRows();
+  await assert.rejects(
+    runDbLine(h.engine, 'query app --sql "SELECT v FROM t" --limit=abc', freshSignal()),
+    (e: DbConnectorError) => e.code === 'INVALID_ARGS' && /limit/i.test(e.message),
+  );
+});
+
+test('query rejects an invalid numeric timeout flag', async () => {
+  const h = await makeHarnessAndRows();
+  await assert.rejects(
+    runDbLine(h.engine, 'query app --sql "SELECT v FROM t" --timeout=abc', freshSignal()),
+    (e: DbConnectorError) => e.code === 'INVALID_ARGS' && /timeout/i.test(e.message),
+  );
+});
+
 test('params CSV decode maps numbers, booleans, null, strings', async () => {
   const h = await makeHarnessAndRows();
   const marker = 'zap567';
