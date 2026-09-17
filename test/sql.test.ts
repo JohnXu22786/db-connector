@@ -133,6 +133,10 @@ test('MySQL double-dash comments require following whitespace or control', () =>
     classifyStatement("SELECT 1--2 INTO OUTFILE '/tmp/x'", 'mysql').kind,
     'write',
   );
+  assert.equal(
+    classifyStatement("SELECT 1--\u00a0 INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'write',
+  );
   assert.equal(classifyStatement('SELECT 1-- 2', 'mysql').kind, 'select');
 });
 

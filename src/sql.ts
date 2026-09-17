@@ -93,7 +93,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     if (
       c === '-' &&
       sql[i + 1] === '-' &&
-      (!mysqlDashComments || /[\s\u0000-\u001f]/.test(sql[i + 2] ?? ''))
+      (!mysqlDashComments || /[\u0000-\u0020]/.test(sql[i + 2] ?? ''))
     ) {
       i += 2;
       while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
