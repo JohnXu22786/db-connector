@@ -716,7 +716,7 @@ export function ensureSelectLimit(
   }
 
   assertSingleStatement(sql, driver);
-  const upper = Math.max(1, Math.floor(limit));
+  const upper = Math.max(0, Math.floor(limit));
   const insertAt = insertionPoint(sql, driver);
   const out =
     sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);
