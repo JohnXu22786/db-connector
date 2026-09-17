@@ -32,6 +32,8 @@ interface MysqlConnection {
 }
 
 interface MysqlRawConnection {
+  on?(event: 'error', listener: (err: unknown) => void): this;
+  removeListener?(event: 'error', listener: (err: unknown) => void): this;
   execute(input: {
     sql: string;
     values?: unknown[];
@@ -353,7 +355,10 @@ function readLimited(
     let hasMoreRows = false;
     let settled = false;
     let stream: MysqlReadStream | undefined;
-    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const cleanup = () => {
+      signal.removeEventListener('abort', onAbort);
+      connection.removeListener?.('error', onConnectionError);
+    };
     const finish = (err?: unknown): void => {
       if (settled) return;
       settled = true;
@@ -363,8 +368,12 @@ function readLimited(
     };
     const onAbort = (): void => {
       const err = cancelError(signal);
-      stream?.destroy(err);
       finish(err);
+      stream?.destroy(err);
+    };
+    function onConnectionError(err: unknown): void {
+      finish(err);
+      stream?.destroy(asError(err));
     };
 
     if (signal.aborted) {
@@ -374,6 +383,7 @@ function readLimited(
     signal.addEventListener('abort', onAbort, { once: true });
 
     try {
+      connection.on?.('error', onConnectionError);
       stream = connection
         .execute({ sql, values: params, rowsAsArray: true })
         .stream({ objectMode: true });
@@ -395,6 +405,10 @@ function readLimited(
 
 function boundedRowCount(maxRows: number): number {
   return Number.isFinite(maxRows) ? Math.max(0, Math.floor(maxRows)) : Number.MAX_SAFE_INTEGER;
+}
+
+function asError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err));
 }
 
 interface MysqlReadResult {

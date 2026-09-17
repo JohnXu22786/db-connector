@@ -888,6 +888,66 @@ test('MySQL driver streams only capped read rows', async () => {
   assert.deepEqual(rawInputs, [{ sql: 'SELECT "?" AS value, ?', values: ['bound'], rowsAsArray: true }]);
 });
 
+test('MySQL bounded streams reject raw connection errors', async () => {
+  let rawErrorListener: ((err: unknown) => void) | undefined;
+  let streamDestroyed = false;
+  let connectionDestroyed = false;
+  const streamListeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const stream = {
+    on(event: string, listener: (...args: unknown[]) => void) {
+      const current = streamListeners.get(event) ?? [];
+      current.push(listener);
+      streamListeners.set(event, current);
+      return stream;
+    },
+    destroy() {
+      streamDestroyed = true;
+      return stream;
+    },
+  };
+  const rawConnection = {
+    on(event: string, listener: (err: unknown) => void) {
+      if (event === 'error') rawErrorListener = listener;
+      return rawConnection;
+    },
+    removeListener(event: string, listener: (err: unknown) => void) {
+      if (event === 'error' && rawErrorListener === listener) rawErrorListener = undefined;
+      return rawConnection;
+    },
+    execute() {
+      queueMicrotask(() => {
+        rawErrorListener?.(Object.assign(new Error('socket lost'), { fatal: true }));
+      });
+      return { stream: () => stream };
+    },
+  };
+  const conn = {
+    connection: rawConnection,
+    async query() { return [[], []]; },
+    async execute() { return [[], []]; },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() { connectionDestroyed = true; },
+    async end() {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  (driver as unknown as { conn: unknown }).conn = conn;
+  const request = driver.read('SELECT 1', [], signal(), 2);
+  const timeout = new Promise<never>((_, reject) => {
+    setTimeout(() => reject(new Error('bounded read did not settle')), 100);
+  });
+
+  await assert.rejects(Promise.race([request, timeout]), (err: unknown) => {
+    assert.ok(err instanceof DbConnectorError);
+    assert.equal(err.code, ErrorCode.QueryFailed);
+    assert.match(err.message, /socket lost/);
+    return true;
+  });
+  assert.equal(streamDestroyed, true);
+  assert.equal(connectionDestroyed, true);
+});
+
 test('MySQL bounded streams are destroyed when aborted', async () => {
   let streamDestroyed = false;
   let connectionDestroyed = false;
