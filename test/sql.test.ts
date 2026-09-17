@@ -124,6 +124,16 @@ test('MySQL executable comments cannot bypass the read-only gate', () => {
   assert.equal(isReadStatement(sql, 'mysql'), false);
 });
 
+test('MySQL executable comment terminators ignore quoted delimiters', () => {
+  for (const sql of [
+    "SELECT /*!50000 'safe */' INTO OUTFILE '/tmp/x' */ /* ' */ FROM t LIMIT 1",
+    "SELECT /*!50000 `safe */` INTO OUTFILE '/tmp/x' */ FROM t LIMIT 1",
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');

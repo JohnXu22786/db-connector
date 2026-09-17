@@ -47,6 +47,55 @@ function scanOptionsForDriver(driver: DriverKind): ScanOptions {
   return {};
 }
 
+function findMySqlExecutableCommentEnd(sql: string, start: number): number {
+  let i = start;
+  while (i < sql.length) {
+    const c = sql[i]!;
+
+    if (c === "'" || c === '"') {
+      const quote = c;
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] === '\\') {
+          i += 2;
+          continue;
+        }
+        if (sql[i] === quote) {
+          if (sql[i + 1] === quote) {
+            i += 2;
+            continue;
+          }
+          i += 1;
+          break;
+        }
+        i += 1;
+      }
+      continue;
+    }
+
+    if (c === '`') {
+      i += 1;
+      while (i < sql.length) {
+        if (sql[i] !== '`') {
+          i += 1;
+          continue;
+        }
+        if (sql[i + 1] === '`') {
+          i += 2;
+          continue;
+        }
+        i += 1;
+        break;
+      }
+      continue;
+    }
+
+    if (c === '*' && sql[i + 1] === '/') return i;
+    i += 1;
+  }
+  return -1;
+}
+
 /** Data-statement keywords valid at the top level of a statement. */
 const DATA_KEYWORDS = new Set([
   'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'VALUES',
@@ -116,7 +165,7 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
         const versionStart = i;
         while (i < n && i - versionStart < 5 && /[0-9]/.test(sql[i]!)) i += 1;
         const bodyStart = i;
-        const end = sql.indexOf('*/', bodyStart);
+        const end = findMySqlExecutableCommentEnd(sql, bodyStart);
         const bodyEnd = end === -1 ? n : end;
 
         // MySQL executes the contents of `/*!...*/`; retain the wrapper as
@@ -137,6 +186,8 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
         if (end !== -1) {
           tokens.push({ type: 'symbol', value: '*/', pos: bodyEnd, depth });
           i = bodyEnd + 2;
+        } else {
+          i = n;
         }
         continue;
       }
