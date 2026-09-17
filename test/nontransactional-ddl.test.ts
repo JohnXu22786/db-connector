@@ -1,4 +1,5 @@
 import { mkdtempSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { strict as assert } from 'node:assert';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -11,6 +12,9 @@ import { importOptional } from '../dist/drivers/driver.js';
 import { PgDriver } from '../dist/drivers/postgres.js';
 import { SchemaService } from '../dist/schema.js';
 import type { DriverApi, Introspection } from '../dist/drivers/driver.js';
+
+const require = createRequire(import.meta.url);
+const pg = require('pg') as { Query: new (...args: never[]) => object };
 
 interface QueryConfig {
   text: string;
@@ -40,7 +44,12 @@ function makePgDriver(
       return handle(query);
     },
   };
-  (driver as unknown as { client: typeof client }).client = client;
+  const internals = driver as unknown as {
+    client: typeof client;
+    queryConstructor: typeof pg.Query;
+  };
+  internals.client = client;
+  internals.queryConstructor = pg.Query;
   return driver;
 }
 

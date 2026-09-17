@@ -28,6 +28,7 @@ type PgClientStub = {
 };
 
 const require = createRequire(import.meta.url);
+const pg = require('pg') as { Query: new (...args: never[]) => object };
 
 type MysqlConnectionStub = {
   execute(input: string | { sql: string; values?: unknown[]; rowsAsArray?: boolean }): Promise<[unknown, unknown]>;
@@ -48,7 +49,12 @@ const spec = (driver: 'postgres' | 'mysql'): ResolvedConnectionSpec => ({
 });
 
 function installPgClient(driver: PgDriver, client: PgClientStub): void {
-  (driver as unknown as { client: PgClientStub }).client = client;
+  const internals = driver as unknown as {
+    client: PgClientStub;
+    queryConstructor: typeof pg.Query;
+  };
+  internals.client = client;
+  internals.queryConstructor = pg.Query;
 }
 
 function installMysqlConnection(driver: MysqlDriver, conn: MysqlConnectionStub): void {
@@ -719,7 +725,11 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     { fields: [{ name: 'id' }, { name: 'label' }], rows: [], rowCount: 0 },
     { fields: [{ name: 'value' }, { name: 'value' }], rows: [[1, 2]], rowCount: 1 },
   ];
-  (driver as unknown as { client: PgClientFake }).client = {
+  const internals = driver as unknown as {
+    client: PgClientFake;
+    queryConstructor: typeof pg.Query;
+  };
+  internals.client = {
     async query(query) {
       if (typeof query === 'string') {
         return { fields: [], rows: [], rowCount: null };
@@ -730,6 +740,7 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     async connect() {},
     async end() {},
   };
+  internals.queryConstructor = pg.Query;
 
   const empty = await driver.read('SELECT id, label FROM t WHERE false', [], signal());
   assert.deepEqual(empty, {
@@ -746,15 +757,15 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
   });
   assert.deepEqual(
     queryConfigs.map((query) => {
-      const config = query as { text: string; values: unknown[]; rowMode: string };
-      return { text: config.text, values: config.values, rowMode: config.rowMode };
+      const config = query as { text: string; values: unknown[]; _rowMode: string };
+      return { text: config.text, values: config.values, rowMode: config._rowMode };
     }),
     [
       { text: 'SELECT id, label FROM t WHERE false', values: [], rowMode: 'array' },
       { text: 'SELECT 1 AS value, 2 AS value', values: [], rowMode: 'array' },
     ],
   );
-  assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+  assert.equal(queryConfigs.every((query) => !('signal' in (query as object))), true);
 });
 
 test('SQLite close waits for a dispatched request before exiting', async () => {
