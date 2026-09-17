@@ -32,10 +32,19 @@ interface ColumnRow {
   pk: number;
 }
 
+type SchemaName = 'main' | 'temp';
+
 interface MasterRow {
+  schema: SchemaName;
   name: string;
   type: string;
   sql: string | null;
+}
+
+interface SchemaObject {
+  schema: SchemaName;
+  name: string;
+  sql?: string;
 }
 
 const database = process.env.DSH_DB_CONNECTOR_SQLITE_DATABASE ?? ':memory:';
@@ -260,10 +269,10 @@ function readSqliteAutoincrementColumns(sql: string): Set<string> {
 function runSchema(): unknown {
   const master = db
     .prepare(
-      `SELECT name, type, sql FROM sqlite_temp_master
+      `SELECT 'temp' AS schema, name, type, sql FROM sqlite_temp_master
        WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%'
        UNION ALL
-       SELECT main.name, main.type, main.sql FROM sqlite_master AS main
+       SELECT 'main' AS schema, main.name, main.type, main.sql FROM sqlite_master AS main
        WHERE main.type IN ('table','view') AND main.name NOT LIKE 'sqlite_%'
          AND NOT EXISTS (
            SELECT 1 FROM sqlite_temp_master AS temp
@@ -274,10 +283,10 @@ function runSchema(): unknown {
     )
     .all() as unknown as MasterRow[];
 
-  const tables: Array<{ name: string; sql?: string }> = [];
-  const views: Array<{ name: string; sql?: string }> = [];
+  const tables: SchemaObject[] = [];
+  const views: SchemaObject[] = [];
   for (const row of master) {
-    const entry = { name: row.name, ...(row.sql ? { sql: row.sql } : {}) };
+    const entry = { schema: row.schema, name: row.name, ...(row.sql ? { sql: row.sql } : {}) };
     if (row.type === 'table') tables.push(entry);
     else views.push(entry);
   }
@@ -311,23 +320,24 @@ function runSchema(): unknown {
 
   const quote = (name: string): string => name.replaceAll('"', '""');
   const primaryKeyColumns = new Map<string, string[]>();
-  const readPrimaryKeyColumns = (table: string): string[] => {
-    const cached = primaryKeyColumns.get(table);
+  const readPrimaryKeyColumns = (schema: SchemaName, table: string): string[] => {
+    const key = `${schema}:${table}`;
+    const cached = primaryKeyColumns.get(key);
     if (cached) return cached;
 
     const columns = (db
-      .prepare(`PRAGMA table_xinfo("${quote(table)}")`)
+      .prepare(`PRAGMA ${schema}.table_xinfo("${quote(table)}")`)
       .all() as unknown as ColumnRow[])
       .filter((column) => column.pk > 0)
       .sort((a, b) => a.pk - b.pk)
       .map((column) => column.name);
-    primaryKeyColumns.set(table, columns);
+    primaryKeyColumns.set(key, columns);
     return columns;
   };
 
-  const readColumns = (object: { name: string; sql?: string }, hasPrimaryKeyIndex = false): void => {
+  const readColumns = (object: SchemaObject, hasPrimaryKeyIndex = false): void => {
     const cols = db
-      .prepare(`PRAGMA table_xinfo("${quote(object.name)}")`)
+      .prepare(`PRAGMA ${object.schema}.table_xinfo("${quote(object.name)}")`)
       .all() as unknown as ColumnRow[];
     const autoincrementColumns = readSqliteAutoincrementColumns(object.sql ?? '');
     for (const c of cols) {
@@ -347,14 +357,14 @@ function runSchema(): unknown {
 
   for (const table of tables) {
     const idxRows = db
-      .prepare(`PRAGMA index_list("${quote(table.name)}")`)
+      .prepare(`PRAGMA ${table.schema}.index_list("${quote(table.name)}")`)
       .all() as unknown as Array<{ name: string; unique: number; origin: string }>;
     const hasPrimaryKeyIndex = idxRows.some((idx) => idx.origin === 'pk');
     readColumns(table, hasPrimaryKeyIndex);
 
     for (const idx of idxRows) {
       const parts = db
-        .prepare(`PRAGMA index_info("${quote(idx.name)}")`)
+        .prepare(`PRAGMA ${table.schema}.index_info("${quote(idx.name)}")`)
         .all() as unknown as Array<{ seqno: number; name: string | null }>;
       parts.sort((a, b) => a.seqno - b.seqno);
       indexes.push({
@@ -367,7 +377,7 @@ function runSchema(): unknown {
     }
 
     const fkRows = db
-      .prepare(`PRAGMA foreign_key_list("${quote(table.name)}")`)
+      .prepare(`PRAGMA ${table.schema}.foreign_key_list("${quote(table.name)}")`)
       .all() as unknown as Array<{
       id: number;
       seq: number;
@@ -393,14 +403,25 @@ function runSchema(): unknown {
         grouped.set(fk.id, entry);
       }
       entry.columns.push(fk.from);
-      entry.referencedColumns.push(fk.to ?? readPrimaryKeyColumns(fk.table)[fk.seq] ?? '');
+      entry.referencedColumns.push(
+        fk.to ?? readPrimaryKeyColumns(table.schema, fk.table)[fk.seq] ?? '',
+      );
     }
     foreignKeys.push(...grouped.values());
   }
 
   for (const view of views) readColumns(view);
 
-  return { tables, views, columns, indexes, foreignKeys };
+  const publicObjects = (objects: SchemaObject[]): Array<{ name: string; sql?: string }> =>
+    objects.map(({ name, sql }) => ({ name, ...(sql ? { sql } : {}) }));
+
+  return {
+    tables: publicObjects(tables),
+    views: publicObjects(views),
+    columns,
+    indexes,
+    foreignKeys,
+  };
 }
 
 process.on('message', (req: Request) => {
