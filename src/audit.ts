@@ -31,6 +31,48 @@ export interface AuditInput {
 
 const FILE_MODE = 0o600;
 
+function isAuditRecord(value: unknown): value is AuditRecord {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.ts !== 'string' ||
+    typeof record.connection !== 'string' ||
+    !['query', 'write', 'ddl', 'read', 'schema', 'denied'].includes(record.kind as string) ||
+    !['tool', 'command', 'cli'].includes(record.way as string) ||
+    !['ok', 'error', 'denied'].includes(record.status as string) ||
+    typeof record.rows !== 'number' ||
+    !Number.isFinite(record.rows) ||
+    typeof record.durationMs !== 'number' ||
+    !Number.isFinite(record.durationMs)
+  ) {
+    return false;
+  }
+
+  if (record.statement === null || typeof record.statement !== 'object' || Array.isArray(record.statement)) {
+    return false;
+  }
+  const statement = record.statement as Record<string, unknown>;
+  if (
+    typeof statement.summary !== 'string' ||
+    typeof statement.digest !== 'string' ||
+    typeof statement.chars !== 'number' ||
+    !Number.isFinite(statement.chars)
+  ) {
+    return false;
+  }
+
+  if (record.error !== undefined) {
+    if (record.error === null || typeof record.error !== 'object' || Array.isArray(record.error)) {
+      return false;
+    }
+    const error = record.error as Record<string, unknown>;
+    if (typeof error.code !== 'string' || typeof error.message !== 'string') return false;
+  }
+
+  return true;
+}
+
 export class AuditLog {
   readonly path: string;
   readonly enabled: boolean;
@@ -140,7 +182,9 @@ export class AuditLog {
       if (trimmed === '') continue;
       let rec: AuditRecord;
       try {
-        rec = JSON.parse(trimmed) as AuditRecord;
+        const parsed: unknown = JSON.parse(trimmed);
+        if (!isAuditRecord(parsed)) continue;
+        rec = parsed;
       } catch {
         continue; // tolerate one malformed line instead of failing the read
       }
