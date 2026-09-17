@@ -118,6 +118,13 @@ test('REPLACE under a CTE and SELECT ... INTO are writes or PostgreSQL DDL', () 
   assert.equal(classifyStatement('SELECT (SELECT 1 INTO x) FROM t').kind, 'select');
 });
 
+test('MySQL executable comments participate in write classification', () => {
+  assert.equal(
+    classifyStatement("SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */", 'mysql').kind,
+    'write',
+  );
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');
