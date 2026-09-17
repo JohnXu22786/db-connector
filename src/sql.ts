@@ -282,7 +282,71 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     i += 1;
   }
 
+  if (postgresEscapeStrings) markQuestionOperators(tokens);
   return tokens;
+}
+
+/**
+ * PostgreSQL uses `?`, `?|`, `?&`, and `@?` as JSONB operators. A question
+ * mark is a positional parameter everywhere else, so reclassify it only when
+ * the surrounding tokens form a binary expression.
+ */
+function markQuestionOperators(tokens: Token[]): void {
+  const meaningfulIndexes = tokens
+    .map((token, index) => token.type === 'space' || token.type === 'comment' ? -1 : index)
+    .filter((index) => index >= 0);
+
+  for (let i = 0; i < meaningfulIndexes.length; i += 1) {
+    const index = meaningfulIndexes[i]!;
+    const token = tokens[index]!;
+    if (token.type !== 'param' || token.value !== '?') continue;
+
+    const previous = i > 0 ? tokens[meaningfulIndexes[i - 1]!] : undefined;
+    const next = i + 1 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 1]!] : undefined;
+    const nextNext = i + 2 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 2]!] : undefined;
+
+    const isAdjacentToNext = next !== undefined && token.pos + token.value.length === next.pos;
+    const isAdjacentToPrevious = previous !== undefined && previous.pos + previous.value.length === token.pos;
+    const right = isAdjacentToNext && next?.type === 'symbol' && (next.value === '|' || next.value === '&')
+      ? nextNext
+      : next;
+    const left = isAdjacentToPrevious && previous?.type === 'symbol' && previous.value === '@'
+      ? (i > 1 ? tokens[meaningfulIndexes[i - 2]!] : undefined)
+      : previous;
+
+    if (isExpressionEnd(left) && isExpressionStart(right)) {
+      token.type = 'symbol';
+    }
+  }
+}
+
+const QUESTION_OPERATOR_BOUNDARIES = new Set([
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO', 'VALUES', 'SET',
+  'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'AND', 'OR', 'NOT', 'IS',
+  'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
+  'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS', 'WHEN', 'THEN', 'ELSE',
+  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'PARTITION', 'FILTER',
+  'WINDOW',
+]);
+
+function isExpressionEnd(token: Token | undefined): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') {
+    return token.value.toUpperCase() === 'END' ||
+      !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  }
+  return token.type === 'symbol' && (/^[0-9.]$/.test(token.value) || /^[)\]}]$/.test(token.value));
+}
+
+function isExpressionStart(token: Token | undefined): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') return !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  return token.type === 'symbol' && /^[([{0-9.]$/.test(token.value);
 }
 
 /** Meaningful tokens: everything except whitespace and comments. */

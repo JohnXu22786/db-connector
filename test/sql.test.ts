@@ -250,6 +250,27 @@ test('tagged PostgreSQL dollar strings still protect placeholders and semicolons
   assert.doesNotThrow(() => assertSingleStatement('SELECT $tag$; SELECT $tag$', 'postgres'));
 });
 
+test('PostgreSQL JSONB operators are not positional parameters', () => {
+  const sql = [
+    "SELECT payload ? 'key'",
+    "payload ?| ARRAY['a']",
+    "payload ?& ARRAY['b']",
+    "payload @? '$.c'",
+    'id = ?',
+  ].join(' AND ');
+
+  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), {
+    sql: [
+      "SELECT payload ? 'key'",
+      "payload ?| ARRAY['a']",
+      "payload ?& ARRAY['b']",
+      "payload @? '$.c'",
+      'id = $1',
+    ].join(' AND '),
+    count: 1,
+  });
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',
