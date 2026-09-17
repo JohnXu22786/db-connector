@@ -37,6 +37,8 @@ export interface Token {
 export interface ScanOptions {
   /** Treat backslashes as escapes inside quoted strings. */
   backslashEscapes?: boolean;
+  /** Recognize MySQL comment syntax when options are passed as an object. */
+  mysqlComments?: boolean;
   /** Recognize PostgreSQL `E'...'` escape string constants. */
   postgresEscapeStrings?: boolean;
 }
@@ -47,7 +49,11 @@ function scanOptionsForDriver(driver: DriverKind): ScanOptions {
   return {};
 }
 
-function findMySqlExecutableCommentEnd(sql: string, start: number): number {
+function findMySqlExecutableCommentEnd(
+  sql: string,
+  start: number,
+  backslashEscapes: boolean,
+): number {
   let i = start;
   while (i < sql.length) {
     const c = sql[i]!;
@@ -56,7 +62,7 @@ function findMySqlExecutableCommentEnd(sql: string, start: number): number {
       const quote = c;
       i += 1;
       while (i < sql.length) {
-        if (sql[i] === '\\') {
+        if (backslashEscapes && sql[i] === '\\') {
           i += 2;
           continue;
         }
@@ -117,9 +123,9 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   const n = sql.length;
   let depth = 0;
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
-  const mysqlComments = options === 'mysql';
+  const mysqlComments = options === 'mysql' || resolvedOptions.mysqlComments === true;
   const sqliteBracketIdentifiers = options === 'sqlite';
-  const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
+  const postgresDollarQuotes = !mysqlComments && options !== 'sqlite';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
 
@@ -160,19 +166,25 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
 
     // /* block comment */
     if (c === '/' && sql[i + 1] === '*') {
-      if (options === 'mysql' && sql[i + 2] === '!') {
+      if (mysqlComments && sql[i + 2] === '!') {
         i += 3;
         const versionStart = i;
         while (i < n && i - versionStart < 5 && /[0-9]/.test(sql[i]!)) i += 1;
         const bodyStart = i;
-        const end = findMySqlExecutableCommentEnd(sql, bodyStart);
+        // The connection's SQL mode is not available here. Treat backslashes
+        // as ordinary characters in executable bodies so NO_BACKSLASH_ESCAPES
+        // cannot hide a delimiter or a write from the read-only classifier.
+        const end = findMySqlExecutableCommentEnd(sql, bodyStart, false);
         const bodyEnd = end === -1 ? n : end;
 
         // MySQL executes the contents of `/*!...*/`; retain the wrapper as
         // symbols so placeholder rewriting and other reconstruction helpers
         // preserve the original executable comment text.
         tokens.push({ type: 'symbol', value: sql.slice(at, bodyStart), pos: at, depth });
-        for (const token of scan(sql.slice(bodyStart, bodyEnd), 'mysql')) {
+        for (const token of scan(sql.slice(bodyStart, bodyEnd), {
+          backslashEscapes: false,
+          mysqlComments: true,
+        })) {
           tokens.push({
             ...token,
             pos: bodyStart + token.pos,

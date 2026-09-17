@@ -134,6 +134,12 @@ test('MySQL executable comment terminators ignore quoted delimiters', () => {
   }
 });
 
+test('MySQL executable comments remain conservative with NO_BACKSLASH_ESCAPES', () => {
+  const sql = "SELECT /*!50000 'safe \\' */ INTO OUTFILE '/tmp/x' FROM t";
+  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+  assert.equal(isReadStatement(sql, 'mysql'), false);
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');
