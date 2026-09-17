@@ -312,11 +312,15 @@ function markQuestionOperators(tokens: Token[]): void {
     const right = isAdjacentToNext && next?.type === 'symbol' && (next.value === '|' || next.value === '&')
       ? nextNext
       : next;
-    const left = isAdjacentToPrevious && previous?.type === 'symbol' && previous.value === '@'
-      ? (i > 1 ? tokens[meaningfulIndexes[i - 2]!] : undefined)
-      : previous;
+    const leftIndex = isAdjacentToPrevious && previous?.type === 'symbol' && previous.value === '@'
+      ? i - 2
+      : i - 1;
+    const left = leftIndex >= 0 ? tokens[meaningfulIndexes[leftIndex]!] : undefined;
+    const leftPrevious = leftIndex > 0
+      ? tokens[meaningfulIndexes[leftIndex - 1]!]
+      : undefined;
 
-    if (isExpressionEnd(left) && isExpressionStart(right)) {
+    if (isExpressionEnd(left, leftPrevious) && isExpressionStart(right)) {
       token.type = 'symbol';
     }
   }
@@ -329,14 +333,31 @@ const QUESTION_OPERATOR_BOUNDARIES = new Set([
   'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'AND', 'OR', 'NOT', 'IS',
   'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO', 'ESCAPE', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
   'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS', 'WHEN', 'THEN', 'ELSE',
-  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'FILTER',
+  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'FILTER', 'PARTITION',
   'WINDOW',
 ]);
 
-function isExpressionEnd(token: Token | undefined): boolean {
+/**
+ * PostgreSQL permits non-reserved keywords as bare column names. Keep only
+ * reserved/type-function keywords as unconditional expression-start
+ * boundaries; the broader set above is still needed on the left of a
+ * parameter because those words can introduce clauses such as BETWEEN.
+ */
+const QUESTION_OPERATOR_START_BOUNDARIES = new Set([
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO',
+  'AND', 'OR', 'NOT', 'IS', 'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO',
+  'AS', 'ON', 'USING', 'JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
+  'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'COLLATE', 'WINDOW',
+]);
+
+function isExpressionEnd(token: Token | undefined, previous?: Token): boolean {
   if (!token) return false;
   if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
   if (token.type === 'word') {
+    // PostgreSQL allows reserved words after a qualification dot, e.g.
+    // `t.where`, so the final spelling alone cannot identify a clause.
+    if (previous?.type === 'symbol' && previous.value === '.') return true;
     return token.value.toUpperCase() === 'END' ||
       !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
   }
@@ -346,7 +367,7 @@ function isExpressionEnd(token: Token | undefined): boolean {
 function isExpressionStart(token: Token | undefined): boolean {
   if (!token) return false;
   if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
-  if (token.type === 'word') return !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  if (token.type === 'word') return !QUESTION_OPERATOR_START_BOUNDARIES.has(token.value.toUpperCase());
   return token.type === 'symbol' && /^[([{0-9.]$/.test(token.value);
 }
 

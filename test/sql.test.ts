@@ -294,8 +294,15 @@ test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESC
 });
 
 test('PostgreSQL JSONB operators accept keyword operands', () => {
-  const sql = 'SELECT payload ? partition';
-  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 });
+  for (const operand of [
+    'first', 'row', 'rows', 'filter', 'over', 'escape', 'between', 'by', 'values', 'partition',
+  ]) {
+    const sql = `SELECT payload ? ${operand} FROM t`;
+    assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 }, operand);
+  }
+
+  const qualified = "SELECT t.where ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(qualified, 'postgres'), { sql: qualified, count: 0 });
 });
 
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
