@@ -312,6 +312,10 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(added.applied, true);
   assert.equal(added.sql, 'SELECT id FROM t LIMIT 10');
 
+  const empty = ensureSelectLimit('SELECT id FROM t', 0);
+  assert.equal(empty.applied, true);
+  assert.equal(empty.sql, 'SELECT id FROM t LIMIT 0');
+
   assert.equal(ensureSelectLimit('SELECT id FROM t;', 3).sql, 'SELECT id FROM t LIMIT 3;');
   assert.equal(ensureSelectLimit('SELECT (SELECT 1 LIMIT 2)', 3).applied, true);
   // not a select -> untouched
