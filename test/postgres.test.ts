@@ -1,6 +1,7 @@
 /** PostgreSQL-specific introspection query regressions. */
 
 import { strict as assert } from 'node:assert';
+import { EventEmitter } from 'node:events';
 import { Client } from 'pg';
 import { test } from 'node:test';
 import { resolveConnectionSpec } from '../dist/config.js';
@@ -40,12 +41,31 @@ class PgQueryStub {
 }
 
 /** Models pg's behavior: QueryConfig.signal is ignored, but Query handles can be cancelled. */
-class PgClientStub {
+class PgClientStub extends EventEmitter {
   readonly configs: FakeQueryConfig[] = [];
   readonly statements: string[] = [];
+  readonly queries: PgQueryStub[] = [];
+  readonly pipeline: boolean;
+  readonly connection: EventEmitter & {
+    stream: { destroy(error?: Error): void };
+  };
   cancelled = 0;
   activeQuery: PgQueryStub | undefined;
   private readonly pending = new Map<PgQueryStub, FakeQueryCallback>();
+
+  constructor(pipeline = false) {
+    super();
+    this.pipeline = Boolean(pipeline);
+    const connection = new EventEmitter() as EventEmitter & {
+      stream: { destroy(error?: Error): void };
+    };
+    connection.stream = {
+      destroy: (error?: Error) => {
+        queueMicrotask(() => this.emit('error', error ?? new Error('connection destroyed')));
+      },
+    };
+    this.connection = connection;
+  }
 
   query(input: string | FakeQueryConfig | PgQueryStub): Promise<FakeQueryResult> | PgQueryStub {
     if (typeof input === 'string') {
@@ -57,9 +77,22 @@ class PgClientStub {
     this.configs.push(config);
     if (!(input instanceof PgQueryStub)) return new Promise<FakeQueryResult>(() => {});
 
+    this.queries.push(input);
     this.pending.set(input, input.callback);
     if (!this.activeQuery) this.activeQuery = input;
     return input;
+  }
+
+  complete(query: PgQueryStub, result: FakeQueryResult = {
+    fields: [],
+    rows: [],
+    rowCount: 1,
+  }): void {
+    const callback = this.pending.get(query);
+    assert.ok(callback, 'complete should receive a pending pg query handle');
+    this.pending.delete(query);
+    if (this.activeQuery === query) this.activeQuery = undefined;
+    callback(null, result);
   }
 
   cancel(client: PgClientStub, query: PgQueryStub): void {
@@ -77,6 +110,12 @@ class PgClientStub {
   async connect(): Promise<void> {}
 
   async end(): Promise<void> {}
+}
+
+class FailingCancellationClient extends PgClientStub {
+  override cancel(_client: PgClientStub, _query: PgQueryStub): Promise<void> {
+    return Promise.reject(new Error('cancellation connection failed'));
+  }
 }
 
 const cancellationSpec = resolveConnectionSpec({
@@ -137,6 +176,74 @@ test('PostgreSQL cancellation uses query handles for reads, writes, and introspe
     1,
   );
   await assertPostgresCancellation((driver, signal) => driver.introspect(signal), 6);
+});
+
+test('PostgreSQL abort during COMMIT rejects the write', async () => {
+  const client = new PgClientStub();
+  const driver = driverWithCancellationStub(client);
+  const controller = new AbortController();
+  const operation = driver.write('UPDATE users SET name = ?', ['x'], false, controller.signal);
+
+  for (let attempt = 0; attempt < 20 && client.queries.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.queries.length, 1);
+  client.complete(client.queries[0]!);
+
+  for (let attempt = 0; attempt < 20 && client.queries.length < 2; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.queries[1]?.config.text, 'COMMIT');
+
+  controller.abort(new Error('query timeout'));
+  const outcome = await operation.then(() => undefined, (err: unknown) => err);
+  assert.ok(outcome instanceof DbConnectorError);
+  assert.equal(outcome.code, ErrorCode.Timeout);
+  assert.equal(client.cancelled, 1);
+  assert.equal(client.statements.includes('COMMIT'), false);
+  assert.equal(client.statements.includes('ROLLBACK'), true);
+  await driver.close();
+});
+
+test('PostgreSQL pipeline introspection does not submit later queries after abort', async () => {
+  const client = new PgClientStub(true);
+  const driver = driverWithCancellationStub(client);
+  const controller = new AbortController();
+  const operation = driver.introspect(controller.signal);
+
+  for (let attempt = 0; attempt < 20 && client.configs.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.configs.length, 1);
+
+  controller.abort(new Error('query timeout'));
+  const outcome = await operation.then(() => undefined, (err: unknown) => err);
+  assert.ok(outcome instanceof DbConnectorError);
+  assert.equal(outcome.code, ErrorCode.Timeout);
+  assert.equal(client.cancelled, 1);
+  assert.equal(client.configs.length, 1);
+  await driver.close();
+});
+
+test('PostgreSQL cancellation connection failures do not become unhandled client errors', async () => {
+  const client = new PgClientStub();
+  const driver = driverWithCancellationStub(client);
+  (driver as unknown as { clientConstructor: typeof FailingCancellationClient }).clientConstructor =
+    FailingCancellationClient;
+  const controller = new AbortController();
+  const operation = driver.read('SELECT pg_sleep(10)', [], controller.signal);
+
+  for (let attempt = 0; attempt < 20 && client.configs.length < 1; attempt += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(client.configs.length, 1);
+
+  controller.abort(new Error('query timeout'));
+  const outcome = await operation.then(() => undefined, (err: unknown) => err);
+  assert.ok(outcome instanceof DbConnectorError);
+  assert.equal(outcome.code, ErrorCode.QueryFailed);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await driver.close();
 });
 
 test(

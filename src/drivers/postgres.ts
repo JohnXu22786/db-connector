@@ -48,6 +48,7 @@ interface PgQueryable {
 interface PgClientLike extends PgQueryable {
   activeQuery?: PgQueryHandle;
   _activeQuery?: PgQueryHandle;
+  pipeline?: boolean;
   host?: string;
   port?: number;
   ssl?: unknown;
@@ -188,12 +189,13 @@ export class PgDriver implements DriverApi {
     this.queryConstructor = null;
     this.clientConfig = null;
     const error = cause instanceof Error ? cause : new Error(String(cause));
+    const removeClientErrorGuard = guardClientError(client);
     try {
       client.connection?.stream?.destroy(error);
     } catch {
       // The cancellation failure is already being propagated to the caller.
     }
-    void client.end().catch(() => {});
+    void client.end().catch(() => {}).finally(removeClientErrorGuard);
   }
 
   async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
@@ -280,7 +282,15 @@ export class PgDriver implements DriverApi {
           (err) => this.invalidateClient(client, err),
         );
         if (signal.aborted) throw cancelError(signal);
-        await client.query('COMMIT');
+        await queryWithCancellation(
+          client,
+          this.clientConstructor!,
+          this.queryConstructor!,
+          this.clientConfig!,
+          { text: 'COMMIT' },
+          signal,
+          (err) => this.invalidateClient(client, err),
+        );
         return { affectedRows: result.rowCount ?? 0, isDdl };
       } catch (err) {
         if (isCancellationFailure(err)) {
@@ -303,72 +313,48 @@ export class PgDriver implements DriverApi {
     const client = this.ensure();
     const schema = this.spec.schema || 'public';
     try {
-      const catalogResults = await Promise.allSettled([
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.tables, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.views, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.columns, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.primaryKeys, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.indexes, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-        queryWithCancellation(
-          client,
-          this.clientConstructor!,
-          this.queryConstructor!,
-          this.clientConfig!,
-          { ...QUERIES.foreignKeys, values: [schema] },
-          signal,
-          (err) => this.invalidateClient(client, err),
-        ),
-      ]);
+      const catalogQueries: PgQueryConfig[] = [
+        { ...QUERIES.tables, values: [schema] },
+        { ...QUERIES.views, values: [schema] },
+        { ...QUERIES.columns, values: [schema] },
+        { ...QUERIES.primaryKeys, values: [schema] },
+        { ...QUERIES.indexes, values: [schema] },
+        { ...QUERIES.foreignKeys, values: [schema] },
+      ];
+      const runCatalogQuery = (config: PgQueryConfig) => queryWithCancellation(
+        client,
+        this.clientConstructor!,
+        this.queryConstructor!,
+        this.clientConfig!,
+        config,
+        signal,
+        (err) => this.invalidateClient(client, err),
+      );
+      const catalogResults: PromiseSettledResult<PgQueryResult>[] = [];
+      if (client.pipeline) {
+        // pg sends every query submitted in one pipeline immediately. Run
+        // catalog queries one at a time so an abort cannot leave later
+        // introspection statements executing on the server.
+        for (const query of catalogQueries) {
+          try {
+            catalogResults.push({ status: 'fulfilled', value: await runCatalogQuery(query) });
+          } catch (reason) {
+            catalogResults.push({ status: 'rejected', reason });
+          }
+        }
+      } else {
+        catalogResults.push(...await Promise.allSettled(catalogQueries.map(runCatalogQuery)));
+      }
       const catalogResultValue = <T>(result: PromiseSettledResult<T>): T => {
         if (result.status === 'rejected') throw result.reason;
         return result.value;
       };
-      const tables = catalogResultValue(catalogResults[0]);
-      const views = catalogResultValue(catalogResults[1]);
-      const columns = catalogResultValue(catalogResults[2]);
-      const pks = catalogResultValue(catalogResults[3]);
-      const indexes = catalogResultValue(catalogResults[4]);
-      const fks = catalogResultValue(catalogResults[5]);
+      const tables = catalogResultValue(catalogResults[0]!);
+      const views = catalogResultValue(catalogResults[1]!);
+      const columns = catalogResultValue(catalogResults[2]!);
+      const pks = catalogResultValue(catalogResults[3]!);
+      const indexes = catalogResultValue(catalogResults[4]!);
+      const fks = catalogResultValue(catalogResults[5]!);
       const pkRows = pks.rows as Array<{ table_name: string; column_name: string }>;
       const pkByTable = new Map<string, Set<string>>();
       for (const row of pkRows) {
@@ -515,6 +501,24 @@ function cancelQuery(
     cleanup();
     throw err;
   }
+  return cleanup;
+}
+
+function guardClientError(client: PgClientLike): () => void {
+  const events = client as unknown as PgEventSource;
+  if (typeof events.on !== 'function') return () => {};
+
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    events.removeListener?.('error', onError);
+    events.removeListener?.('end', onEnd);
+  };
+  const onError: PgEventListener = () => cleanup();
+  const onEnd: PgEventListener = () => cleanup();
+  events.on('error', onError);
+  events.on('end', onEnd);
   return cleanup;
 }
 
