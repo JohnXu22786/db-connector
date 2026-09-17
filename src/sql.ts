@@ -691,8 +691,8 @@ export function rewriteNamedToPositional(
 
 /**
  * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * already. Used only as a courtesy guard: the executor always caps rows on the
- * consuming side no matter what this returns.
+ * or PostgreSQL FETCH row limit already. Used only as a courtesy guard: the
+ * executor always caps rows on the consuming side no matter what this returns.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -706,7 +706,9 @@ export function ensureSelectLimit(
   const hasTopLevelLimit = tokens.some(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
   );
-  if (hasTopLevelLimit) return { sql, applied: false };
+  if (hasTopLevelLimit || hasTopLevelFetchLimit(tokens, driver)) {
+    return { sql, applied: false };
+  }
 
   assertSingleStatement(sql, driver);
   const upper = Math.max(1, Math.floor(limit));
@@ -714,6 +716,42 @@ export function ensureSelectLimit(
   const out =
     sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);
   return { sql: out, applied: true };
+}
+
+function hasTopLevelFetchLimit(tokens: Token[], driver?: DriverKind): boolean {
+  if (driver !== 'postgres') return false;
+
+  for (let i = 0; i < tokens.length - 1; i += 1) {
+    const fetch = tokens[i];
+    const direction = tokens[i + 1];
+    if (
+      fetch?.type !== 'word' ||
+      fetch.depth !== 0 ||
+      fetch.value.toUpperCase() !== 'FETCH' ||
+      direction?.type !== 'word' ||
+      direction.depth !== 0 ||
+      !['FIRST', 'NEXT'].includes(direction.value.toUpperCase())
+    ) {
+      continue;
+    }
+
+    for (let j = i + 2; j < tokens.length - 1; j += 1) {
+      const row = tokens[j];
+      const only = tokens[j + 1];
+      if (row?.type === 'symbol' && row.depth === 0 && row.value === ';') break;
+      if (
+        row?.type === 'word' &&
+        row.depth === 0 &&
+        (row.value.toUpperCase() === 'ROW' || row.value.toUpperCase() === 'ROWS') &&
+        only?.type === 'word' &&
+        only.depth === 0 &&
+        only.value.toUpperCase() === 'ONLY'
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /**

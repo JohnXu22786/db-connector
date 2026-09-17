@@ -323,6 +323,27 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit recognizes PostgreSQL FETCH FIRST/NEXT row limits', () => {
+  for (const clause of ['FETCH FIRST 5 ROWS ONLY', 'FETCH NEXT 5 ROWS ONLY']) {
+    const sql = `SELECT id FROM t ${clause}`;
+    assert.deepEqual(ensureSelectLimit(sql, 10, 'postgres'), {
+      sql,
+      applied: false,
+    });
+  }
+
+  const nested = ensureSelectLimit(
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited',
+    10,
+    'postgres',
+  );
+  assert.equal(nested.applied, true);
+  assert.equal(
+    nested.sql,
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited LIMIT 10',
+  );
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');
