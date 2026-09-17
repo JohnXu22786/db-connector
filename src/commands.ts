@@ -117,8 +117,8 @@ export async function runDbLine(
         connectionString: flagStr(flags, 'connection-string'),
         schema: flagStr(flags, 'schema'),
       } as const;
-      await engine.connect(spec as never);
-      return `Connected ${name} (${driver}).`;
+      const status = await engine.connect(spec as never);
+      return `Connected ${name} (${status.driver}).`;
     }
 
     case 'close': {

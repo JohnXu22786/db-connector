@@ -68,6 +68,20 @@ test('connect + query + schema + audit round-trip', async () => {
   assert.ok(a.includes('write'));
 });
 
+test('connect reports the existing connection driver on a mismatched reconnect', async () => {
+  const h = makeHarness();
+  const db = `${h.dir.replace(/\\/g, '/')}/c.sqlite`;
+
+  assert.equal(
+    await runDbLine(h.engine, `connect app --driver sqlite --db ${db}`, freshSignal()),
+    'Connected app (sqlite).',
+  );
+  assert.equal(
+    await runDbLine(h.engine, 'connect app --driver postgres --db other', freshSignal()),
+    'Connected app (sqlite).',
+  );
+});
+
 test('exec requires --allow-write', async () => {
   const h = await makeHarnessAndRows();
   await assert.rejects(
