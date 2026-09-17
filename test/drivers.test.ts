@@ -28,6 +28,9 @@ type PgClientStub = {
 };
 
 const require = createRequire(import.meta.url);
+const PgQuery = (require('pg') as {
+  Query: new (config: Record<string, unknown>) => unknown;
+}).Query;
 
 type MysqlConnectionStub = {
   execute(input: string | { sql: string; values?: unknown[]; rowsAsArray?: boolean }): Promise<[unknown, unknown]>;
@@ -691,40 +694,33 @@ test('SQLite driver bounds read rows before returning them', async () => {
 
 test('PostgreSQL driver bounds portal reads', async () => {
   const events: string[] = [];
-  let rowListener: ((row: unknown[]) => void) | undefined;
-  let errorListener: ((err: unknown) => void) | undefined;
-  let endListener: ((result: PgResult) => void) | undefined;
-  const limitedQuery = {
-    on(event: string, listener: (value: unknown) => void) {
-      if (event === 'row') rowListener = listener as (row: unknown[]) => void;
-      if (event === 'error') errorListener = listener;
-      if (event === 'end') endListener = listener as (result: PgResult) => void;
-      return limitedQuery;
-    },
-    handlePortalSuspended(connection: { sync(): void }) {
-      connection.sync();
-    },
+  const { Query } = require('pg') as {
+    Query: new (config: Record<string, unknown>) => {
+      emit(event: string, ...args: unknown[]): boolean;
+      handlePortalSuspended(connection: { sync(): void }): void;
+    };
   };
   const client = {
-    query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
+    constructor: { Query },
+    query(input: unknown) {
       if (typeof input === 'string') {
         events.push(input);
         return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
       }
       queueMicrotask(() => {
         try {
-          rowListener?.([1]);
-          rowListener?.([2]);
-          rowListener?.([3]);
-          limitedQuery.handlePortalSuspended({ sync: () => events.push('SYNC') });
+          const query = input as InstanceType<typeof Query>;
+          query.emit('row', [1]);
+          query.emit('row', [2]);
+          query.emit('row', [3]);
+          query.handlePortalSuspended({ sync: () => events.push('SYNC') });
           const result = { fields: [{ name: 'value' }], rows: [[1], [2], [3]], rowCount: 3 };
-          if (callback) callback(null, result);
-          else endListener?.(result);
+          query.emit('end', result);
         } catch (err) {
-          errorListener?.(err);
+          (input as InstanceType<typeof Query>).emit('error', err);
         }
       });
-      return limitedQuery;
+      return input;
     },
     async connect() {},
     async end() {},
@@ -751,6 +747,7 @@ test('PostgreSQL zero-cap reads do not retain callback result rows', async () =>
     handlePortalSuspended() {},
   };
   const client = {
+    constructor: { Query: PgQuery },
     query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
       if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
       callbackProvided = callback !== undefined;
@@ -785,6 +782,7 @@ test('PostgreSQL clamps oversized portal row counts', async () => {
     handlePortalSuspended() {},
   };
   const client = {
+    constructor: { Query: PgQuery },
     query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
       if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
       rowsRequested = (input as { rows?: number }).rows;
@@ -816,6 +814,7 @@ test('PostgreSQL bounded portal reads cancel when aborted', async () => {
     handlePortalSuspended() {},
   };
   const client = {
+    constructor: { Query: PgQuery },
     query(input: unknown) {
       if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
       return limitedQuery;

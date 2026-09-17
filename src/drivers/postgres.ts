@@ -42,12 +42,11 @@ interface PgLimitedQuery {
   handlePortalSuspended(connection: { sync(): void }): void;
 }
 
+type PgQueryConstructor = new (config: PgQueryConfig) => PgLimitedQuery;
+
 interface PgQueryable {
   query(config: PgQueryConfig): Promise<PgQueryResult>;
-  query(
-    config: PgQueryConfig,
-    callback: (err: unknown, result: PgArrayQueryResult) => void,
-  ): PgLimitedQuery;
+  query(query: PgLimitedQuery): PgLimitedQuery;
   query(text: string): Promise<PgQueryResult>;
 }
 
@@ -375,13 +374,17 @@ function readLimited(
       // metadata for forms such as SHOW. The row listener prevents pg from
       // retaining that row; it is only used to report that more rows exist.
       const portalRows = cap === MAX_POSTGRES_PORTAL_ROWS ? cap : cap + 1;
-      query = client.query({
+      const Query = (client.constructor as unknown as { Query?: PgQueryConstructor }).Query;
+      if (typeof Query !== 'function') {
+        throw new Error('the "pg" client did not expose its Query constructor');
+      }
+      query = client.query(new Query({
         text,
         values,
         signal,
         rowMode: 'array',
         rows: portalRows,
-      }) as unknown as PgLimitedQuery;
+      }));
       query.on('row', (row) => {
         if (rows.length < cap) rows.push(row);
         else hasMoreRows = true;
