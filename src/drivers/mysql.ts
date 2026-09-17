@@ -194,15 +194,15 @@ export class MysqlDriver implements DriverApi {
       let fields: unknown;
       let hasMoreRows = false;
       try {
-        if (maxRows === undefined) {
+        if (maxRows === undefined || !conn.connection) {
           [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
-        } else {
-          if (!conn.connection) {
-            throw new DbConnectorError(
-              ErrorCode.QueryFailed,
-              'bounded MySQL reads require the event-emitting mysql2 connection',
-            );
+          if (maxRows !== undefined) {
+            const cap = boundedRowCount(maxRows);
+            const materializedRows = Array.isArray(rows) ? rows : [];
+            hasMoreRows = materializedRows.length > cap;
+            rows = materializedRows.slice(0, cap);
           }
+        } else {
           const limited = await readLimited(
             conn.connection,
             sql,
@@ -346,7 +346,7 @@ function readLimited(
   signal: AbortSignal,
   maxRows: number,
 ): Promise<MysqlReadResult> {
-  const cap = Number.isFinite(maxRows) ? Math.max(0, Math.floor(maxRows)) : Number.MAX_SAFE_INTEGER;
+  const cap = boundedRowCount(maxRows);
   return new Promise((resolve, reject) => {
     const rows: unknown[][] = [];
     let fields: Array<{ name: string }> = [];
@@ -391,6 +391,10 @@ function readLimited(
       finish(err);
     }
   });
+}
+
+function boundedRowCount(maxRows: number): number {
+  return Number.isFinite(maxRows) ? Math.max(0, Math.floor(maxRows)) : Number.MAX_SAFE_INTEGER;
 }
 
 interface MysqlReadResult {
