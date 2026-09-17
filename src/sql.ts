@@ -111,6 +111,36 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
 
     // /* block comment */
     if (c === '/' && sql[i + 1] === '*') {
+      if (options === 'mysql' && sql[i + 2] === '!') {
+        i += 3;
+        const versionStart = i;
+        while (i < n && i - versionStart < 5 && /[0-9]/.test(sql[i]!)) i += 1;
+        const bodyStart = i;
+        const end = sql.indexOf('*/', bodyStart);
+        const bodyEnd = end === -1 ? n : end;
+
+        // MySQL executes the contents of `/*!...*/`; retain the wrapper as
+        // symbols so placeholder rewriting and other reconstruction helpers
+        // preserve the original executable comment text.
+        tokens.push({ type: 'symbol', value: sql.slice(at, bodyStart), pos: at, depth });
+        for (const token of scan(sql.slice(bodyStart, bodyEnd), 'mysql')) {
+          tokens.push({
+            ...token,
+            pos: bodyStart + token.pos,
+            depth,
+          });
+          if (token.type === 'symbol') {
+            if (token.value === '(') depth += 1;
+            else if (token.value === ')') depth = Math.max(0, depth - 1);
+          }
+        }
+        if (end !== -1) {
+          tokens.push({ type: 'symbol', value: '*/', pos: bodyEnd, depth });
+          i = bodyEnd + 2;
+        }
+        continue;
+      }
+
       i += 2;
       while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
       i = Math.min(n, i + 2);

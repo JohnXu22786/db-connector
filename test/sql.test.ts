@@ -118,6 +118,12 @@ test('REPLACE under a CTE and SELECT ... INTO are writes or PostgreSQL DDL', () 
   assert.equal(classifyStatement('SELECT (SELECT 1 INTO x) FROM t').kind, 'select');
 });
 
+test('MySQL executable comments cannot bypass the read-only gate', () => {
+  const sql = "SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */";
+  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+  assert.equal(isReadStatement(sql, 'mysql'), false);
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');
