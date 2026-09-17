@@ -271,6 +271,33 @@ test('PostgreSQL JSONB operators are not positional parameters', () => {
   });
 });
 
+test('PostgreSQL FETCH row-limit placeholders remain positional parameters', () => {
+  for (const clause of ['FETCH FIRST ? ROWS ONLY', 'FETCH NEXT ? ROW ONLY']) {
+    assert.deepEqual(
+      toDollarPlaceholders(`SELECT id FROM t ${clause}`, 'postgres'),
+      {
+        sql: `SELECT id FROM t ${clause.replace('?', '$1')}`,
+        count: 1,
+      },
+    );
+  }
+});
+
+test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESCAPE', () => {
+  assert.deepEqual(
+    toDollarPlaceholders("SELECT value FROM t WHERE value SIMILAR TO ? ESCAPE '!'", 'postgres'),
+    {
+      sql: "SELECT value FROM t WHERE value SIMILAR TO $1 ESCAPE '!'",
+      count: 1,
+    },
+  );
+});
+
+test('PostgreSQL JSONB operators accept keyword operands', () => {
+  const sql = 'SELECT payload ? partition';
+  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 });
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',

@@ -324,11 +324,12 @@ function markQuestionOperators(tokens: Token[]): void {
 
 const QUESTION_OPERATOR_BOUNDARIES = new Set([
   'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FIRST', 'NEXT', 'ROW', 'ROWS',
   'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO', 'VALUES', 'SET',
   'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'AND', 'OR', 'NOT', 'IS',
-  'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
+  'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO', 'ESCAPE', 'BETWEEN', 'AS', 'ON', 'USING', 'JOIN',
   'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS', 'WHEN', 'THEN', 'ELSE',
-  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'PARTITION', 'FILTER',
+  'END', 'ASC', 'DESC', 'NULLS', 'COLLATE', 'OVER', 'FILTER',
   'WINDOW',
 ]);
 
