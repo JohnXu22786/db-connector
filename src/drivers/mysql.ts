@@ -1,9 +1,10 @@
 ﻿/**
  * MySQL driver over the optional `mysql2/promise` package (peer dependency).
- * Uses server-side prepared statements (`execute`) so values never touch SQL
- * text, runs reads inside a READ ONLY transaction, wraps writes in
- * BEGIN/COMMIT/ROLLBACK, and cancels in-flight queries by destroying the
- * connection when the caller's AbortSignal fires.
+ * Uses bound values for all statements, streams capped reads through the
+ * callback connection exposed by mysql2's promise wrapper, runs reads inside
+ * a READ ONLY transaction, wraps writes in BEGIN/COMMIT/ROLLBACK, and
+ * cancels in-flight queries by destroying the connection when the caller's
+ * AbortSignal fires.
  */
 
 import { ErrorCode, DbConnectorError } from '../errors.js';
@@ -14,6 +15,8 @@ import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
   config?: { database?: string };
+  /** Underlying callback connection exposed by mysql2's promise wrapper. */
+  connection?: MysqlRawConnection;
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   execute(options: {
     sql: string;
@@ -26,6 +29,26 @@ interface MysqlConnection {
   rollback(): Promise<void>;
   destroy(): void;
   end(): Promise<void>;
+}
+
+interface MysqlRawConnection {
+  execute(input: {
+    sql: string;
+    values?: unknown[];
+    rowsAsArray?: boolean;
+  }): MysqlRawQuery;
+}
+
+interface MysqlRawQuery {
+  stream(options?: { objectMode?: boolean }): MysqlReadStream;
+}
+
+interface MysqlReadStream {
+  on(event: 'fields', listener: (fields: Array<{ name: string }>) => void): this;
+  on(event: 'data', listener: (row: unknown[]) => void): this;
+  on(event: 'end', listener: () => void): this;
+  on(event: 'error', listener: (err: unknown) => void): this;
+  destroy(error?: Error): this;
 }
 
 interface MysqlModule {
@@ -159,13 +182,37 @@ export class MysqlDriver implements DriverApi {
     );
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
       let rows: unknown;
       let fields: unknown;
+      let hasMoreRows = false;
       try {
-        [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
+        if (maxRows === undefined) {
+          [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
+        } else {
+          if (!conn.connection) {
+            throw new DbConnectorError(
+              ErrorCode.QueryFailed,
+              'bounded MySQL reads require the event-emitting mysql2 connection',
+            );
+          }
+          const limited = await readLimited(
+            conn.connection,
+            sql,
+            params,
+            signal,
+            maxRows,
+          );
+          ({ rows, fields } = limited);
+          hasMoreRows = limited.hasMoreRows === true;
+        }
       } catch (err) {
         try {
           await conn.query('ROLLBACK');
@@ -179,7 +226,7 @@ export class MysqlDriver implements DriverApi {
       } catch (rollbackErr) {
         throw new MysqlRollbackFailure(undefined, rollbackErr);
       }
-      return { rows, fields };
+      return { rows, fields, ...(hasMoreRows ? { hasMoreRows: true } : {}) };
     }, signal);
     return outcomeOf(result as MysqlReadResult);
   }
@@ -291,9 +338,65 @@ export class MysqlDriver implements DriverApi {
   }
 }
 
+/** Consume a MySQL prepared-statement stream without retaining rows past the cap. */
+function readLimited(
+  connection: MysqlRawConnection,
+  sql: string,
+  params: unknown[],
+  signal: AbortSignal,
+  maxRows: number,
+): Promise<MysqlReadResult> {
+  const cap = Number.isFinite(maxRows) ? Math.max(0, Math.floor(maxRows)) : Number.MAX_SAFE_INTEGER;
+  return new Promise((resolve, reject) => {
+    const rows: unknown[][] = [];
+    let fields: Array<{ name: string }> = [];
+    let hasMoreRows = false;
+    let settled = false;
+    let stream: MysqlReadStream | undefined;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const finish = (err?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve({ rows, fields, hasMoreRows });
+    };
+    const onAbort = (): void => {
+      const err = cancelError(signal);
+      stream?.destroy(err);
+      finish(err);
+    };
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      stream = connection
+        .execute({ sql, values: params, rowsAsArray: true })
+        .stream({ objectMode: true });
+      stream.on('fields', (nextFields) => {
+        fields = nextFields;
+      });
+      stream.on('data', (row) => {
+        if (rows.length < cap) rows.push(row);
+        else hasMoreRows = true;
+      });
+      stream.on('end', () => finish());
+      stream.on('error', (err) => finish(err));
+      if (signal.aborted) onAbort();
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
 interface MysqlReadResult {
   rows: unknown[][];
   fields: Array<{ name: string }>;
+  hasMoreRows?: boolean;
 }
 
 export function indexesFromStatistics(
@@ -332,7 +435,12 @@ export function indexesFromStatistics(
 function outcomeOf(result: MysqlReadResult): ReadOutcome {
   const columns = result.fields.map((field) => field.name);
   const aligned = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows: aligned, rowCount: aligned.length };
+  return {
+    columns,
+    rows: aligned,
+    rowCount: aligned.length,
+    ...(result.hasMoreRows ? { hasMoreRows: true } : {}),
+  };
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {

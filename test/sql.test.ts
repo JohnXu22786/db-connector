@@ -40,6 +40,16 @@ test('classify simple statements', () => {
   assert.equal(classifyStatement('   -- nothing but a comment').kind, 'unknown');
 });
 
+test('MySQL executable comments cannot hide writes from the read gate', () => {
+  const sql = 'SELECT /*!50000 1 INTO OUTFILE "/tmp/out" */';
+  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+  assert.equal(isReadStatement(sql, 'mysql'), false);
+  assert.equal(
+    classifyStatement('SELECT (/*!50000 1 ) */ INTO OUTFILE "/tmp/out"', 'mysql').kind,
+    'write',
+  );
+});
+
 test('PRAGMA is never trusted on the read path (it can write)', () => {
   assert.equal(classifyStatement('PRAGMA table_info(users)').kind, 'unknown');
   assert.equal(classifyStatement('PRAGMA journal_mode = WAL').kind, 'unknown');
@@ -303,6 +313,16 @@ test('rewriteNamedToPositional ignores colons inside strings and casts', () => {
   assert.deepEqual(out.order, ['v']);
 });
 
+test('rewriteNamedToPositional preserves MySQL executable-comment delimiters', () => {
+  const out = rewriteNamedToPositional(
+    'SELECT /*!80000 SQL_NO_CACHE */ :value',
+    ['value'],
+    'mysql',
+  );
+  assert.equal(out.sql, 'SELECT /*!80000 SQL_NO_CACHE */ ?');
+  assert.deepEqual(out.order, ['value']);
+});
+
 test('ensureSelectLimit appends LIMIT only when none exists at top level', () => {
   const withLimit = ensureSelectLimit('SELECT id FROM t LIMIT 5', 10);
   assert.equal(withLimit.applied, false);
@@ -323,9 +343,148 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit replaces unbounded top-level LIMIT forms', () => {
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -1', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -01', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -10', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT ALL', 3, 'postgres'),
+    { sql: 'SELECT id FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -0', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT -0', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 10', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5, -1', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 5, 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 5, -0', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 5, -0', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT -1, 5', 3, 'mysql'),
+    { sql: 'SELECT id FROM t LIMIT -1, 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t LIMIT 10 + 10', 3, 'sqlite'),
+    { sql: 'SELECT id FROM t LIMIT 10 + 10', applied: false },
+  );
+});
+
+test('ensureSelectLimit handles FETCH and compound read syntax', () => {
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST 5 ROWS ONLY', 3, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST 3 ROWS ONLY', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST 2 ROWS ONLY', 3, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST 2 ROWS ONLY', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST ? ROWS ONLY', 3, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST ? ROWS ONLY', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id AS fetch FROM t FETCH FIRST 5 ROWS ONLY', 3, 'postgres'),
+    { sql: 'SELECT id AS fetch FROM t FETCH FIRST 3 ROWS ONLY', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST 5 ROWS WITH TIES', 3, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST 5 ROWS WITH TIES', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT id FROM t FETCH FIRST (5) ROWS ONLY', 3, 'postgres'),
+    { sql: 'SELECT id FROM t FETCH FIRST (5) ROWS ONLY', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT fetch FROM t', 3, 'sqlite'),
+    { sql: 'SELECT fetch FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT * FROM merge', 3, 'sqlite'),
+    { sql: 'SELECT * FROM merge LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT 1 UNION ALL VALUES (2)', 3, 'sqlite'),
+    { sql: 'SELECT 1 UNION ALL VALUES (2)', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('VALUES (1) UNION ALL SELECT 2', 3, 'sqlite'),
+    { sql: 'VALUES (1) UNION ALL SELECT 2 LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('VALUES (1) UNION ALL SELECT 2 LIMIT -1', 3, 'sqlite'),
+    { sql: 'VALUES (1) UNION ALL SELECT 2 LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SHOW TABLES', 3, 'mysql'),
+    { sql: 'SHOW TABLES', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('DESCRIBE users', 3, 'mysql'),
+    { sql: 'DESCRIBE users', applied: false },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('EXPLAIN UPDATE users SET name = "x"', 3, 'mysql'),
+    { sql: 'EXPLAIN UPDATE users SET name = "x"', applied: false },
+  );
+  assert.equal(
+    ensureSelectLimit('SELECT id FROM t # trailing comment', 3, 'mysql').sql,
+    'SELECT id FROM t LIMIT 3 # trailing comment',
+  );
+  assert.equal(
+    ensureSelectLimit('SELECT 1 /* outer /* inner */ LIMIT 100 */', 3, 'postgres').sql,
+    'SELECT 1 LIMIT 3 /* outer /* inner */ LIMIT 100 */',
+  );
+  assert.deepEqual(
+    ensureSelectLimit('VALUES (1), (2)', 1, 'postgres'),
+    { sql: 'VALUES (1), (2) LIMIT 1', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT * FROM t OFFSET 5', 3, 'postgres'),
+    { sql: 'SELECT * FROM t LIMIT 3 OFFSET 5', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT offset(5) FROM t', 3, 'postgres'),
+    { sql: 'SELECT offset(5) FROM t LIMIT 3', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT * FROM t FOR UPDATE', 3, 'postgres'),
+    { sql: 'SELECT * FROM t LIMIT 3 FOR UPDATE', applied: true },
+  );
+  assert.deepEqual(
+    ensureSelectLimit('SELECT * FROM t FOR UPDATE', 3, 'mysql'),
+    { sql: 'SELECT * FROM t LIMIT 3 FOR UPDATE', applied: true },
+  );
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');
+  assert.equal(normalizeText('SELECT 1 # hidden'), 'SELECT 1');
+});
+
+test('normalizeText preserves PostgreSQL JSON operators without a dialect', () => {
+  assert.equal(
+    normalizeText("SELECT data #> '{foo}' FROM t"),
+    "SELECT data #> 'x' FROM t",
+  );
+  assert.equal(normalizeText('SELECT 1 #> SECRET'), 'SELECT 1 #>');
 });
 
 test('summarizeSql caps length and keeps a stable digest', () => {

@@ -12,7 +12,7 @@ import { mkdir, open, readFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { ErrorCode, DbConnectorError } from './errors.js';
 import { summarizeSql } from './sql.js';
-import type { AuditRecord, WayKind } from './types.js';
+import type { AuditRecord, DriverKind, WayKind } from './types.js';
 import { sha256, uid } from './util.js';
 
 export interface AuditInput {
@@ -20,6 +20,7 @@ export interface AuditInput {
   kind: AuditRecord['kind'];
   way: WayKind;
   sql: string;
+  driver?: DriverKind;
   maxSqlChars: number;
   rows: number;
   durationMs: number;
@@ -68,7 +69,7 @@ export class AuditLog {
       connection: input.connection,
       kind: input.kind,
       way: input.way,
-      statement: summarizeSql(input.sql, input.maxSqlChars),
+      statement: summarizeSql(input.sql, input.maxSqlChars, input.driver),
       rows: Math.max(0, Math.floor(input.rows) || 0),
       durationMs: Math.max(0, Math.round(input.durationMs)),
       status: input.status,

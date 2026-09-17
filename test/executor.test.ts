@@ -209,15 +209,42 @@ test('failed SELECT and EXPLAIN through exec are reported and audited as reads',
     assert.equal(records[0]!.status, 'error');
     assert.equal(records[0]!.error?.code, ErrorCode.QueryFailed);
     assert.equal(records[0]!.error?.message, 'driver read failed');
+    assert.equal(
+      records[0]!.statement.summary,
+      sql === 'SELECT 1' ? 'SELECT 1 LIMIT 1000' : 'EXPLAIN SELECT 1 LIMIT 1000',
+    );
   }
+});
+
+test('failed guarded queries audit the SQL sent to the driver', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  installDriver(h, emptyDriver({
+    read: async () => {
+      throw new Error('query read failed');
+    },
+  }));
+  h.connectors.define({ name: 'broken-guarded-query', driver: 'sqlite' });
+
+  await assert.rejects(
+    h.engine.query(
+      { connection: 'broken-guarded-query', sql: 'SELECT 1', way: 'cli' },
+      freshSignal(),
+    ),
+    /query read failed/,
+  );
+
+  const records = await h.audit.query({ connection: 'broken-guarded-query' });
+  assert.equal(records[0]!.statement.summary, 'SELECT 1 LIMIT 2');
 });
 
 test('read-like exec applies the server-side result limit before reading', async () => {
   const h = makeHarness({ query: { maxRows: 2 } });
   let receivedSql: string | undefined;
+  let receivedLimit: number | undefined;
   installDriver(h, emptyDriver({
-    read: async (sql) => {
+    read: async (sql, _params, _signal, maxRows) => {
       receivedSql = sql;
+      receivedLimit = maxRows;
       return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
     },
   }));
@@ -229,8 +256,117 @@ test('read-like exec applies the server-side result limit before reading', async
   );
 
   assert.equal(receivedSql, 'SELECT id FROM items LIMIT 2');
+  assert.equal(receivedLimit, 2);
   assert.equal(result.kind, 'read');
   assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+  const records = await h.audit.query({ connection: 'bounded-read-exec' });
+  assert.equal(records[0]!.statement.summary, 'SELECT id FROM items LIMIT 2');
+});
+
+test('read-like exec keeps metadata and non-SELECT EXPLAIN syntax valid', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  const receivedSql: string[] = [];
+  installDriver(h, emptyDriver({
+    kind: 'mysql',
+    read: async (sql) => {
+      receivedSql.push(sql);
+      return { columns: ['value'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-read-like-exec', driver: 'mysql', database: 'test' });
+
+  for (const sql of [
+    'SHOW TABLES',
+    'DESCRIBE users',
+    'EXPLAIN UPDATE users SET name = "x"',
+    'EXPLAIN SELECT * FROM users',
+  ]) {
+    await h.engine.exec(
+      { connection: 'bounded-read-like-exec', sql, way: 'cli' },
+      freshSignal(),
+    );
+  }
+
+  assert.deepEqual(receivedSql, [
+    'SHOW TABLES',
+    'DESCRIBE users',
+    'EXPLAIN UPDATE users SET name = "x"',
+    'EXPLAIN SELECT * FROM users LIMIT 2',
+  ]);
+});
+
+test('read-only query preserves metadata statement syntax', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedSql: string | undefined;
+  installDriver(h, emptyDriver({
+    kind: 'mysql',
+    read: async (sql) => {
+      receivedSql = sql;
+      return { columns: ['value'], rows: [[1], [2]], rowCount: 2 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-read-like-query', driver: 'mysql', database: 'test' });
+
+  await h.engine.query(
+    { connection: 'bounded-read-like-query', sql: 'SHOW TABLES', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(receivedSql, 'SHOW TABLES');
+});
+
+test('read-only query reports driver-detected truncation without a SQL guard', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  installDriver(h, emptyDriver({
+    kind: 'mysql',
+    read: async () => ({
+      columns: ['value'],
+      rows: [[1], [2]],
+      rowCount: 2,
+      hasMoreRows: true,
+    }),
+  }));
+  h.connectors.define({ name: 'driver-truncated-query', driver: 'mysql', database: 'test' });
+
+  const result = await h.engine.query(
+    { connection: 'driver-truncated-query', sql: 'SHOW TABLES', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(result.truncated, true);
+});
+
+test('read-like exec preserves a zero row cap in the server-side guard', async () => {
+  const h = makeHarness({ query: { maxRows: 0 } });
+  let receivedSql: string | undefined;
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      receivedSql = sql;
+      return { columns: ['id'], rows: [[1]], rowCount: 1 };
+    },
+  }));
+  h.connectors.define({ name: 'zero-row-read-exec', driver: 'sqlite' });
+
+  const result = await h.engine.exec(
+    { connection: 'zero-row-read-exec', sql: 'SELECT id FROM items', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(receivedSql, 'SELECT id FROM items LIMIT 0');
+  assert.match(result.note, /returned 0 row\(s\) \(capped at 0\)/);
+});
+
+test('read-like exec leaves top-level VALUES unchanged for SQLite', async () => {
+  const h = makeHarness({ query: { maxRows: 1 } });
+  await h.engine.connect({ name: 'values-read-exec', driver: 'sqlite', database: ':memory:' });
+
+  const result = await h.engine.exec(
+    { connection: 'values-read-exec', sql: 'VALUES (1), (2)', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(result.kind, 'read');
+  assert.match(result.note, /returned 1 row\(s\) \(capped at 1\)/);
 });
 
 test('failed schema introspection is audited', async () => {

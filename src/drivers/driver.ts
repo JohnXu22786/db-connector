@@ -14,6 +14,8 @@ export interface ReadOutcome {
   columns: string[];
   rows: unknown[][];
   rowCount: number;
+  /** True when a bounded read observed at least one row beyond `maxRows`. */
+  hasMoreRows?: boolean;
 }
 
 /** Result of a write / DDL statement, transactional where supported. */
@@ -60,10 +62,17 @@ export interface DriverApi {
   /** Open / validate the underlying handle. Idempotent. */
   connect(): Promise<void>;
   /**
-   * Execute a read-only statement (SELECT/EXPLAIN). Must observe `signal`
-   * and settle only after its owned work reaches quiescence.
+   * Execute a read-only statement (SELECT/EXPLAIN/metadata forms). Drivers
+   * should retain no more than `maxRows` rows when their protocol supports
+   * bounded reads. Must observe `signal` and settle only after its owned work
+   * reaches quiescence.
    */
-  read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome>;
+  read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome>;
   /**
    * Execute a write or DDL statement with transaction protection where
    * supported: COMMIT on success, ROLLBACK on failure. Must observe `signal`.

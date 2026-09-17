@@ -23,6 +23,7 @@ interface PgQueryResult {
 
 interface PgArrayQueryResult extends Omit<PgQueryResult, 'rows'> {
   rows: unknown[][];
+  hasMoreRows?: boolean;
 }
 
 interface PgQueryConfig {
@@ -31,16 +32,29 @@ interface PgQueryConfig {
   signal?: AbortSignal;
   name?: string;
   rowMode?: 'array';
+  rows?: number;
+}
+
+interface PgLimitedQuery {
+  on(event: 'row', listener: (row: unknown[]) => void): PgLimitedQuery;
+  on(event: 'error', listener: (err: unknown) => void): PgLimitedQuery;
+  on(event: 'end', listener: (result: PgArrayQueryResult) => void): PgLimitedQuery;
+  handlePortalSuspended(connection: { sync(): void }): void;
 }
 
 interface PgQueryable {
   query(config: PgQueryConfig): Promise<PgQueryResult>;
+  query(
+    config: PgQueryConfig,
+    callback: (err: unknown, result: PgArrayQueryResult) => void,
+  ): PgLimitedQuery;
   query(text: string): Promise<PgQueryResult>;
 }
 
 interface PgClientLike extends PgQueryable {
   connect(): Promise<void>;
   end(): Promise<void>;
+  cancel?(client: PgClientLike, query: PgLimitedQuery): void;
 }
 
 type PgModule = { Client: new (...args: never[]) => PgClientLike };
@@ -129,14 +143,20 @@ export class PgDriver implements DriverApi {
     return this.client;
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
-    return this.withOperationLock(() => this.readUnlocked(sql, params, signal), signal);
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
+    return this.withOperationLock(() => this.readUnlocked(sql, params, signal, maxRows), signal);
   }
 
   private async readUnlocked(
     sql: string,
     params: unknown[],
     signal: AbortSignal,
+    maxRows?: number,
   ): Promise<ReadOutcome> {
     const client = this.ensure();
     const converted = toDollarPlaceholders(sql, 'postgres');
@@ -145,14 +165,16 @@ export class PgDriver implements DriverApi {
       // classifier cannot mutate data inside a READ ONLY transaction.
       await client.query('BEGIN TRANSACTION READ ONLY');
       try {
-        const result = await client.query({
-          text: converted.sql,
-          values: params,
-          signal,
-          rowMode: 'array',
-        } as never);
+        const result = maxRows === undefined
+          ? await client.query({
+            text: converted.sql,
+            values: params,
+            signal,
+            rowMode: 'array',
+          }) as unknown as PgArrayQueryResult
+          : await readLimited(client, converted.sql, params, signal, maxRows);
         await client.query('ROLLBACK');
-        return outcomeOf(result as unknown as PgArrayQueryResult);
+        return outcomeOf(result);
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         throw err;
@@ -290,10 +312,100 @@ export class PgDriver implements DriverApi {
   }
 }
 
+/** Read only the first page from PostgreSQL's extended-query portal. */
+const MAX_POSTGRES_PORTAL_ROWS = 0xffff_ffff;
+
+function readLimited(
+  client: PgClientLike,
+  text: string,
+  values: unknown[],
+  signal: AbortSignal,
+  maxRows: number,
+): Promise<PgArrayQueryResult> {
+  const cap = Number.isFinite(maxRows)
+    ? Math.min(MAX_POSTGRES_PORTAL_ROWS, Math.max(0, Math.floor(maxRows)))
+    : MAX_POSTGRES_PORTAL_ROWS;
+  return new Promise((resolve, reject) => {
+    const rows: unknown[][] = [];
+    let hasMoreRows = false;
+    let settled = false;
+    let query: PgLimitedQuery | undefined;
+    let aborted = false;
+    let cancelSent = false;
+    const cleanup = () => signal.removeEventListener('abort', onAbort);
+    const finish = (err: unknown, result?: PgArrayQueryResult): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (err) reject(err);
+      else resolve({
+        fields: result?.fields ?? [],
+        rows,
+        rowCount: rows.length,
+        hasMoreRows,
+      });
+    };
+    const onAbort = (): void => {
+      aborted = true;
+      if (!query) {
+        finish(cancelError(signal));
+        return;
+      }
+      if (cancelSent) return;
+      cancelSent = true;
+      if (!client.cancel) {
+        finish(cancelError(signal));
+        return;
+      }
+      try {
+        client.cancel(client, query);
+      } catch (err) {
+        finish(err);
+      }
+    };
+
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    try {
+      // A zero cap still needs one protocol round trip to obtain column
+      // metadata for forms such as SHOW. The row listener prevents pg from
+      // retaining that row; it is only used to report that more rows exist.
+      const portalRows = cap === MAX_POSTGRES_PORTAL_ROWS ? cap : cap + 1;
+      query = client.query({
+        text,
+        values,
+        signal,
+        rowMode: 'array',
+        rows: portalRows,
+      }) as unknown as PgLimitedQuery;
+      query.on('row', (row) => {
+        if (rows.length < cap) rows.push(row);
+        else hasMoreRows = true;
+      });
+      query.on('error', (err) => finish(err));
+      query.on('end', (result) => finish(undefined, result));
+      // Do not let node-postgres automatically request the next portal page.
+      query.handlePortalSuspended = (connection) => connection.sync();
+      if (aborted) onAbort();
+    } catch (err) {
+      finish(err);
+    }
+  });
+}
+
 function outcomeOf(result: PgArrayQueryResult): ReadOutcome {
   const columns = result.fields.map((f) => f.name);
   const rows = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows, rowCount: rows.length };
+  return {
+    columns,
+    rows,
+    rowCount: rows.length,
+    ...(result.hasMoreRows ? { hasMoreRows: true } : {}),
+  };
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {

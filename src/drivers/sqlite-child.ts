@@ -8,7 +8,7 @@
  * from exiting (a stuck worker thread would).
  *
  * Protocol (process.send / process.on('message')):
- *   { id, op: 'query'|'write'|'schema'|'close', sql?, params?, isDdl? }
+ *   { id, op: 'query'|'write'|'schema'|'close', sql?, params?, maxRows?, isDdl? }
  * Replies: { id, ok: true, payload } | { id, ok: false, error }.
  */
 
@@ -20,6 +20,7 @@ interface Request {
   op: 'query' | 'write' | 'schema' | 'close';
   sql?: string;
   params?: unknown[];
+  maxRows?: number;
   isDdl?: boolean;
 }
 
@@ -91,9 +92,43 @@ function runQuery(req: Request): unknown {
   const stmt = db.prepare(req.sql ?? '');
   const columns = stmt.columns().map((column) => column.name);
   stmt.setReturnArrays(true);
-  const rows = stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][];
-  const data = rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows: data, rowCount: data.length };
+  const bounded = req.maxRows === undefined
+    ? {
+      rows: stmt.all(...(req.params ?? []) as never[]) as unknown as unknown[][],
+      hasMoreRows: false,
+    }
+    : readRows(stmt, req.params ?? [], req.maxRows);
+  const data = bounded.rows.map((row) => row.map((value) => value ?? null));
+  return {
+    columns,
+    rows: data,
+    rowCount: data.length,
+    ...(bounded.hasMoreRows ? { hasMoreRows: true } : {}),
+  };
+}
+
+interface BoundedRows {
+  rows: unknown[][];
+  hasMoreRows: boolean;
+}
+
+function readRows(
+  stmt: { iterate(...params: never[]): Iterable<unknown> },
+  params: unknown[],
+  maxRows: number,
+): BoundedRows {
+  const rows: unknown[][] = [];
+  const cap = Math.max(0, Math.floor(maxRows));
+  let hasMoreRows = false;
+  for (const row of stmt.iterate(...params as never[])) {
+    if (rows.length < cap) {
+      rows.push(row as unknown[]);
+    } else {
+      hasMoreRows = true;
+      break;
+    }
+  }
+  return { rows, hasMoreRows };
 }
 
 function runWrite(req: Request): unknown {

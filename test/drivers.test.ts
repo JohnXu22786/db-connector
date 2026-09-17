@@ -665,6 +665,269 @@ test('MySQL invalidates an active connection abort before a queued request runs'
 
 const logger = { debug() {}, info() {}, warn() {} };
 
+test('SQLite driver bounds read rows before returning them', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-read-cap',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+
+  try {
+    await driver.connect();
+    const result = await driver.read('VALUES (1), (2), (3)', [], signal(), 2);
+    assert.deepEqual(result.rows, [[1], [2]]);
+    assert.equal(result.rowCount, 2);
+    assert.equal(result.hasMoreRows, true);
+  } finally {
+    await driver.close();
+  }
+});
+
+test('PostgreSQL driver bounds portal reads', async () => {
+  const events: string[] = [];
+  let rowListener: ((row: unknown[]) => void) | undefined;
+  let errorListener: ((err: unknown) => void) | undefined;
+  let endListener: ((result: PgResult) => void) | undefined;
+  const limitedQuery = {
+    on(event: string, listener: (value: unknown) => void) {
+      if (event === 'row') rowListener = listener as (row: unknown[]) => void;
+      if (event === 'error') errorListener = listener;
+      if (event === 'end') endListener = listener as (result: PgResult) => void;
+      return limitedQuery;
+    },
+    handlePortalSuspended(connection: { sync(): void }) {
+      connection.sync();
+    },
+  };
+  const client = {
+    query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
+      if (typeof input === 'string') {
+        events.push(input);
+        return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+      }
+      queueMicrotask(() => {
+        try {
+          rowListener?.([1]);
+          rowListener?.([2]);
+          rowListener?.([3]);
+          limitedQuery.handlePortalSuspended({ sync: () => events.push('SYNC') });
+          const result = { fields: [{ name: 'value' }], rows: [[1], [2], [3]], rowCount: 3 };
+          if (callback) callback(null, result);
+          else endListener?.(result);
+        } catch (err) {
+          errorListener?.(err);
+        }
+      });
+      return limitedQuery;
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as { client: unknown }).client = client;
+
+  const result = await driver.read('SHOW ALL', [], signal(), 2);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.hasMoreRows, true);
+  assert.deepEqual(events, ['BEGIN TRANSACTION READ ONLY', 'SYNC', 'ROLLBACK']);
+});
+
+test('PostgreSQL zero-cap reads do not retain callback result rows', async () => {
+  let callbackProvided = false;
+  let rowListener: ((row: unknown[]) => void) | undefined;
+  let endListener: ((result: PgResult) => void) | undefined;
+  const limitedQuery = {
+    on(event: string, listener: (value: unknown) => void) {
+      if (event === 'row') rowListener = listener as (row: unknown[]) => void;
+      if (event === 'end') endListener = listener as (result: PgResult) => void;
+      return limitedQuery;
+    },
+    handlePortalSuspended() {},
+  };
+  const client = {
+    query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
+      if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+      callbackProvided = callback !== undefined;
+      queueMicrotask(() => {
+        rowListener?.([1]);
+        const result = { fields: [{ name: 'value' }], rows: [[1]], rowCount: 1 };
+        if (callback) callback(null, result);
+        else endListener?.(result);
+      });
+      return limitedQuery;
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as { client: unknown }).client = client;
+
+  const result = await driver.read('SHOW ALL', [], signal(), 0);
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.hasMoreRows, true);
+  assert.equal(callbackProvided, false);
+});
+
+test('PostgreSQL clamps oversized portal row counts', async () => {
+  let rowsRequested: number | undefined;
+  let endListener: ((result: PgResult) => void) | undefined;
+  const limitedQuery = {
+    on(event: string, listener: (value: unknown) => void) {
+      if (event === 'end') endListener = listener as (result: PgResult) => void;
+      return limitedQuery;
+    },
+    handlePortalSuspended() {},
+  };
+  const client = {
+    query(input: unknown, callback?: (err: unknown, result: PgResult) => void) {
+      if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+      rowsRequested = (input as { rows?: number }).rows;
+      queueMicrotask(() => {
+        const result = { fields: [{ name: 'value' }], rows: [], rowCount: 0 };
+        if (callback) callback(null, result);
+        else endListener?.(result);
+      });
+      return limitedQuery;
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as { client: unknown }).client = client;
+
+  await driver.read('SELECT 1', [], signal(), 0x1_0000_0000);
+  assert.equal(rowsRequested, 0xffff_ffff);
+});
+
+test('PostgreSQL bounded portal reads cancel when aborted', async () => {
+  let errorListener: ((err: unknown) => void) | undefined;
+  let cancelCalls = 0;
+  const limitedQuery = {
+    on(event: string, listener: (value: unknown) => void) {
+      if (event === 'error') errorListener = listener;
+      return limitedQuery;
+    },
+    handlePortalSuspended() {},
+  };
+  const client = {
+    query(input: unknown) {
+      if (typeof input === 'string') return Promise.resolve({ fields: [], rows: [], rowCount: 0 });
+      return limitedQuery;
+    },
+    cancel() {
+      cancelCalls += 1;
+      queueMicrotask(() => errorListener?.(new Error('cancelled')));
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as { client: unknown }).client = client;
+  const controller = new AbortController();
+  const request = driver.read('SELECT pg_sleep(10)', [], controller.signal, 2);
+
+  await nextTurn();
+  controller.abort();
+
+  await assert.rejects(request, /cancelled/);
+  assert.equal(cancelCalls, 1);
+});
+
+test('MySQL driver streams only capped read rows', async () => {
+  const events: string[] = [];
+  const rawInputs: unknown[] = [];
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  const stream = {
+    on(event: string, listener: (...args: unknown[]) => void) {
+      const current = listeners.get(event) ?? [];
+      current.push(listener);
+      listeners.set(event, current);
+      return stream;
+    },
+  };
+  const rawQuery = {
+    stream() {
+      queueMicrotask(() => {
+        for (const listener of listeners.get('fields') ?? []) listener([{ name: 'value' }]);
+        for (const row of [[1], [2], [3]]) {
+          for (const listener of listeners.get('data') ?? []) listener(row);
+        }
+        for (const listener of listeners.get('end') ?? []) listener();
+      });
+      return stream;
+    },
+  };
+  const conn = {
+    connection: { execute: (input: unknown) => { rawInputs.push(input); return rawQuery; } },
+    async query(sql: string) {
+      events.push(sql);
+      return [[], []];
+    },
+    async execute() {
+      return [[], []];
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  (driver as unknown as { conn: unknown }).conn = conn;
+
+  const result = await driver.read('SELECT "?" AS value, ?', ['bound'], signal(), 2);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.hasMoreRows, true);
+  assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'ROLLBACK']);
+  assert.deepEqual(rawInputs, [{ sql: 'SELECT "?" AS value, ?', values: ['bound'], rowsAsArray: true }]);
+});
+
+test('MySQL bounded streams are destroyed when aborted', async () => {
+  let streamDestroyed = false;
+  let connectionDestroyed = false;
+  const stream = {
+    on() {
+      return stream;
+    },
+    destroy() {
+      streamDestroyed = true;
+      return stream;
+    },
+  };
+  const rawQuery = { stream: () => stream };
+  const conn = {
+    connection: { execute: () => rawQuery },
+    async query() { return [[], []]; },
+    async execute() { return [[], []]; },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() { connectionDestroyed = true; },
+    async end() {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  (driver as unknown as { conn: unknown }).conn = conn;
+  const controller = new AbortController();
+  const request = driver.read('SELECT 1', [], controller.signal, 2);
+
+  await nextTurn();
+  controller.abort();
+
+  await assert.rejects(request, (err: unknown) => {
+    assert.ok(err instanceof DbConnectorError);
+    assert.equal(err.code, ErrorCode.Cancelled);
+    return true;
+  });
+  assert.equal(streamDestroyed, true);
+  assert.equal(connectionDestroyed, true);
+});
+
 test('MySQL read conversion preserves empty columns and duplicate values', async () => {
   const driver = new MysqlDriver(
     { name: 'mysql-test', driver: 'mysql', database: 'test' } as never,

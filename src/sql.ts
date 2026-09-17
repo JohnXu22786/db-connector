@@ -69,6 +69,8 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
   let depth = 0;
   const resolvedOptions = typeof options === 'string' ? scanOptionsForDriver(options) : options;
   const sqliteBracketIdentifiers = options === 'sqlite';
+  const mysqlDialect = options === 'mysql';
+  const postgresDialect = options === 'postgres';
   const postgresDollarQuotes = options !== 'sqlite' && options !== 'mysql';
   const backslashEscapes = resolvedOptions.backslashEscapes === true;
   const postgresEscapeStrings = resolvedOptions.postgresEscapeStrings === true;
@@ -88,19 +90,70 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
       continue;
     }
 
-    // -- line comment
-    if (c === '-' && sql[i + 1] === '-') {
+    // MySQL `#` line comment.
+    if (mysqlDialect && c === '#') {
+      i += 1;
+      while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
+      tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
+      continue;
+    }
+
+    // -- line comment. MySQL recognizes this form only when whitespace or a
+    // control character follows the second dash.
+    if (
+      c === '-' &&
+      sql[i + 1] === '-' &&
+      (!mysqlDialect || sql[i + 2] === undefined || /\s/.test(sql[i + 2]!))
+    ) {
       i += 2;
       while (i < n && sql[i] !== '\n' && sql[i] !== '\r') i += 1;
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
       continue;
     }
 
-    // /* block comment */
+    // MySQL executable comments are SQL, not inert comments. Scan their body
+    // at the current parenthesis depth so statements such as SELECT ... INTO
+    // OUTFILE cannot bypass the read-only classifier.
+    if (mysqlDialect && c === '/' && sql[i + 1] === '*' && sql[i + 2] === '!') {
+      tokens.push({ type: 'symbol', value: '/*!', pos: at, depth });
+      const bodyStart = i + 3;
+      const close = sql.indexOf('*/', bodyStart);
+      const bodyEnd = close === -1 ? n : close;
+      let executableDepth = depth;
+      for (const token of scan(sql.slice(bodyStart, bodyEnd), options)) {
+        tokens.push({
+          ...token,
+          pos: token.pos + bodyStart,
+          depth: executableDepth,
+        });
+        if (token.type === 'symbol' && token.value === '(') executableDepth += 1;
+        else if (token.type === 'symbol' && token.value === ')') {
+          executableDepth = Math.max(0, executableDepth - 1);
+        }
+      }
+      if (close !== -1) {
+        tokens.push({ type: 'symbol', value: '*/', pos: close, depth: executableDepth });
+      }
+      depth = executableDepth;
+      i = close === -1 ? n : close + 2;
+      continue;
+    }
+
+    // /* block comment */. PostgreSQL permits nesting block comments.
     if (c === '/' && sql[i + 1] === '*') {
       i += 2;
-      while (i < n && !(sql[i] === '*' && sql[i + 1] === '/')) i += 1;
-      i = Math.min(n, i + 2);
+      let commentDepth = 1;
+      while (i < n && commentDepth > 0) {
+        if (postgresDialect && sql[i] === '/' && sql[i + 1] === '*') {
+          commentDepth += 1;
+          i += 2;
+        } else if (sql[i] === '*' && sql[i + 1] === '/') {
+          commentDepth -= 1;
+          i += 2;
+        } else {
+          i += 1;
+        }
+      }
       tokens.push({ type: 'comment', value: sql.slice(at, i), pos: at, depth });
       continue;
     }
@@ -283,6 +336,22 @@ function firstDataKeyword(sql: string, driver?: DriverKind): Token | undefined {
   return tokens.find(
     (t) => t.type === 'word' && t.depth === 0 && DATA_KEYWORDS.has(t.value.toUpperCase()),
   );
+}
+
+/** Last data-statement keyword at paren depth 0, used for compound queries. */
+function lastDataKeyword(sql: string, driver?: DriverKind): Token | undefined {
+  const tokens = meaningful(sql, driver);
+  for (let i = tokens.length - 1; i >= 0; i -= 1) {
+    const token = tokens[i]!;
+    if (
+      token.type === 'word' &&
+      token.depth === 0 &&
+      (token.value.toUpperCase() === 'SELECT' || token.value.toUpperCase() === 'VALUES')
+    ) {
+      return token;
+    }
+  }
+  return undefined;
 }
 
 const LEADING_READ = new Set([
@@ -593,12 +662,53 @@ function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
 
 /** Collapse whitespace, dropping comments. Used for summaries/digests. */
 export function normalizeText(sql: string, driver?: DriverKind): string {
+  // With no connector dialect, combine the dialect scans to redact literals
+  // safely. Do not let MySQL's `#` comment rule swallow PostgreSQL's `#>` or
+  // `#>>` JSON operators in that compatibility pass. Conversely, retain the
+  // comment tail for an ambiguous unquoted RHS so MySQL comment text is still
+  // redacted when no connector dialect is available.
+  const mysqlTokens = unknownDialectMysqlTokens(sql);
   const tokenSets = driver
     ? [scan(sql, driver)]
-    : [scan(sql), scan(sql, 'mysql'), scan(sql, 'postgres')];
+    : [scan(sql), mysqlTokens, scan(sql, 'postgres')];
   return renderSanitized(sql, tokenSets)
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function unknownDialectMysqlTokens(sql: string): Token[] {
+  return scan(sql, 'mysql').flatMap((token) => {
+    if (token.type !== 'comment' || !token.value.startsWith('#')) return [token];
+    if (sql[token.pos + 1] !== '>' && sql[token.pos + 1] !== '<') return [token];
+    const markerLength = sql[token.pos + 1] === '>' && sql[token.pos + 2] === '>'
+      ? 3
+      : 2;
+    const markerEnd = token.pos + markerLength;
+    const tail = sql.slice(markerEnd, token.pos + token.value.length);
+    // PostgreSQL JSON operators conventionally take a quoted path (or an
+    // ARRAY expression); preserve that source for the other dialect scans to
+    // redact its literals normally. Treat an unquoted tail as MySQL comment
+    // text and remove it.
+    if (/^\s*(?:['"]|ARRAY\s*\[|\()/i.test(tail)) {
+      return [{
+        ...token,
+        type: 'symbol',
+        value: sql.slice(token.pos, markerEnd),
+      }];
+    }
+    return [
+      {
+        ...token,
+        type: 'symbol',
+        value: sql.slice(token.pos, markerEnd),
+      },
+      {
+        ...token,
+        pos: markerEnd,
+        value: tail,
+      },
+    ];
+  });
 }
 
 /**
@@ -690,9 +800,10 @@ export function rewriteNamedToPositional(
 }
 
 /**
- * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
- * already. Used only as a courtesy guard: the executor always caps rows on the
- * consuming side no matter what this returns.
+ * Add a bounded top-level LIMIT to a read-like statement when its syntax
+ * permits it. Existing smaller limits are preserved; larger or explicitly
+ * unbounded forms are tightened. Used only as a courtesy guard: the executor
+ * and drivers also cap rows on the consuming side.
  */
 export function ensureSelectLimit(
   sql: string,
@@ -700,20 +811,227 @@ export function ensureSelectLimit(
   driver?: DriverKind,
 ): { sql: string; applied: boolean } {
   const { kind } = classifyStatement(sql, driver);
-  if (kind !== 'select') return { sql, applied: false };
+  if (kind !== 'select' && kind !== 'explain') return { sql, applied: false };
 
   const tokens = meaningful(sql, driver);
-  const hasTopLevelLimit = tokens.some(
+  // SHOW, DESCRIBE, and EXPLAIN forms that describe a table or a write are
+  // read-like classifications, but their dialect grammars do not accept a
+  // trailing LIMIT. SQLite also rejects a LIMIT after a top-level VALUES;
+  // PostgreSQL accepts it, so keep that distinction here and rely on the
+  // driver-side cap for other dialects whose VALUES grammar is uncertain.
+  const finalData = lastDataKeyword(sql, driver)?.value.toUpperCase();
+  if (finalData === 'VALUES' && driver !== 'postgres') {
+    return { sql, applied: false };
+  }
+  if (finalData !== 'SELECT' && !(finalData === 'VALUES' && driver === 'postgres')) {
+    return { sql, applied: false };
+  }
+
+  const upper = Math.max(0, Math.floor(limit));
+
+  // PostgreSQL also supports FETCH FIRST/NEXT as an existing row limit. Find
+  // the rightmost complete clause so a column alias named FETCH cannot hide
+  // the real clause. WITH TIES is left opaque because it may return more rows
+  // than its literal count.
+  const fetch = findFetchClause(tokens);
+  if (fetch) {
+    if (fetch.withTies || fetch.hasCount && !fetch.count) {
+      return { sql, applied: false };
+    }
+    if (!fetch.hasCount) {
+      const rowWord = tokens[fetch.rowIndex]!;
+      if (upper === 0) {
+        return {
+          sql: sql.slice(0, rowWord.pos) + '0 ' + sql.slice(rowWord.pos),
+          applied: true,
+        };
+      }
+      return { sql, applied: false };
+    }
+    const count = fetch.count!;
+    if (count.value > upper) {
+      return {
+        sql: sql.slice(0, count.start) + String(upper) + sql.slice(count.end),
+        applied: true,
+      };
+    }
+    return { sql, applied: false };
+  }
+
+  const limitIndex = tokens.findIndex(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
   );
-  if (hasTopLevelLimit) return { sql, applied: false };
+  if (limitIndex >= 0) {
+    const limitValue = tokens[limitIndex + 1];
+    if (limitValue?.type === 'word' && limitValue.value.toUpperCase() === 'ALL') {
+      if (!isLimitBoundary(tokens[limitIndex + 2])) return { sql, applied: false };
+      const out = sql.slice(0, limitValue.pos) + String(upper) +
+        sql.slice(limitValue.pos + limitValue.value.length);
+      return { sql: out, applied: true };
+    }
+
+    const count = signedInteger(tokens, limitIndex + 1);
+    if (count) {
+      // MySQL also accepts LIMIT offset, count; the second literal is the
+      // bounded row count in that form.
+      const comma = tokens[count.nextIndex];
+      if (comma?.type === 'symbol' && comma.value === ',') {
+        const rowCount = signedInteger(tokens, count.nextIndex + 1);
+        if (!rowCount || !isLimitBoundary(tokens[rowCount.nextIndex])) {
+          return { sql, applied: false };
+        }
+        if (rowCount.value < 0 || rowCount.value > upper) {
+          return {
+            sql: sql.slice(0, rowCount.start) + String(upper) + sql.slice(rowCount.end),
+            applied: true,
+          };
+        }
+        return { sql, applied: false };
+      }
+
+      if (!isLimitBoundary(comma)) return { sql, applied: false };
+
+      // Negative LIMIT values are unbounded in SQLite. Preserve -0, which is
+      // equivalent to zero, while tightening every other negative literal.
+      if (count.value < 0 || count.value > upper) {
+        return {
+          sql: sql.slice(0, count.start) + String(upper) + sql.slice(count.end),
+          applied: true,
+        };
+      }
+      return { sql, applied: false };
+    }
+
+    return { sql, applied: false };
+  }
 
   assertSingleStatement(sql, driver);
-  const upper = Math.max(1, Math.floor(limit));
-  const insertAt = insertionPoint(sql, driver);
-  const out =
-    sql.slice(0, insertAt) + ` LIMIT ${upper}` + sql.slice(insertAt);
+  const insertion = insertionPoint(sql, driver);
+  if (insertion.beforeClause) {
+    const prefix = sql.slice(0, insertion.offset);
+    const suffix = sql.slice(insertion.offset);
+    const leadingSpace = prefix.length > 0 && !/\s$/.test(prefix) ? ' ' : '';
+    const trailingSpace = suffix.length > 0 && !/^\s/.test(suffix) ? ' ' : '';
+    return {
+      sql: prefix + leadingSpace + `LIMIT ${upper}` + trailingSpace + suffix,
+      applied: true,
+    };
+  }
+  const out = sql.slice(0, insertion.offset) + ` LIMIT ${upper}` + sql.slice(insertion.offset);
   return { sql: out, applied: true };
+}
+
+interface IntegerLiteral {
+  start: number;
+  end: number;
+  nextIndex: number;
+  value: number;
+}
+
+interface FetchClause {
+  rowIndex: number;
+  hasCount: boolean;
+  count?: IntegerLiteral;
+  withTies: boolean;
+}
+
+function findFetchClause(tokens: Token[]): FetchClause | undefined {
+  for (let index = tokens.length - 1; index >= 0; index -= 1) {
+    const fetch = tokens[index];
+    if (
+      fetch?.type !== 'word' ||
+      fetch.depth !== 0 ||
+      fetch.value.toUpperCase() !== 'FETCH'
+    ) {
+      continue;
+    }
+    const direction = tokens[index + 1];
+    if (
+      direction?.type !== 'word' ||
+      direction.depth !== 0 ||
+      (direction.value.toUpperCase() !== 'FIRST' && direction.value.toUpperCase() !== 'NEXT')
+    ) {
+      continue;
+    }
+
+    for (let rowIndex = index + 2; rowIndex < tokens.length; rowIndex += 1) {
+      const row = tokens[rowIndex];
+      if (
+        row?.type !== 'word' ||
+        row.depth !== 0 ||
+        (row.value.toUpperCase() !== 'ROW' && row.value.toUpperCase() !== 'ROWS')
+      ) {
+        continue;
+      }
+      const ending = tokens[rowIndex + 1];
+      const endingWord = ending?.type === 'word' && ending.depth === 0
+        ? ending.value.toUpperCase()
+        : '';
+      if (endingWord === 'ONLY') {
+        const count = unsignedInteger(tokens, index + 2);
+        return {
+          rowIndex,
+          hasCount: rowIndex > index + 2,
+          count: count?.nextIndex === rowIndex ? count : undefined,
+          withTies: false,
+        };
+      }
+      if (
+        endingWord === 'WITH' &&
+        tokens[rowIndex + 2]?.type === 'word' &&
+        tokens[rowIndex + 2]?.depth === 0 &&
+        tokens[rowIndex + 2]?.value.toUpperCase() === 'TIES'
+      ) {
+        const count = unsignedInteger(tokens, index + 2);
+        return {
+          rowIndex,
+          hasCount: rowIndex > index + 2,
+          count: count?.nextIndex === rowIndex ? count : undefined,
+          withTies: true,
+        };
+      }
+      break;
+    }
+  }
+  return undefined;
+}
+
+function isLimitBoundary(token: Token | undefined): boolean {
+  if (!token) return true;
+  if (token.type === 'symbol' && token.value === ';') return true;
+  return token.type === 'word' &&
+    (token.value.toUpperCase() === 'OFFSET' ||
+      token.value.toUpperCase() === 'FETCH' ||
+      token.value.toUpperCase() === 'FOR');
+}
+
+/** Read an unsigned integer whose digits may be separated by whitespace. */
+function unsignedInteger(tokens: Token[], index: number): IntegerLiteral | undefined {
+  const first = tokens[index];
+  if (first?.type !== 'symbol' || !/^\d+$/.test(first.value)) return undefined;
+
+  let digits = first.value;
+  let end = first.pos + first.value.length;
+  let nextIndex = index + 1;
+  while (true) {
+    const next = tokens[nextIndex];
+    if (next?.type !== 'symbol' || !/^\d+$/.test(next.value)) break;
+    digits += next.value;
+    end = next.pos + next.value.length;
+    nextIndex += 1;
+  }
+  return { start: first.pos, end, nextIndex, value: Number(digits) };
+}
+
+/** Read an optional-minus integer literal. */
+function signedInteger(tokens: Token[], index: number): IntegerLiteral | undefined {
+  const token = tokens[index];
+  if (token?.type === 'symbol' && token.value === '-') {
+    const unsigned = unsignedInteger(tokens, index + 1);
+    if (!unsigned) return undefined;
+    return { ...unsigned, start: token.pos, value: -unsigned.value };
+  }
+  return unsignedInteger(tokens, index);
 }
 
 /**
@@ -723,12 +1041,48 @@ export function ensureSelectLimit(
  *  - before a trailing `;` token (so it stays the terminator), or
  *  - after the last meaningful token.
  */
-function insertionPoint(source: string, driver?: DriverKind): number {
+interface InsertionPoint {
+  offset: number;
+  beforeClause: boolean;
+}
+
+function isOffsetClause(tokens: Token[], index: number): boolean {
+  const next = tokens[index + 1];
+  return Boolean(next?.type === 'param' || signedInteger(tokens, index + 1));
+}
+
+function isLockClause(tokens: Token[], index: number): boolean {
+  const word = (offset: number): string => {
+    const token = tokens[index + offset];
+    return token?.type === 'word' && token.depth === 0 ? token.value.toUpperCase() : '';
+  };
+  if (word(0) === 'FOR') {
+    return word(1) === 'UPDATE' || word(1) === 'SHARE' ||
+      (word(1) === 'NO' && word(2) === 'KEY' && word(3) === 'UPDATE') ||
+      (word(1) === 'KEY' && word(2) === 'SHARE');
+  }
+  return word(0) === 'LOCK' && word(1) === 'IN' && word(2) === 'SHARE' && word(3) === 'MODE';
+}
+
+function trailingClauseStart(tokens: Token[]): Token | undefined {
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.type !== 'word' || token.depth !== 0) continue;
+    const word = token.value.toUpperCase();
+    if (word === 'OFFSET' && isOffsetClause(tokens, index)) return token;
+    if ((word === 'FOR' || word === 'LOCK') && isLockClause(tokens, index)) return token;
+  }
+  return undefined;
+}
+
+function insertionPoint(source: string, driver?: DriverKind): InsertionPoint {
   const tokens = scan(source, driver ?? {}).filter(
     (t) => t.type !== 'space' && t.type !== 'comment',
   );
+  const clause = trailingClauseStart(tokens);
+  if (clause) return { offset: clause.pos, beforeClause: true };
   const last = tokens[tokens.length - 1];
-  if (!last) return source.length;
-  if (last.type === 'symbol' && last.value === ';') return last.pos;
-  return last.pos + last.value.length;
+  if (!last) return { offset: source.length, beforeClause: false };
+  if (last.type === 'symbol' && last.value === ';') return { offset: last.pos, beforeClause: false };
+  return { offset: last.pos + last.value.length, beforeClause: false };
 }

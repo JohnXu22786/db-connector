@@ -115,6 +115,23 @@ test('audit summaries redact PostgreSQL dollar-quoted literals', async () => {
   assert.ok(!JSON.stringify(rec).includes('DOLLAR_SECRET'));
 });
 
+test('audit summaries use the connector dialect for hash comments and JSON operators', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ driver: 'mysql', sql: 'SELECT 1 #> MYSQL_SECRET' }));
+  await log.append(input({
+    driver: 'postgres',
+    sql: "SELECT data #> '{foo}' FROM t",
+  }));
+  await log.flush();
+
+  const records = (await readFile(log.path, 'utf8'))
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line) as { statement: { summary: string } });
+  assert.equal(records[0]!.statement.summary, 'SELECT 1');
+  assert.equal(records[1]!.statement.summary, "SELECT data #> 'x' FROM t");
+});
+
 test('error records carry code + message, rows default to 0', async () => {
   const log = new AuditLog(freshPath());
   await log.append(input({ status: 'error', error: { code: 'QUERY_FAILED', message: 'boom' }, rows: 0 }));
