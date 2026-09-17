@@ -323,6 +323,12 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
+  const values = ensureSelectLimit('VALUES (1), (2)', 1, 'sqlite');
+  assert.equal(values.applied, false);
+  assert.equal(values.sql, 'VALUES (1), (2)');
+});
+
 test('normalizeText strips comments and collapses whitespace', () => {
   assert.equal(normalizeText("SELECT  1, 'x' -- c"), "SELECT 1, 'x'");
   assert.equal(normalizeText('SELECT\n\t2 /* b */ , 3'), 'SELECT 2 , 3');

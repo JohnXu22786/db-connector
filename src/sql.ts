@@ -699,8 +699,10 @@ export function ensureSelectLimit(
   limit: number,
   driver?: DriverKind,
 ): { sql: string; applied: boolean } {
-  const { kind } = classifyStatement(sql, driver);
-  if (kind !== 'select') return { sql, applied: false };
+  const { kind, firstWord } = classifyStatement(sql, driver);
+  // SQLite accepts standalone VALUES as a read statement, but does not allow
+  // a LIMIT clause to be appended to that syntax.
+  if (kind !== 'select' || firstWord === 'VALUES') return { sql, applied: false };
 
   const tokens = meaningful(sql, driver);
   const hasTopLevelLimit = tokens.some(
