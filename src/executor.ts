@@ -168,12 +168,19 @@ export class ExecutionEngine {
     try {
       assertSingleStatement(opts.sql, driverKind);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err, driverKind);
       throw err;
     }
 
     if (!isReadStatement(opts.sql, driverKind)) {
-      await this.auditDenied(opts.connection, opts.sql, classification.kind, ErrorCode.ReadOnlyViolation, opts.way);
+      await this.auditDenied(
+        opts.connection,
+        opts.sql,
+        classification.kind,
+        ErrorCode.ReadOnlyViolation,
+        opts.way,
+        driverKind,
+      );
       throw new DbConnectorError(
         ErrorCode.ReadOnlyViolation,
         `read-only path: "${classification.firstWord || 'statement'}" statements are not allowed in db_query; use db_exec with allowWrite=true for writes`,
@@ -191,7 +198,7 @@ export class ExecutionEngine {
           ? ensureSelectLimit(bound.sql, limit, driverKind)
           : { sql: bound.sql, applied: false };
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err, driverKind);
       throw err;
     }
     const protectedSql = guarded.sql;
@@ -201,14 +208,22 @@ export class ExecutionEngine {
     try {
       driver = await this.requireDriver(opts.connection);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'query', hrtimeMs(openStarted), opts.way, err);
+      await this.auditFail(
+        opts.connection,
+        opts.sql,
+        'query',
+        hrtimeMs(openStarted),
+        opts.way,
+        err,
+        driverKind,
+      );
       throw err;
     }
     let deadline: ReturnType<ExecutionEngine['deadline']>;
     try {
       deadline = this.deadline(opts.timeoutMs, signal);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, 'query', 0, opts.way, err, driverKind);
       throw err;
     }
     const started = process.hrtime();
@@ -217,7 +232,7 @@ export class ExecutionEngine {
       outcome = await driver.read(protectedSql, bound.values, deadline.signal);
     } catch (err) {
       const duration = hrtimeMs(started);
-      await this.auditFail(opts.connection, opts.sql, 'query', duration, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, 'query', duration, opts.way, err, driverKind);
       throw err;
     } finally {
       deadline.clear();
@@ -238,6 +253,7 @@ export class ExecutionEngine {
       kind: 'query',
       way: opts.way,
       sql: protectedSql,
+      driver: driverKind,
       rows: serialized.length,
       durationMs: duration,
     });
@@ -269,14 +285,21 @@ export class ExecutionEngine {
     try {
       assertSingleStatement(opts.sql, driverKind);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err, driverKind);
       throw err;
     }
 
     if (!readLike) {
       const allowed = opts.allowWrite === true || this.config.defaultAllowWrite === true;
       if (!allowed) {
-        await this.auditDenied(opts.connection, opts.sql, classification.kind, ErrorCode.WriteNotAllowed, opts.way);
+        await this.auditDenied(
+          opts.connection,
+          opts.sql,
+          classification.kind,
+          ErrorCode.WriteNotAllowed,
+          opts.way,
+          driverKind,
+        );
         throw new DbConnectorError(
           ErrorCode.WriteNotAllowed,
           `write approval gate: "${classification.firstWord || 'statement'}" is a write; pass allowWrite=true to confirm (transaction protection is used where supported; some statements must execute outside a transaction)`,
@@ -288,7 +311,7 @@ export class ExecutionEngine {
     try {
       bound = this.bind(opts.sql, opts.params, opts.namedParams, driverKind);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err, driverKind);
       throw err;
     }
     const openStarted = process.hrtime();
@@ -296,14 +319,22 @@ export class ExecutionEngine {
     try {
       driver = await this.requireDriver(opts.connection);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, openAuditKind, hrtimeMs(openStarted), opts.way, err);
+      await this.auditFail(
+        opts.connection,
+        opts.sql,
+        openAuditKind,
+        hrtimeMs(openStarted),
+        opts.way,
+        err,
+        driverKind,
+      );
       throw err;
     }
     let deadline: ReturnType<ExecutionEngine['deadline']>;
     try {
       deadline = this.deadline(opts.timeoutMs, signal);
     } catch (err) {
-      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err);
+      await this.auditFail(opts.connection, opts.sql, openAuditKind, 0, opts.way, err, driverKind);
       throw err;
     }
     const started = process.hrtime();
@@ -324,6 +355,7 @@ export class ExecutionEngine {
           kind: 'read',
           way: opts.way,
           sql: opts.sql,
+          driver: driverKind,
           rows: rows.length,
           durationMs: hrtimeMs(started),
         });
@@ -353,6 +385,7 @@ export class ExecutionEngine {
         kind: isDdl ? 'ddl' : 'write',
         way: opts.way,
         sql: opts.sql,
+        driver: driverKind,
         rows: outcome.affectedRows,
         durationMs: duration,
       });
@@ -369,13 +402,21 @@ export class ExecutionEngine {
     } catch (err) {
       if (readLike) {
         const duration = hrtimeMs(started);
-        await this.auditFail(opts.connection, opts.sql, 'read', duration, opts.way, err);
+        await this.auditFail(opts.connection, opts.sql, 'read', duration, opts.way, err, driverKind);
         throw err;
       }
       if (nonTransactional) this.schemaService.invalidate(opts.connection);
       const dbErr = wrapWriteError(err, isDdl, nonTransactional);
       const duration = hrtimeMs(started);
-      await this.auditFail(opts.connection, opts.sql, isDdl ? 'ddl' : 'write', duration, opts.way, dbErr);
+      await this.auditFail(
+        opts.connection,
+        opts.sql,
+        isDdl ? 'ddl' : 'write',
+        duration,
+        opts.way,
+        dbErr,
+        driverKind,
+      );
       throw dbErr;
     } finally {
       deadline.clear();
@@ -384,6 +425,7 @@ export class ExecutionEngine {
 
   /** Schema snapshot for one connection (cached; refresh/flush with opts). */
   async schema(opts: SchemaOptions, signal: AbortSignal): Promise<SchemaResult> {
+    const driverKind = this.connectors.describe(opts.connection)?.driver;
     const openStarted = process.hrtime();
     const scope = opts.filter ? ` filter="${opts.filter}"` : '';
     const sql = `schema introspection<${opts.connection}${scope}>`;
@@ -391,14 +433,14 @@ export class ExecutionEngine {
     try {
       driver = await this.requireDriver(opts.connection);
     } catch (err) {
-      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(openStarted), opts.way, err);
+      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(openStarted), opts.way, err, driverKind);
       throw err;
     }
     let deadline: ReturnType<ExecutionEngine['deadline']>;
     try {
       deadline = this.deadline(opts.timeoutMs, signal);
     } catch (err) {
-      await this.auditFail(opts.connection, sql, 'schema', 0, opts.way, err);
+      await this.auditFail(opts.connection, sql, 'schema', 0, opts.way, err, driverKind);
       throw err;
     }
     const started = process.hrtime();
@@ -410,7 +452,7 @@ export class ExecutionEngine {
         signal: deadline.signal,
       });
     } catch (err) {
-      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(started), opts.way, err);
+      await this.auditFail(opts.connection, sql, 'schema', hrtimeMs(started), opts.way, err, driverKind);
       throw err;
     } finally {
       deadline.clear();
@@ -422,6 +464,7 @@ export class ExecutionEngine {
       kind: 'schema',
       way: opts.way,
       sql,
+      driver: driverKind,
       rows: snapshot.tables.length + snapshot.views.length,
       durationMs: duration,
     });
@@ -513,6 +556,7 @@ export class ExecutionEngine {
     kind: 'query' | 'write' | 'ddl' | 'read' | 'schema';
     way: WayKind;
     sql: string;
+    driver?: DriverKind;
     rows: number;
     durationMs: number;
   }): Promise<string> {
@@ -522,6 +566,7 @@ export class ExecutionEngine {
         kind: input.kind,
         way: input.way,
         sql: input.sql,
+        driver: input.driver,
         maxSqlChars: this.config.query.maxSqlChars,
         rows: input.rows,
         durationMs: input.durationMs,
@@ -541,6 +586,7 @@ export class ExecutionEngine {
     kind: StatementKind,
     code: ErrorCode,
     way: WayKind,
+    driver?: DriverKind,
   ): Promise<void> {
     try {
       await this.auditLog.append({
@@ -548,6 +594,7 @@ export class ExecutionEngine {
         kind: 'denied',
         way,
         sql,
+        driver,
         maxSqlChars: this.config.query.maxSqlChars,
         rows: 0,
         durationMs: 0,
@@ -566,6 +613,7 @@ export class ExecutionEngine {
     durationMs: number,
     way: WayKind,
     err: unknown,
+    driver?: DriverKind,
   ): Promise<void> {
     const code = err instanceof DbConnectorError ? err.code : ErrorCode.QueryFailed;
     const message = err instanceof Error ? err.message : String(err);
@@ -575,6 +623,7 @@ export class ExecutionEngine {
         kind,
         way,
         sql,
+        driver,
         maxSqlChars: this.config.query.maxSqlChars,
         rows: 0,
         durationMs,

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { AuditLog } from '../dist/audit.js';
+import { summarizeSql } from '../dist/sql.js';
 
 function freshPath(): string {
   return join(mkdtempSync(join(tmpdir(), 'db-connector-audit-')), 'audit.jsonl');
@@ -113,6 +114,27 @@ test('audit summaries redact PostgreSQL dollar-quoted literals', async () => {
   const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
   assert.equal(rec.statement.summary, "SELECT 'x'");
   assert.ok(!JSON.stringify(rec).includes('DOLLAR_SECRET'));
+});
+
+test('audit summaries preserve PostgreSQL JSONB operators', async () => {
+  const log = new AuditLog(freshPath());
+  const sql = "SELECT doc #> '{a}' FROM t";
+  await log.append(input({ sql }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.deepEqual(rec.statement, summarizeSql(sql, 512));
+  assert.equal(rec.statement.summary, "SELECT doc #> 'x' FROM t");
+});
+
+test('audit summaries redact MySQL hash comments', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: 'SELECT * FROM t # MYSQL_SECRET', driver: 'mysql' }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, 'SELECT * FROM t');
+  assert.ok(!JSON.stringify(rec).includes('MYSQL_SECRET'));
 });
 
 test('error records carry code + message, rows default to 0', async () => {

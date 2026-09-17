@@ -608,7 +608,10 @@ function mergeSpans(spans: RedactionSpan[]): RedactionSpan[] {
 export function normalizeText(sql: string, driver?: DriverKind): string {
   const tokenSets = driver
     ? [scan(sql, driver)]
-    : [scan(sql), scan(sql, 'mysql'), scan(sql, 'postgres')];
+    // The backslash-enabled pass preserves MySQL string redaction without
+    // treating PostgreSQL `#>` / `#>>` operators as MySQL comments. A
+    // driver-less audit cannot safely choose between those dialects.
+    : [scan(sql), scan(sql, { backslashEscapes: true }), scan(sql, 'postgres')];
   return renderSanitized(sql, tokenSets)
     .replace(/\s+/g, ' ')
     .trim();

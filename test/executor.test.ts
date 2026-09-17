@@ -6,6 +6,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { ErrorCode } from '../dist/errors.js';
 import type { DriverApi } from '../dist/drivers/driver.js';
+import { summarizeSql } from '../dist/sql.js';
 import { freshSignal, makeHarness, type Harness } from './helpers.ts';
 
 function installDriver(h: Harness, driver: DriverApi): void {
@@ -31,6 +32,23 @@ function emptyDriver(overrides: Partial<DriverApi> = {}): DriverApi {
     ...overrides,
   };
 }
+
+test('executor preserves PostgreSQL JSONB operators in audit summaries', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver({ kind: 'postgres' }));
+  h.connectors.define({ name: 'pg', driver: 'postgres', database: 'test' });
+
+  const sql = "SELECT doc #> '{a}' FROM t";
+  await h.engine.query({ connection: 'pg', sql, limit: 10, way: 'cli' }, freshSignal());
+
+  const records = await h.audit.query({ connection: 'pg' });
+  assert.equal(records.length, 1);
+  assert.deepEqual(
+    records[0]!.statement,
+    summarizeSql(`${sql} LIMIT 10`, 512, 'postgres'),
+  );
+  assert.equal(records[0]!.statement.summary, "SELECT doc #> 'x' FROM t LIMIT 10");
+});
 
 test('invalid query validation is audited', async () => {
   const h = makeHarness();
