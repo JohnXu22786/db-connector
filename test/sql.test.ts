@@ -332,11 +332,38 @@ test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
   assert.equal(compound.applied, false);
   assert.equal(compound.sql, 'SELECT 0 UNION ALL VALUES (1)');
 
+  for (const sql of ['SELECT $VALUES', 'SELECT @VALUES']) {
+    const parameter = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameter.applied, true);
+    assert.equal(parameter.sql, `${sql} LIMIT 1`);
+  }
+
   for (const driver of ['postgres', 'mysql'] as const) {
     const serverValues = ensureSelectLimit('VALUES (1), (2)', 1, driver);
     assert.equal(serverValues.applied, true);
     assert.equal(serverValues.sql, 'VALUES (1), (2) LIMIT 1');
   }
+});
+
+test('ensureSelectLimit recognizes PostgreSQL FETCH FIRST/NEXT row limits', () => {
+  for (const clause of ['FETCH FIRST 5 ROWS ONLY', 'FETCH NEXT 5 ROWS ONLY']) {
+    const sql = `SELECT id FROM t ${clause}`;
+    assert.deepEqual(ensureSelectLimit(sql, 10, 'postgres'), {
+      sql,
+      applied: false,
+    });
+  }
+
+  const nested = ensureSelectLimit(
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited',
+    10,
+    'postgres',
+  );
+  assert.equal(nested.applied, true);
+  assert.equal(
+    nested.sql,
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited LIMIT 10',
+  );
 });
 
 test('normalizeText strips comments and collapses whitespace', () => {
