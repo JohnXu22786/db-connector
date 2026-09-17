@@ -14,6 +14,8 @@ export interface ReadOutcome {
   columns: string[];
   rows: unknown[][];
   rowCount: number;
+  /** True when a bounded read observed at least one row beyond its cap. */
+  truncated?: boolean;
 }
 
 /** Result of a write / DDL statement, transactional where supported. */
@@ -61,9 +63,16 @@ export interface DriverApi {
   connect(): Promise<void>;
   /**
    * Execute a read-only statement (SELECT/EXPLAIN). Must observe `signal`
-   * and settle only after its owned work reaches quiescence.
+   * and settle only after its owned work reaches quiescence. When `maxRows`
+   * is supplied, retain no more than that many rows and report whether an
+   * additional row was observed via `truncated`.
    */
-  read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome>;
+  read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome>;
   /**
    * Execute a write or DDL statement with transaction protection where
    * supported: COMMIT on success, ROLLBACK on failure. Must observe `signal`.

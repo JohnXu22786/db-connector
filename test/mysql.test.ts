@@ -8,6 +8,9 @@ import { makeHarness } from './helpers.ts';
 import { resolveConnectionSpec } from '../dist/config.js';
 
 interface FakeConnection {
+  connection?: {
+    execute(input: unknown): EventEmitter;
+  };
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   query(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   beginTransaction(): Promise<void>;
@@ -22,13 +25,18 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
   let connectionCreates = 0;
   let firstExecuteStarted = false;
   let firstDestroyCalls = 0;
-  let releaseFirstExecute = () => {};
+  let firstCommand: EventEmitter | undefined;
   const firstConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        firstExecuteStarted = true;
+        firstCommand = new EventEmitter();
+        return firstCommand;
+      },
+    },
     execute: () => {
       firstExecuteStarted = true;
-      return new Promise<[unknown, unknown]>((resolve) => {
-        releaseFirstExecute = () => resolve([[], []]);
-      });
+      return new Promise<[unknown, unknown]>(() => {});
     },
     query: async () => [[], []],
     beginTransaction: async () => {},
@@ -36,11 +44,22 @@ test('aborting a MySQL query reconnects on the next public use', async () => {
     rollback: async () => {},
     destroy: () => {
       firstDestroyCalls += 1;
-      releaseFirstExecute();
+      firstCommand?.emit('end');
     },
     end: async () => {},
   };
   const secondConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('fields', [{ name: 'id' }]);
+          command.emit('result', [2]);
+          command.emit('end');
+        });
+        return command;
+      },
+    },
     execute: async () => [[[2]], [{ name: 'id' }]],
     query: async () => [[], []],
     beginTransaction: async () => {},
@@ -431,6 +450,20 @@ test('MySQL query reconnects after a read rollback failure', async (t) => {
   let failedRollbackCalls = 0;
   let failedDestroyCalls = 0;
   const failedConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        failedExecuteCalls += 1;
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('error', Object.assign(new Error('table does not exist'), {
+            code: 'ER_NO_SUCH_TABLE',
+            errno: 1146,
+            sqlState: '42S02',
+          }));
+        });
+        return command;
+      },
+    },
     execute: async () => {
       failedExecuteCalls += 1;
       throw Object.assign(new Error('table does not exist'), {
@@ -457,6 +490,17 @@ test('MySQL query reconnects after a read rollback failure', async (t) => {
     end: async () => {},
   };
   const workingConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('fields', [{ name: 'id' }]);
+          command.emit('result', [2]);
+          command.emit('end');
+        });
+        return command;
+      },
+    },
     execute: async () => [[[2]], [{ name: 'id' }]],
     query: async () => [[], []],
     beginTransaction: async () => {},
@@ -505,6 +549,17 @@ test('MySQL query reconnects when successful-read cleanup rollback fails', async
   let rollbackCalls = 0;
   let failedDestroyCalls = 0;
   const failedConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('fields', [{ name: 'id' }]);
+          command.emit('result', [1]);
+          command.emit('end');
+        });
+        return command;
+      },
+    },
     execute: async () => [[[1]], [{ name: 'id' }]],
     query: async (sql) => {
       if (sql === 'ROLLBACK') {
@@ -524,6 +579,17 @@ test('MySQL query reconnects when successful-read cleanup rollback fails', async
     end: async () => {},
   };
   const workingConnection: FakeConnection = {
+    connection: {
+      execute: () => {
+        const command = new EventEmitter();
+        queueMicrotask(() => {
+          command.emit('fields', [{ name: 'id' }]);
+          command.emit('result', [2]);
+          command.emit('end');
+        });
+        return command;
+      },
+    },
     execute: async () => [[[2]], [{ name: 'id' }]],
     query: async () => [[], []],
     beginTransaction: async () => {},

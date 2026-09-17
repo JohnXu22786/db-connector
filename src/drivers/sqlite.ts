@@ -33,6 +33,7 @@ interface RequestMessage {
   sql?: string;
   params?: unknown[];
   isDdl?: boolean;
+  maxRows?: number;
 }
 
 interface ReplyMessage {
@@ -352,8 +353,13 @@ export class SqliteDriver implements DriverApi {
     }
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
-    return (await this.request('query', signal, { sql, params })) as ReadOutcome;
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
+    return (await this.request('query', signal, { sql, params, maxRows })) as ReadOutcome;
   }
 
   async write(

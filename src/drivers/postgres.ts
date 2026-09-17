@@ -23,6 +23,7 @@ interface PgQueryResult {
 
 interface PgArrayQueryResult extends Omit<PgQueryResult, 'rows'> {
   rows: unknown[][];
+  truncated?: boolean;
 }
 
 interface PgQueryConfig {
@@ -33,17 +34,35 @@ interface PgQueryConfig {
   rowMode?: 'array';
 }
 
+interface PgStreamResult {
+  fields?: Array<{ name: string }>;
+}
+
+interface PgStreamQuery {
+  on(event: 'row', listener: (row: unknown[], result?: PgStreamResult) => void): PgStreamQuery;
+  on(event: 'error', listener: (err: unknown) => void): PgStreamQuery;
+  on(event: 'end', listener: (result?: PgStreamResult) => void): PgStreamQuery;
+}
+
+type PgQueryConstructor = new (config: PgQueryConfig) => PgStreamQuery;
+
 interface PgQueryable {
   query(config: PgQueryConfig): Promise<PgQueryResult>;
   query(text: string): Promise<PgQueryResult>;
+  query(query: PgStreamQuery): unknown;
 }
 
 interface PgClientLike extends PgQueryable {
   connect(): Promise<void>;
   end(): Promise<void>;
+  /** Present on the optional libpq-backed `pg.native` client. */
+  native?: unknown;
 }
 
-type PgModule = { Client: new (...args: never[]) => PgClientLike };
+type PgModule = {
+  Client: new (...args: never[]) => PgClientLike;
+  Query: PgQueryConstructor;
+};
 
 async function loadPgModule(): Promise<PgModule> {
   const raw = await importOptional<Record<string, unknown>>('pg');
@@ -53,12 +72,20 @@ async function loadPgModule(): Promise<PgModule> {
   if (typeof Client !== 'function') {
     throw new Error('the "pg" package did not expose a Client constructor');
   }
-  return { Client: Client as PgModule['Client'] };
+  const Query = ns.Query;
+  if (typeof Query !== 'function') {
+    throw new Error('the "pg" package did not expose a Query constructor');
+  }
+  return {
+    Client: Client as PgModule['Client'],
+    Query: Query as PgModule['Query'],
+  };
 }
 
 export class PgDriver implements DriverApi {
   readonly kind = 'postgres' as const;
   private client: PgClientLike | null = null;
+  private queryConstructor: PgQueryConstructor | null = null;
   private closed = false;
   private operationTail: Promise<void> = Promise.resolve();
 
@@ -71,7 +98,7 @@ export class PgDriver implements DriverApi {
     await this.withOperationLock(async () => {
       if (this.client) return;
       this.closed = false;
-      const { Client } = await loadPgModule();
+      const { Client, Query } = await loadPgModule();
       const client = new Client({
         host: this.spec.host,
         port: this.spec.port,
@@ -90,6 +117,7 @@ export class PgDriver implements DriverApi {
         throw toConnectorError(this.spec, err);
       }
       this.client = client;
+      this.queryConstructor = Query;
     });
   }
 
@@ -129,28 +157,48 @@ export class PgDriver implements DriverApi {
     return this.client;
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
-    return this.withOperationLock(() => this.readUnlocked(sql, params, signal), signal);
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
+    return this.withOperationLock(
+      () => this.readUnlocked(sql, params, signal, maxRows),
+      signal,
+    );
   }
 
   private async readUnlocked(
     sql: string,
     params: unknown[],
     signal: AbortSignal,
+    maxRows?: number,
   ): Promise<ReadOutcome> {
     const client = this.ensure();
+    const bounded = maxRows !== undefined && Number.isFinite(maxRows);
+    if (bounded && isNativePgClient(client)) throw nativeModeError();
+    if (bounded && !this.queryConstructor) {
+      throw new DbConnectorError(
+        ErrorCode.UnsupportedDriver,
+        'bounded PostgreSQL reads require the event-emitting pg client',
+      );
+    }
     const converted = toDollarPlaceholders(sql, 'postgres');
     try {
       // Server-side read-only backstop: even a statement that slips past the
       // classifier cannot mutate data inside a READ ONLY transaction.
       await client.query('BEGIN TRANSACTION READ ONLY');
       try {
-        const result = await client.query({
+        const queryConfig = {
           text: converted.sql,
           values: params,
           signal,
           rowMode: 'array',
-        } as never);
+        } as PgQueryConfig;
+        const result = bounded
+          ? await streamPgQuery(client, this.queryConstructor!, queryConfig, maxRows!)
+          : await client.query(queryConfig);
         await client.query('ROLLBACK');
         return outcomeOf(result as unknown as PgArrayQueryResult);
       } catch (err) {
@@ -293,7 +341,69 @@ export class PgDriver implements DriverApi {
 function outcomeOf(result: PgArrayQueryResult): ReadOutcome {
   const columns = result.fields.map((f) => f.name);
   const rows = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows, rowCount: rows.length };
+  return {
+    columns,
+    rows,
+    rowCount: rows.length,
+    ...(result.truncated ? { truncated: true } : {}),
+  };
+}
+
+async function streamPgQuery(
+  client: PgQueryable,
+  Query: PgQueryConstructor,
+  config: PgQueryConfig,
+  maxRows: number,
+): Promise<PgArrayQueryResult> {
+  if (!Number.isFinite(maxRows) || maxRows < 0) {
+    throw new RangeError('maxRows must be a non-negative number');
+  }
+  const limit = Math.floor(maxRows);
+  const query = new Query(config);
+  return new Promise<PgArrayQueryResult>((resolve, reject) => {
+    let settled = false;
+    let fields: Array<{ name: string }> | undefined;
+    const rows: unknown[][] = [];
+    let truncated = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    query.on('row', (row: unknown[], result?: PgStreamResult) => {
+      if (fields === undefined && result?.fields) fields = result.fields;
+      if (rows.length < limit) rows.push(row);
+      else truncated = true;
+    });
+    query.on('error', (err: unknown) => {
+      finish(() => reject(err));
+    });
+    query.on('end', (result?: PgStreamResult) => {
+      finish(() => resolve({
+        fields: fields ?? result?.fields ?? [],
+        rows,
+        rowCount: rows.length,
+        ...(truncated ? { truncated: true } : {}),
+      }));
+    });
+    try {
+      client.query(query);
+    } catch (err) {
+      finish(() => reject(err));
+    }
+  });
+}
+
+function isNativePgClient(client: PgClientLike): boolean {
+  return client.native !== undefined;
+}
+
+function nativeModeError(): DbConnectorError {
+  return new DbConnectorError(
+    ErrorCode.UnsupportedDriver,
+    'PostgreSQL native client mode is not supported for bounded reads; unset NODE_PG_FORCE_NATIVE',
+  );
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
