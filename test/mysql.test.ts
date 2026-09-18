@@ -748,6 +748,52 @@ test('MysqlDriver uses the URI database for schema introspection', async () => {
   assert.deepEqual(introspection.tables, [{ name: 'users' }]);
 });
 
+test('MysqlDriver waits for queued catalog queries after an introspection failure', async () => {
+  const columnsStarted = deferred<void>();
+  const releaseColumns = deferred<void>();
+  const queries: string[] = [];
+  const connection = {
+    async query(sql: string) {
+      queries.push(sql);
+      if (sql.includes('information_schema.tables')) {
+        throw new Error('tables catalog failed');
+      }
+      if (sql.includes('information_schema.columns')) {
+        columnsStarted.resolve();
+        await releaseColumns.promise;
+      }
+      return [[], []];
+    },
+    async execute() {
+      return [[], []];
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(
+    resolveConnectionSpec({ name: 'introspection-quiescence', driver: 'mysql', database: 'app_db' }, {}),
+    { debug() {}, info() {}, warn() {} },
+  );
+  (driver as unknown as { conn: unknown }).conn = connection;
+
+  const introspection = driver.introspect(new AbortController().signal);
+  await columnsStarted.promise;
+  let settled = false;
+  void introspection.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+
+  releaseColumns.resolve();
+  await assert.rejects(introspection, /tables catalog failed/);
+  assert.equal(queries.length, 4);
+});
+
 test('MysqlDriver keeps colon-containing foreign key names distinct', async () => {
   const connection = {
     async query(sql: string) {

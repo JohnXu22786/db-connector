@@ -256,12 +256,23 @@ export class MysqlDriver implements DriverApi {
       databaseFromConnectionString(this.spec.connectionString) ||
       this.conn?.config?.database ||
       '';
-    const [tables, columns, stats, fks] = (await Promise.all([
+    const catalogResults = await Promise.allSettled([
       this.run(async (conn) => conn.query(QUERIES.tables.text, [schema]), signal),
       this.run(async (conn) => conn.query(QUERIES.columns.text, [schema]), signal),
       this.run(async (conn) => conn.query(QUERIES.indexes.text, [schema]), signal),
       this.run(async (conn) => conn.query(QUERIES.foreignKeys.text, [schema]), signal),
-    ])) as unknown as [Array<Array<Record<string, unknown>>>, Array<Array<Record<string, unknown>>>, Array<Array<Record<string, unknown>>>, Array<Array<Record<string, unknown>>>];
+    ]);
+    type MysqlCatalogResult = [Array<Record<string, unknown>>, Array<Record<string, unknown>>];
+    const catalogResultValue = (result: PromiseSettledResult<unknown>) => {
+      if (result.status === 'rejected') throw result.reason;
+      return result.value as MysqlCatalogResult;
+    };
+    const [tables, columns, stats, fks] = catalogResults.map(catalogResultValue) as [
+      MysqlCatalogResult,
+      MysqlCatalogResult,
+      MysqlCatalogResult,
+      MysqlCatalogResult,
+    ];
 
     const tableRows = tables[0] ?? [];
     const columnRows = columns[0] ?? [];
