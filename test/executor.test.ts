@@ -215,6 +215,33 @@ test('read-like db_exec guards driver materialization with the configured row ca
   assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
 });
 
+test('read-like db_exec passes its cap to the driver when SQL already has a limit', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  const calls: Array<{ sql: string; maxRows: number | undefined }> = [];
+  installDriver(h, emptyDriver({
+    read: async (sql, _params, _signal, maxRows) => {
+      calls.push({ sql, maxRows });
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+
+  for (const [index, sql] of [
+    'SELECT id FROM items LIMIT 1000000',
+    'EXPLAIN SELECT id FROM items',
+  ].entries()) {
+    const connection = `bounded-existing-limit-${index}`;
+    h.connectors.define({ name: connection, driver: 'sqlite' });
+    const result = await h.engine.exec({ connection, sql, way: 'cli' }, freshSignal());
+    assert.equal(result.kind, 'read');
+    assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+  }
+
+  assert.deepEqual(calls, [
+    { sql: 'SELECT id FROM items LIMIT 1000000', maxRows: 2 },
+    { sql: 'EXPLAIN SELECT id FROM items', maxRows: 2 },
+  ]);
+});
+
 test('invalid query validation is audited', async () => {
   const h = makeHarness();
 
