@@ -63,6 +63,8 @@ export class SqliteDriver implements DriverApi {
   private readonly operationQueue: QueuedOperation[] = [];
   private closed = false;
   private connecting: Promise<void> | null = null;
+  private connectingController: AbortController | null = null;
+  private connectingWaiters = 0;
   private seq = 0;
   private readonly pending = new Map<
     number,
@@ -341,16 +343,66 @@ export class SqliteDriver implements DriverApi {
 
   async connect(signal?: AbortSignal): Promise<void> {
     if (signal?.aborted) throw cancelError(signal);
-    if (this.connecting && !this.closed) return this.connecting;
+    if (this.connecting && !this.closed) {
+      await this.waitForConnecting(this.connecting, signal);
+      return;
+    }
     if (this.child && !this.closed) return;
     // Verify the database opens and is queryable; surface failures loudly.
-    const validation = this.request('query', signal ?? new AbortController().signal, { sql: 'SELECT 1' });
+    const controller = new AbortController();
+    const validation = this.request('query', controller.signal, { sql: 'SELECT 1' });
     const connecting = validation.then(() => undefined);
     this.connecting = connecting;
+    this.connectingController = controller;
+    void connecting.then(
+      () => this.clearConnecting(connecting, controller),
+      () => this.clearConnecting(connecting, controller),
+    );
+    await this.waitForConnecting(connecting, signal);
+  }
+
+  private clearConnecting(
+    connecting: Promise<void>,
+    controller: AbortController,
+  ): void {
+    if (this.connecting !== connecting) return;
+    this.connecting = null;
+    if (this.connectingController === controller) this.connectingController = null;
+  }
+
+  private async waitForConnecting(
+    connecting: Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    this.connectingWaiters += 1;
     try {
-      await this.connecting;
+      if (!signal) {
+        await connecting;
+        return;
+      }
+      if (signal.aborted) throw cancelError(signal);
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        const finish = (callback: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          callback();
+        };
+        const onAbort = () => finish(() => reject(cancelError(signal)));
+        signal.addEventListener('abort', onAbort, { once: true });
+        connecting.then(
+          () => finish(resolve),
+          (err) => finish(() => reject(err)),
+        );
+        if (signal.aborted) onAbort();
+      });
     } finally {
-      if (this.connecting === connecting) this.connecting = null;
+      this.connectingWaiters -= 1;
+      if (this.connecting === connecting && this.connectingWaiters === 0) {
+        this.connectingController?.abort();
+      }
     }
   }
 
@@ -379,6 +431,9 @@ export class SqliteDriver implements DriverApi {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    const connecting = this.connecting;
+    this.connectingController?.abort();
+    await connecting?.catch(() => {});
     const child = this.child;
     this.child = null;
     const retiring = this.retiring;

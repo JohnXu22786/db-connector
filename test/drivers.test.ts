@@ -1000,6 +1000,55 @@ test('SQLite concurrent connect calls share the pending validation result', asyn
   }
 });
 
+test('SQLite isolates cancellation between concurrent connect callers', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  const state = driver as unknown as {
+    child: object | null;
+    request: (...args: unknown[]) => Promise<unknown>;
+  };
+  const validation = deferred<unknown>();
+  const originalRequest = state.request;
+  let validationSignal: AbortSignal | undefined;
+  state.request = async (...args: unknown[]) => {
+    validationSignal = args[1] as AbortSignal;
+    state.child = {};
+    await validation.promise;
+    if (validationSignal.aborted) throw new Error('shared validation cancelled');
+  };
+
+  try {
+    const firstController = new AbortController();
+    const secondController = new AbortController();
+    const first = driver.connect(firstController.signal);
+    const second = driver.connect(secondController.signal);
+
+    firstController.abort();
+    await assert.rejects(
+      first,
+      (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Cancelled,
+    );
+    assert.ok(validationSignal);
+    assert.equal(validationSignal.aborted, false);
+
+    validation.resolve(undefined);
+    await second;
+  } finally {
+    state.request = originalRequest;
+    state.child = null;
+    await driver.close();
+  }
+});
+
 test('SQLite close flushes a buffered response before exiting', async () => {
   const driver = new SqliteDriver(
     {
