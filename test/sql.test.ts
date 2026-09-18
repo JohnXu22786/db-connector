@@ -483,6 +483,21 @@ test('ensureSelectLimit places the MySQL guard before executable locking clauses
   });
 });
 
+test('ensureSelectLimit places server guards before locking clauses', () => {
+  for (const [driver, sql, expected] of [
+    ['postgres', 'SELECT * FROM t FOR UPDATE', 'SELECT * FROM t LIMIT 10 FOR UPDATE'],
+    ['postgres', 'SELECT * FROM t FOR NO KEY UPDATE', 'SELECT * FROM t LIMIT 10 FOR NO KEY UPDATE'],
+    ['postgres', 'SELECT * FROM t FOR KEY SHARE', 'SELECT * FROM t LIMIT 10 FOR KEY SHARE'],
+    ['mysql', 'SELECT * FROM t FOR UPDATE', 'SELECT * FROM t LIMIT 10 FOR UPDATE'],
+    ['mysql', 'SELECT * FROM t LOCK IN SHARE MODE', 'SELECT * FROM t LIMIT 10 LOCK IN SHARE MODE'],
+  ] as const) {
+    assert.deepEqual(ensureSelectLimit(sql, 10, driver), {
+      sql: expected,
+      applied: true,
+    });
+  }
+});
+
 test('ensureSelectLimit recognizes PostgreSQL FETCH FIRST/NEXT row limits', () => {
   for (const clause of ['FETCH FIRST 5 ROWS ONLY', 'FETCH NEXT 5 ROWS ONLY']) {
     const sql = `SELECT id FROM t ${clause}`;
