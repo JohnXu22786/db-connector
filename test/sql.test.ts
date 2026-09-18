@@ -118,6 +118,32 @@ test('REPLACE under a CTE and SELECT ... INTO are writes or PostgreSQL DDL', () 
   assert.equal(classifyStatement('SELECT (SELECT 1 INTO x) FROM t').kind, 'select');
 });
 
+test('MySQL executable comments cannot bypass the read-only gate', () => {
+  const sql = "SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */";
+  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+  assert.equal(isReadStatement(sql, 'mysql'), false);
+});
+
+test('MySQL executable comment terminators ignore quoted delimiters', () => {
+  for (const sql of [
+    "SELECT /*!50000 'safe */' INTO OUTFILE '/tmp/x' */ /* ' */ FROM t LIMIT 1",
+    "SELECT /*!50000 `safe */` INTO OUTFILE '/tmp/x' */ FROM t LIMIT 1",
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
+});
+
+test('MySQL executable comments account for both backslash modes', () => {
+  for (const sql of [
+    String.raw`SELECT /*!50000 'safe \' */ INTO OUTFILE '/tmp/x' FROM t`,
+    String.raw`SELECT /*!50000 'a\' b' INTO OUTFILE '/tmp/x' */ FROM src`,
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');
@@ -412,6 +438,14 @@ test('ensureSelectLimit places the MySQL guard before # comments', () => {
   const sql = 'SELECT * FROM t # trailing comment';
   assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
     sql: 'SELECT * FROM t LIMIT 10 # trailing comment',
+    applied: true,
+  });
+});
+
+test('ensureSelectLimit places the MySQL guard before executable locking clauses', () => {
+  const sql = 'SELECT * FROM t /*!80000 FOR UPDATE */';
+  assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
+    sql: 'SELECT * FROM t LIMIT 10 /*!80000 FOR UPDATE */',
     applied: true,
   });
 });
