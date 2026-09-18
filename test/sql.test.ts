@@ -118,6 +118,32 @@ test('REPLACE under a CTE and SELECT ... INTO are writes or PostgreSQL DDL', () 
   assert.equal(classifyStatement('SELECT (SELECT 1 INTO x) FROM t').kind, 'select');
 });
 
+test('MySQL executable comments cannot bypass the read-only gate', () => {
+  const sql = "SELECT 1 /*!50000 INTO OUTFILE '/tmp/x' */";
+  assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+  assert.equal(isReadStatement(sql, 'mysql'), false);
+});
+
+test('MySQL executable comment terminators ignore quoted delimiters', () => {
+  for (const sql of [
+    "SELECT /*!50000 'safe */' INTO OUTFILE '/tmp/x' */ /* ' */ FROM t LIMIT 1",
+    "SELECT /*!50000 `safe */` INTO OUTFILE '/tmp/x' */ FROM t LIMIT 1",
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
+});
+
+test('MySQL executable comments account for both backslash modes', () => {
+  for (const sql of [
+    String.raw`SELECT /*!50000 'safe \' */ INTO OUTFILE '/tmp/x' FROM t`,
+    String.raw`SELECT /*!50000 'a\' b' INTO OUTFILE '/tmp/x' */ FROM src`,
+  ]) {
+    assert.equal(classifyStatement(sql, 'mysql').kind, 'write');
+    assert.equal(isReadStatement(sql, 'mysql'), false);
+  }
+});
+
 test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'INSERT'").kind, 'select');
   assert.equal(classifyStatement("SELECT 'insert' ' from t").kind, 'select');
@@ -126,6 +152,22 @@ test('string literals and comments cannot change classification', () => {
   assert.equal(classifyStatement("SELECT 'crea te'").kind, 'select');
   assert.equal(classifyStatement("INSERT 'x' INTO t").kind, 'write');
   assert.equal(classifyStatement('DELETE /* c */ FROM t').kind, 'write');
+});
+
+test('MySQL double-dash comments require following whitespace or control', () => {
+  assert.equal(
+    classifyStatement("SELECT 1--2 INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement("SELECT 1--\u00a0 INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'write',
+  );
+  assert.equal(
+    classifyStatement("SELECT 1--\x7f INTO OUTFILE '/tmp/x'", 'mysql').kind,
+    'select',
+  );
+  assert.equal(classifyStatement('SELECT 1-- 2', 'mysql').kind, 'select');
 });
 
 test('scan keeps SQLite bracket quoting dialect-specific and preserves escaped backticks', () => {
@@ -234,6 +276,71 @@ test('tagged PostgreSQL dollar strings still protect placeholders and semicolons
   assert.doesNotThrow(() => assertSingleStatement('SELECT $tag$; SELECT $tag$', 'postgres'));
 });
 
+test('PostgreSQL JSONB operators are not positional parameters', () => {
+  const sql = [
+    "SELECT payload ? 'key'",
+    "payload ?| ARRAY['a']",
+    "payload ?& ARRAY['b']",
+    "payload @? '$.c'",
+    'id = ?',
+  ].join(' AND ');
+
+  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), {
+    sql: [
+      "SELECT payload ? 'key'",
+      "payload ?| ARRAY['a']",
+      "payload ?& ARRAY['b']",
+      "payload @? '$.c'",
+      'id = $1',
+    ].join(' AND '),
+    count: 1,
+  });
+});
+
+test('PostgreSQL FETCH row-limit placeholders remain positional parameters', () => {
+  for (const clause of ['FETCH FIRST ? ROWS ONLY', 'FETCH NEXT ? ROW ONLY']) {
+    assert.deepEqual(
+      toDollarPlaceholders(`SELECT id FROM t ${clause}`, 'postgres'),
+      {
+        sql: `SELECT id FROM t ${clause.replace('?', '$1')}`,
+        count: 1,
+      },
+    );
+  }
+
+  const orderBy = 'SELECT id FROM t ORDER BY ? NULLS FIRST';
+  assert.deepEqual(toDollarPlaceholders(orderBy, 'postgres'), {
+    sql: 'SELECT id FROM t ORDER BY $1 NULLS FIRST',
+    count: 1,
+  });
+});
+
+test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESCAPE', () => {
+  assert.deepEqual(
+    toDollarPlaceholders("SELECT value FROM t WHERE value SIMILAR TO ? ESCAPE '!'", 'postgres'),
+    {
+      sql: "SELECT value FROM t WHERE value SIMILAR TO $1 ESCAPE '!'",
+      count: 1,
+    },
+  );
+});
+
+test('PostgreSQL JSONB operators accept keyword operands', () => {
+  for (const operand of [
+    'limit', 'returning', 'first', 'row', 'rows', 'filter', 'over', 'escape', 'between', 'by',
+    'values', 'partition',
+  ]) {
+    const sql = `SELECT payload ? ${operand} FROM t`;
+    assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 }, operand);
+  }
+
+  const bareKeyword = "SELECT first ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(bareKeyword, 'postgres'), { sql: bareKeyword, count: 0 });
+
+  const qualified = "SELECT t.where ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(qualified, 'postgres'), { sql: qualified, count: 0 });
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',
@@ -312,6 +419,10 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(added.applied, true);
   assert.equal(added.sql, 'SELECT id FROM t LIMIT 10');
 
+  const empty = ensureSelectLimit('SELECT id FROM t', 0);
+  assert.equal(empty.applied, true);
+  assert.equal(empty.sql, 'SELECT id FROM t LIMIT 0');
+
   assert.equal(ensureSelectLimit('SELECT id FROM t;', 3).sql, 'SELECT id FROM t LIMIT 3;');
   assert.equal(ensureSelectLimit('SELECT (SELECT 1 LIMIT 2)', 3).applied, true);
   // not a select -> untouched
@@ -321,6 +432,76 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   // a `;` inside a trailing comment must NOT swallow the guard limit
   assert.equal(ensureSelectLimit('SELECT 1 -- hi ; bye', 5).sql, 'SELECT 1 LIMIT 5 -- hi ; bye');
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
+});
+
+test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
+  const values = ensureSelectLimit('VALUES (1), (2)', 1, 'sqlite');
+  assert.equal(values.applied, false);
+  assert.equal(values.sql, 'VALUES (1), (2)');
+
+  const compound = ensureSelectLimit('SELECT 0 UNION ALL VALUES (1)', 1, 'sqlite');
+  assert.equal(compound.applied, false);
+  assert.equal(compound.sql, 'SELECT 0 UNION ALL VALUES (1)');
+
+  for (const sql of ['SELECT $VALUES', 'SELECT @VALUES']) {
+    const parameter = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameter.applied, true);
+    assert.equal(parameter.sql, `${sql} LIMIT 1`);
+  }
+
+  for (const sql of [
+    'SELECT $foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT $foo::bar::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::bar::VALUES FROM (VALUES (1), (2))',
+  ]) {
+    const parameterSuffix = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameterSuffix.applied, true);
+    assert.equal(parameterSuffix.sql, `${sql} LIMIT 1`);
+  }
+
+  for (const driver of ['postgres', 'mysql'] as const) {
+    const serverValues = ensureSelectLimit('VALUES (1), (2)', 1, driver);
+    assert.equal(serverValues.applied, true);
+    assert.equal(serverValues.sql, 'VALUES (1), (2) LIMIT 1');
+  }
+});
+
+test('ensureSelectLimit places the MySQL guard before # comments', () => {
+  const sql = 'SELECT * FROM t # trailing comment';
+  assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
+    sql: 'SELECT * FROM t LIMIT 10 # trailing comment',
+    applied: true,
+  });
+});
+
+test('ensureSelectLimit places the MySQL guard before executable locking clauses', () => {
+  const sql = 'SELECT * FROM t /*!80000 FOR UPDATE */';
+  assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
+    sql: 'SELECT * FROM t LIMIT 10 /*!80000 FOR UPDATE */',
+    applied: true,
+  });
+});
+
+test('ensureSelectLimit recognizes PostgreSQL FETCH FIRST/NEXT row limits', () => {
+  for (const clause of ['FETCH FIRST 5 ROWS ONLY', 'FETCH NEXT 5 ROWS ONLY']) {
+    const sql = `SELECT id FROM t ${clause}`;
+    assert.deepEqual(ensureSelectLimit(sql, 10, 'postgres'), {
+      sql,
+      applied: false,
+    });
+  }
+
+  const nested = ensureSelectLimit(
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited',
+    10,
+    'postgres',
+  );
+  assert.equal(nested.applied, true);
+  assert.equal(
+    nested.sql,
+    'SELECT * FROM (SELECT id FROM t FETCH FIRST 5 ROWS ONLY) AS limited LIMIT 10',
+  );
 });
 
 test('normalizeText strips comments and collapses whitespace', () => {

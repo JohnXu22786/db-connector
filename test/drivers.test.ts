@@ -6,6 +6,7 @@
 import { strict as assert } from 'node:assert';
 import { mkdtempSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { EventEmitter } from 'node:events';
 import { mock, test } from 'node:test';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -28,6 +29,7 @@ type PgClientStub = {
 };
 
 const require = createRequire(import.meta.url);
+const pg = require('pg') as { Query: new (...args: never[]) => object };
 
 type MysqlConnectionStub = {
   execute(input: string | { sql: string; values?: unknown[]; rowsAsArray?: boolean }): Promise<[unknown, unknown]>;
@@ -48,19 +50,30 @@ const spec = (driver: 'postgres' | 'mysql'): ResolvedConnectionSpec => ({
 });
 
 function installPgClient(driver: PgDriver, client: PgClientStub): void {
-  (driver as unknown as { client: PgClientStub }).client = client;
+  const internals = driver as unknown as {
+    client: PgClientStub;
+    queryConstructor: typeof pg.Query;
+  };
+  internals.client = client;
+  internals.queryConstructor = pg.Query;
 }
 
 function installMysqlConnection(driver: MysqlDriver, conn: MysqlConnectionStub): void {
   (driver as unknown as { conn: MysqlConnectionStub }).conn = conn;
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+} {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function nextTurn(): Promise<void> {
@@ -719,9 +732,20 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     { fields: [{ name: 'id' }, { name: 'label' }], rows: [], rowCount: 0 },
     { fields: [{ name: 'value' }, { name: 'value' }], rows: [[1, 2]], rowCount: 1 },
   ];
-  (driver as unknown as { client: PgClientFake }).client = {
+  const internals = driver as unknown as {
+    client: PgClientFake;
+    queryConstructor: typeof pg.Query;
+  };
+  internals.client = {
     async query(query) {
       if (typeof query === 'string') {
+        return { fields: [], rows: [], rowCount: null };
+      }
+      const queryConfig = query as { text?: string };
+      if (
+        queryConfig.text === 'BEGIN TRANSACTION READ ONLY' ||
+        queryConfig.text === 'ROLLBACK'
+      ) {
         return { fields: [], rows: [], rowCount: null };
       }
       queryConfigs.push(query);
@@ -730,6 +754,7 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
     async connect() {},
     async end() {},
   };
+  internals.queryConstructor = pg.Query;
 
   const empty = await driver.read('SELECT id, label FROM t WHERE false', [], signal());
   assert.deepEqual(empty, {
@@ -746,15 +771,166 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
   });
   assert.deepEqual(
     queryConfigs.map((query) => {
-      const config = query as { text: string; values: unknown[]; rowMode: string };
-      return { text: config.text, values: config.values, rowMode: config.rowMode };
+      const config = query as { text: string; values: unknown[]; _rowMode: string };
+      return { text: config.text, values: config.values, rowMode: config._rowMode };
     }),
     [
       { text: 'SELECT id, label FROM t WHERE false', values: [], rowMode: 'array' },
       { text: 'SELECT 1 AS value, 2 AS value', values: [], rowMode: 'array' },
     ],
   );
-  assert.equal(queryConfigs.every((query) => 'signal' in (query as object)), true);
+  assert.equal(queryConfigs.every((query) => !('signal' in (query as object))), true);
+});
+
+test('PostgreSQL bounded reads retain no rows beyond the requested cap', async () => {
+  class FakePgStreamQuery {
+    readonly config: { text: string };
+    private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+
+    constructor(config: { text: string }) {
+      this.config = config;
+    }
+
+    on(event: string, listener: (...args: unknown[]) => void): this {
+      const listeners = this.listeners.get(event) ?? [];
+      listeners.push(listener);
+      this.listeners.set(event, listeners);
+      return this;
+    }
+
+    emit(event: string, ...args: unknown[]): void {
+      for (const listener of this.listeners.get(event) ?? []) listener(...args);
+    }
+  }
+
+  const events: string[] = [];
+  const client = {
+    async query(input: unknown): Promise<unknown> {
+      if (typeof input === 'string') {
+        events.push(input);
+        return { fields: [], rows: [], rowCount: null };
+      }
+      if (input instanceof FakePgStreamQuery) {
+        events.push(input.config.text);
+        queueMicrotask(() => {
+          const fields = [{ name: 'id' }];
+          input.emit('row', [1], { fields });
+          input.emit('row', [2], { fields });
+          input.emit('row', [3], { fields });
+          input.emit('end', { fields });
+        });
+        return input;
+      }
+      return { fields: [], rows: [], rowCount: 0 };
+    },
+    async connect() {},
+    async end() {},
+  };
+  const driver = new PgDriver(spec('postgres'), logger);
+  (driver as unknown as {
+    client: typeof client;
+    queryConstructor: typeof FakePgStreamQuery;
+  }).client = client;
+  (driver as unknown as { queryConstructor: typeof FakePgStreamQuery }).queryConstructor =
+    FakePgStreamQuery;
+
+  const result = await driver.read('SHOW ALL', [], signal(), 2);
+
+  assert.deepEqual(result.columns, ['id']);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['BEGIN TRANSACTION READ ONLY', 'SHOW ALL', 'ROLLBACK']);
+});
+
+test('MySQL bounded reads retain no rows beyond the requested cap', async () => {
+  class FakeMysqlCommand extends EventEmitter {
+    override on(event: string, listener: (...args: unknown[]) => void): this {
+      return super.on(event, listener as (...args: any[]) => void);
+    }
+  }
+
+  const events: string[] = [];
+  const command = new FakeMysqlCommand();
+  const connection = {
+    execute(input: unknown): FakeMysqlCommand {
+      assert.deepEqual(input, { sql: 'DESCRIBE users', values: [], rowsAsArray: true });
+      queueMicrotask(() => {
+        command.emit('fields', [{ name: 'Field' }]);
+        command.emit('result', ['id']);
+        command.emit('result', ['email']);
+        command.emit('result', ['age']);
+        command.emit('end');
+      });
+      return command;
+    },
+  };
+  const conn = {
+    connection,
+    async query(sql: string): Promise<[unknown, unknown]> {
+      events.push(sql);
+      return [[], []];
+    },
+    async execute(): Promise<[unknown, unknown]> {
+      throw new Error('bounded read should use the event-emitting connection');
+    },
+    async beginTransaction() {},
+    async commit() {},
+    async rollback() {},
+    destroy() {},
+    async end() {},
+  };
+  const driver = new MysqlDriver(spec('mysql'), logger);
+  (driver as unknown as { conn: typeof conn }).conn = conn;
+
+  const result = await driver.read('DESCRIBE users', [], signal(), 2);
+
+  assert.deepEqual(result.columns, ['Field']);
+  assert.deepEqual(result.rows, [['id'], ['email']]);
+  assert.equal(result.truncated, true);
+  assert.deepEqual(events, ['START TRANSACTION READ ONLY', 'ROLLBACK']);
+});
+
+test('SQLite bounded reads retain no rows beyond the requested cap', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-bounded-read',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+
+  try {
+    await driver.connect();
+    await driver.write(
+      'CREATE TABLE items (id INTEGER)',
+      [],
+      true,
+      signal(),
+    );
+    await driver.write(
+      'INSERT INTO items (id) VALUES (1), (2), (3), (4)',
+      [],
+      false,
+      signal(),
+    );
+
+    const result = await driver.read(
+      'SELECT id FROM items LIMIT 100',
+      [],
+      signal(),
+      2,
+    );
+
+    assert.deepEqual(result.rows, [[1], [2]]);
+    assert.equal(result.rowCount, 2);
+    assert.equal(result.truncated, true);
+  } finally {
+    await driver.close();
+  }
 });
 
 test('SQLite close waits for a dispatched request before exiting', async () => {
@@ -783,6 +959,44 @@ test('SQLite close waits for a dispatched request before exiting', async () => {
     assert.equal(state.child, null);
   } finally {
     state.child?.kill('SIGKILL');
+  }
+});
+
+test('SQLite concurrent connect calls share the pending validation result', async () => {
+  const driver = new SqliteDriver(
+    {
+      name: 'sqlite-test',
+      driver: 'sqlite',
+      database: ':memory:',
+      password: '',
+      passwordSource: 'none',
+      options: {},
+    },
+    logger,
+  );
+  const state = driver as unknown as {
+    child: object | null;
+    request: (...args: unknown[]) => Promise<unknown>;
+  };
+  const validation = deferred<unknown>();
+  const originalRequest = state.request;
+  state.request = async () => {
+    state.child = {};
+    return validation.promise;
+  };
+
+  try {
+    const first = driver.connect();
+    const second = driver.connect();
+
+    validation.reject(new Error('validation failed'));
+
+    await assert.rejects(first, /validation failed/);
+    await assert.rejects(second, /validation failed/);
+  } finally {
+    state.request = originalRequest;
+    state.child = null;
+    await driver.close();
   }
 });
 

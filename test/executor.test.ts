@@ -6,6 +6,7 @@ import { strict as assert } from 'node:assert';
 import { test } from 'node:test';
 import { DbConnectorError, ErrorCode } from '../dist/errors.js';
 import type { DriverApi } from '../dist/drivers/driver.js';
+import { summarizeSql } from '../dist/sql.js';
 import { freshSignal, makeHarness, type Harness } from './helpers.ts';
 
 function installDriver(h: Harness, driver: DriverApi): void {
@@ -141,6 +142,77 @@ test('lazy schema applies its timeout while opening the connection', async () =>
   } finally {
     clearTimeout(keepAlive);
   }
+});
+
+test('db_query passes its cap to the driver and preserves bounded truncation', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedMaxRows: number | undefined;
+  installDriver(h, emptyDriver({
+    read: async (_sql, _params, _signal, maxRows) => {
+      receivedMaxRows = maxRows;
+      return {
+        columns: ['id'],
+        rows: [[1], [2]],
+        rowCount: 2,
+        truncated: true,
+      };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-query', driver: 'sqlite' });
+
+  const result = await h.engine.query(
+    {
+      connection: 'bounded-query',
+      sql: 'SELECT id FROM items LIMIT 100',
+      limit: 2,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+
+  assert.equal(receivedMaxRows, 2);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+});
+
+test('executor preserves PostgreSQL JSONB operators in audit summaries', async () => {
+  const h = makeHarness();
+  installDriver(h, emptyDriver({ kind: 'postgres' }));
+  h.connectors.define({ name: 'pg', driver: 'postgres', database: 'test' });
+
+  const sql = "SELECT doc #> '{a}' FROM t";
+  await h.engine.query({ connection: 'pg', sql, limit: 10, way: 'cli' }, freshSignal());
+
+  const records = await h.audit.query({ connection: 'pg' });
+  assert.equal(records.length, 1);
+  assert.deepEqual(
+    records[0]!.statement,
+    summarizeSql(`${sql} LIMIT 10`, 512, 'postgres'),
+  );
+  assert.equal(records[0]!.statement.summary, "SELECT doc #> 'x' FROM t LIMIT 10");
+});
+
+test('read-like db_exec guards driver materialization with the configured row cap', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let executedSql = '';
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      executedSql = sql;
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-exec', driver: 'sqlite', database: 'test' });
+
+  const result = await h.engine.exec(
+    { connection: 'bounded-exec', sql: 'SELECT id FROM items ORDER BY id', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(result.kind, 'read');
+  assert.equal(executedSql, 'SELECT id FROM items ORDER BY id LIMIT 2');
+  const records = await h.audit.query({ connection: 'bounded-exec' });
+  assert.equal(records[0]!.rows, 2);
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
 });
 
 test('invalid query validation is audited', async () => {
@@ -448,4 +520,28 @@ test("executor binds markers using PostgreSQL E'...' strings", async () => {
     sql: "SELECT E'it\\'s ? :ignored', ? LIMIT 1",
     params: [42],
   });
+});
+
+test('server VALUES guards preserve exact-limit truncation', async () => {
+  const h = makeHarness();
+  let received: string | undefined;
+  installDriver(h, emptyDriver({
+    kind: 'postgres',
+    read: async (sql) => {
+      received = sql;
+      return { columns: ['value'], rows: [[1]], rowCount: 1 };
+    },
+  }));
+  h.connectors.define({ name: 'postgres-values', driver: 'postgres', database: 'test' });
+
+  const result = await h.engine.query({
+    connection: 'postgres-values',
+    sql: 'VALUES (1)',
+    limit: 1,
+    way: 'cli',
+  }, freshSignal());
+
+  assert.equal(received, 'VALUES (1) LIMIT 1');
+  assert.equal(result.truncated, true);
+  assert.deepEqual(result.rows, [[1]]);
 });

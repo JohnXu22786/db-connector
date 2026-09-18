@@ -31,6 +31,21 @@ test('db query returns columns, JSON-safe rows, and an audit id', async () => {
   assert.ok(result.durationMs >= 0);
 });
 
+test('SQLite compounds ending in VALUES execute without an appended LIMIT', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    {
+      connection: 'sample',
+      sql: 'SELECT 0 UNION ALL VALUES (1)',
+      limit: 1,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, [[0]]);
+  assert.equal(result.truncated, true);
+});
+
 test('empty query results retain column metadata', async () => {
   const h = await setup();
   const result = await h.engine.query(
@@ -392,6 +407,21 @@ test('result cap applies and reports truncation', async () => {
   assert.equal(capped.rowCount, 5);
   assert.equal(capped.truncated, true);
   assert.equal(capped.limit, 5);
+});
+
+test('zero result cap is enforced by the SELECT guard', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT * FROM users', limit: 0, way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.rowCount, 0);
+  assert.equal(result.limit, 0);
+
+  const { records } = await h.engine.audit({ connection: 'sample', limit: 50 });
+  const hit = records.find((r) => r.kind === 'query' && r.statement.summary.includes('LIMIT 0'));
+  assert.ok(hit, 'expected the zero-row guard in the audit record');
 });
 
 test('SELECT guard limit is appended when absent', async () => {

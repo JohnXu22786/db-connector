@@ -14,6 +14,8 @@ import { importOptional, redactSpecMessage } from './driver.js';
 
 interface MysqlConnection {
   config?: { database?: string };
+  /** The promise wrapper exposes its event-emitting core connection here. */
+  connection?: MysqlCoreConnection;
   execute(sql: string, values?: unknown[]): Promise<[unknown, unknown]>;
   execute(options: {
     sql: string;
@@ -26,6 +28,18 @@ interface MysqlConnection {
   rollback(): Promise<void>;
   destroy(): void;
   end(): Promise<void>;
+}
+
+interface MysqlCommand {
+  on(event: string, listener: (...args: unknown[]) => void): MysqlCommand;
+}
+
+interface MysqlCoreConnection {
+  execute(input: {
+    sql: string;
+    values?: unknown[];
+    rowsAsArray?: boolean;
+  }): MysqlCommand;
 }
 
 interface MysqlModule {
@@ -103,7 +117,7 @@ export class MysqlDriver implements DriverApi {
     return this.conn;
   }
 
-  /** Run a query, rejecting (and destroying the connection) on abort. */
+  /** Run a query, destroying the connection only on abort or fatal errors. */
   private run(
     fn: (conn: MysqlConnection) => Promise<unknown>,
     signal: AbortSignal,
@@ -131,7 +145,7 @@ export class MysqlDriver implements DriverApi {
             if (settled) return;
             settled = true;
             cleanup();
-            if (!abortError) {
+            if (!abortError && isFatalMysqlError(err)) {
               if (this.conn === conn) this.conn = null;
               destroy();
             }
@@ -154,7 +168,7 @@ export class MysqlDriver implements DriverApi {
               if (abortError) fail(abortError);
               else succeed(value);
             },
-            (err) => fail(abortError ?? err),
+            (err) => fail(errorAfterAbort(abortError, err)),
           );
         });
       },
@@ -165,17 +179,49 @@ export class MysqlDriver implements DriverApi {
     );
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
     const result = await this.run(async (conn) => {
       await conn.query('START TRANSACTION READ ONLY');
+      let bounded: MysqlReadResult;
       try {
-        const [rows, fields] = await conn.execute({ sql, values: params, rowsAsArray: true });
-        await conn.query('ROLLBACK');
-        return { rows, fields };
+        if (maxRows !== undefined && Number.isFinite(maxRows)) {
+          if (!conn.connection) {
+            throw new DbConnectorError(
+              ErrorCode.UnsupportedDriver,
+              'bounded MySQL reads require the event-emitting mysql2 connection',
+            );
+          }
+          bounded = await streamMysqlExecute(conn.connection, sql, params, maxRows);
+        } else {
+          const [rows, fields] = await conn.execute({
+            sql,
+            values: params,
+            rowsAsArray: true,
+          });
+          bounded = {
+            rows: rows as unknown[][],
+            fields: fields as Array<{ name: string }>,
+          };
+        }
       } catch (err) {
-        await conn.query('ROLLBACK').catch(() => {});
+        try {
+          await conn.query('ROLLBACK');
+        } catch (rollbackErr) {
+          throw new MysqlRollbackFailure(err, rollbackErr);
+        }
         throw err;
       }
+      try {
+        await conn.query('ROLLBACK');
+      } catch (rollbackErr) {
+        throw new MysqlRollbackFailure(undefined, rollbackErr);
+      }
+      return bounded;
     }, signal);
     return outcomeOf(result as MysqlReadResult);
   }
@@ -193,7 +239,11 @@ export class MysqlDriver implements DriverApi {
         await conn.commit();
         return rows as { affectedRows?: number };
       } catch (err) {
-        await conn.rollback().catch(() => {});
+        try {
+          await conn.rollback();
+        } catch (rollbackErr) {
+          throw new MysqlRollbackFailure(err, rollbackErr);
+        }
         throw err;
       }
     }, signal);
@@ -286,6 +336,7 @@ export class MysqlDriver implements DriverApi {
 interface MysqlReadResult {
   rows: unknown[][];
   fields: Array<{ name: string }>;
+  truncated?: boolean;
 }
 
 export function indexesFromStatistics(
@@ -324,7 +375,54 @@ export function indexesFromStatistics(
 function outcomeOf(result: MysqlReadResult): ReadOutcome {
   const columns = result.fields.map((field) => field.name);
   const aligned = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows: aligned, rowCount: aligned.length };
+  return {
+    columns,
+    rows: aligned,
+    rowCount: aligned.length,
+    ...(result.truncated ? { truncated: true } : {}),
+  };
+}
+
+async function streamMysqlExecute(
+  connection: MysqlCoreConnection,
+  sql: string,
+  params: unknown[],
+  maxRows: number,
+): Promise<MysqlReadResult> {
+  if (!Number.isFinite(maxRows) || maxRows < 0) {
+    throw new RangeError('maxRows must be a non-negative number');
+  }
+  const limit = Math.floor(maxRows);
+  const command = connection.execute({ sql, values: params, rowsAsArray: true });
+  return new Promise<MysqlReadResult>((resolve, reject) => {
+    let settled = false;
+    let fields: Array<{ name: string }> = [];
+    const rows: unknown[][] = [];
+    let truncated = false;
+    const finish = (callback: () => void): void => {
+      if (settled) return;
+      settled = true;
+      callback();
+    };
+
+    command.on('fields', (value: unknown) => {
+      if (!Array.isArray(value)) return;
+      fields = value.map((field) => ({
+        name: String((field as { name?: unknown }).name ?? ''),
+      }));
+    });
+    command.on('result', (value: unknown) => {
+      if (!Array.isArray(value)) return;
+      if (rows.length < limit) rows.push(value as unknown[]);
+      else truncated = true;
+    });
+    command.on('error', (err: unknown) => {
+      finish(() => reject(err));
+    });
+    command.on('end', () => {
+      finish(() => resolve({ fields, rows, truncated }));
+    });
+  });
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {
@@ -414,13 +512,56 @@ function cancelError(signal: AbortSignal): DbConnectorError {
   );
 }
 
+function isFatalMysqlError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { fatal?: unknown }).fatal === true
+  );
+}
+
+class MysqlRollbackFailure extends Error {
+  readonly fatal = true;
+  readonly rollbackFailed = true;
+
+  constructor(originalErr: unknown, rollbackErr: unknown) {
+    super(
+      originalErr === undefined
+        ? `rollback failed: ${errorMessage(rollbackErr)}`
+        : `operation error: ${errorMessage(originalErr)}; ` +
+          `rollback failed: ${errorMessage(rollbackErr)}`,
+    );
+    this.name = 'MysqlRollbackFailure';
+  }
+}
+
 function toConnectorError(
   spec: ResolvedConnectionSpec,
   err: unknown,
 ): DbConnectorError {
   if (err instanceof DbConnectorError) return err;
-  const message = err instanceof Error ? err.message : String(err);
-  return new DbConnectorError(ErrorCode.QueryFailed, redactSpecMessage(spec, message));
+  const message = errorMessage(err);
+  const details = err instanceof MysqlRollbackFailure ? { rollbackFailed: true } : undefined;
+  return new DbConnectorError(
+    ErrorCode.QueryFailed,
+    redactSpecMessage(spec, message),
+    details,
+  );
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function errorAfterAbort(
+  abortError: DbConnectorError | undefined,
+  err: unknown,
+): unknown {
+  if (!abortError) return err;
+  if (err instanceof MysqlRollbackFailure) {
+    return new DbConnectorError(abortError.code, abortError.message, { rollbackFailed: true });
+  }
+  return abortError;
 }
 
 /** Introspection queries, parameterized by database (placeholder `?`). */

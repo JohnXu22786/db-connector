@@ -427,6 +427,82 @@ test('schema snapshot gives SQLite temporary objects precedence over case-insens
   );
 });
 
+test('schema snapshot keeps foreign-key primary keys in the child table schema', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE parent (id INTEGER PRIMARY KEY)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE child (parent_id INTEGER REFERENCES parent)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP TABLE PARENT (temp_id TEXT PRIMARY KEY)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const fk = s.foreignKeys.find((foreignKey) => foreignKey.table === 'child');
+
+  assert.ok(fk);
+  assert.equal(fk!.referencedTable, 'parent');
+  assert.deepEqual(fk!.referencedColumns, ['id']);
+});
+
+test('schema snapshot keeps index columns in the index schema', async () => {
+  const h = makeHarness();
+  await h.engine.connect({
+    name: 'sample',
+    driver: 'sqlite',
+    database: join(h.dir, 'sample.sqlite'),
+  });
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TABLE records (value TEXT, other TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE TEMP TABLE temp_records (temp_value TEXT)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE INDEX shared_idx ON records(value)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+  await h.engine.exec({
+    connection: 'sample',
+    sql: 'CREATE INDEX temp.shared_idx ON temp_records(temp_value)',
+    allowWrite: true,
+    way: 'cli',
+  }, freshSignal());
+
+  const s = await h.engine.schema({ connection: 'sample', way: 'cli' }, freshSignal());
+  const mainIndex = s.indexes.find((index) => index.table === 'records' && index.name === 'shared_idx');
+  const tempIndex = s.indexes.find((index) => index.table === 'temp_records' && index.name === 'shared_idx');
+
+  assert.ok(mainIndex);
+  assert.deepEqual(mainIndex!.columns, ['value']);
+  assert.ok(tempIndex);
+  assert.deepEqual(tempIndex!.columns, ['temp_value']);
+});
+
 test('schema snapshots are cached within TTL and refreshable', async () => {
   const h = makeHarness({ schema: { ttlMs: 600000 } });
   await seedSqlite(h);
