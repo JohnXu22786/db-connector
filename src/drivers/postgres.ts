@@ -894,24 +894,46 @@ const QUERIES = {
   },
   foreignKeys: {
     name: 'dsh-db-connector.foreign-keys',
-    text: `SELECT rc.constraint_name,
-       tc.table_name,
-       array_agg(kcu.column_name) AS column_names,
-       ccu.table_name AS referenced_table,
-       (SELECT array_agg(x.column_name ORDER BY x.ordinal_position)
-          FROM information_schema.key_column_usage x
-         WHERE x.constraint_name = rc.constraint_name AND x.constraint_schema = $1
-           AND x.position_in_unique_constraint IS NOT NULL) AS referenced_columns,
-       rc.update_rule AS on_update, rc.delete_rule AS on_delete
-       FROM information_schema.referential_constraints AS rc
-       JOIN information_schema.table_constraints AS tc
-         ON tc.constraint_name = rc.constraint_name AND tc.constraint_schema = $1
-       JOIN information_schema.key_column_usage AS kcu
-         ON kcu.constraint_name = rc.constraint_name AND kcu.constraint_schema = $1
-       JOIN information_schema.constraint_column_usage AS ccu
-         ON ccu.constraint_name = rc.unique_constraint_name
-      WHERE ccu.constraint_schema = $1
-       GROUP BY rc.constraint_name, tc.table_name, rc.update_rule, rc.delete_rule, ccu.table_name
-       ORDER BY tc.table_name, rc.constraint_name`,
+    text: `SELECT constraint_def.conname AS constraint_name,
+       source_table.relname AS table_name,
+       array_agg(source_column.attname::text ORDER BY source_key.ord) AS column_names,
+       target_table.relname AS referenced_table,
+       array_agg(target_column.attname::text ORDER BY source_key.ord) AS referenced_columns,
+       CASE constraint_def.confupdtype
+         WHEN 'a' THEN 'NO ACTION'
+         WHEN 'r' THEN 'RESTRICT'
+         WHEN 'c' THEN 'CASCADE'
+         WHEN 'n' THEN 'SET NULL'
+         WHEN 'd' THEN 'SET DEFAULT'
+       END AS on_update,
+       CASE constraint_def.confdeltype
+         WHEN 'a' THEN 'NO ACTION'
+         WHEN 'r' THEN 'RESTRICT'
+         WHEN 'c' THEN 'CASCADE'
+         WHEN 'n' THEN 'SET NULL'
+         WHEN 'd' THEN 'SET DEFAULT'
+       END AS on_delete
+       FROM pg_constraint AS constraint_def
+       JOIN pg_class AS source_table
+         ON source_table.oid = constraint_def.conrelid
+       JOIN pg_namespace AS source_schema
+         ON source_schema.oid = source_table.relnamespace
+       JOIN pg_class AS target_table
+         ON target_table.oid = constraint_def.confrelid
+       JOIN LATERAL unnest(constraint_def.conkey) WITH ORDINALITY AS source_key(attnum, ord)
+         ON true
+       JOIN LATERAL unnest(constraint_def.confkey) WITH ORDINALITY AS target_key(attnum, ord)
+         ON target_key.ord = source_key.ord
+       JOIN pg_attribute AS source_column
+         ON source_column.attrelid = source_table.oid
+        AND source_column.attnum = source_key.attnum
+       JOIN pg_attribute AS target_column
+         ON target_column.attrelid = target_table.oid
+        AND target_column.attnum = target_key.attnum
+      WHERE constraint_def.contype = 'f' AND source_schema.nspname = $1
+       GROUP BY constraint_def.oid, constraint_def.conname,
+                source_table.relname, target_table.relname,
+                constraint_def.confupdtype, constraint_def.confdeltype
+       ORDER BY source_table.relname, constraint_def.conname, constraint_def.oid`,
   },
 };
