@@ -1111,10 +1111,61 @@ function insertionPoint(source: string, driver?: DriverKind): number {
     const lockingStart = mysqlExecutableLockingSuffixStart(source, tokens);
     if (lockingStart !== undefined) return lockingStart;
   }
+  if (driver === 'postgres' || driver === 'mysql') {
+    const lockingStart = serverLockingSuffixStart(source, tokens, driver);
+    if (lockingStart !== undefined) return lockingStart;
+  }
   const last = tokens[tokens.length - 1];
   if (!last) return source.length;
   if (last.type === 'symbol' && last.value === ';') return last.pos;
   return last.pos + last.value.length;
+}
+
+function serverLockingSuffixStart(
+  source: string,
+  tokens: Token[],
+  driver: 'postgres' | 'mysql',
+): number | undefined {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token?.type !== 'word' || token.depth !== 0) continue;
+
+    if (token.value.toUpperCase() === 'FOR') {
+      const next = tokens[i + 1];
+      const nextNext = tokens[i + 2];
+      const nextWord = next?.type === 'word' ? next.value.toUpperCase() : '';
+      const nextNextWord = nextNext?.type === 'word' ? nextNext.value.toUpperCase() : '';
+      const postgresLock =
+        nextWord === 'UPDATE' ||
+        nextWord === 'SHARE' ||
+        (nextWord === 'NO' && nextNextWord === 'KEY') ||
+        (nextWord === 'KEY' && nextNextWord === 'SHARE');
+      const mysqlLock = nextWord === 'UPDATE' || nextWord === 'SHARE';
+      if ((driver === 'postgres' ? postgresLock : mysqlLock)) {
+        return beforeTokenWhitespace(source, token.pos);
+      }
+    }
+
+    if (driver === 'mysql' && token.value.toUpperCase() === 'LOCK') {
+      const inToken = tokens[i + 1];
+      const shareToken = tokens[i + 2];
+      const modeToken = tokens[i + 3];
+      if (
+        inToken?.type === 'word' && inToken.value.toUpperCase() === 'IN' &&
+        shareToken?.type === 'word' && shareToken.value.toUpperCase() === 'SHARE' &&
+        modeToken?.type === 'word' && modeToken.value.toUpperCase() === 'MODE'
+      ) {
+        return beforeTokenWhitespace(source, token.pos);
+      }
+    }
+  }
+  return undefined;
+}
+
+function beforeTokenWhitespace(source: string, position: number): number {
+  let start = position;
+  while (start > 0 && /\s/.test(source[start - 1]!)) start -= 1;
+  return start;
 }
 
 function mysqlExecutableLockingSuffixStart(
