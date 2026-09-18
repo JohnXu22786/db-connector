@@ -38,6 +38,7 @@ interface ConnectorRecord {
   lastUsedAt: string | null;
   executions: number;
   opening: Promise<DriverApi> | null;
+  openingController: AbortController | null;
   closing: boolean;
   openWaiters: Set<() => void>;
   closingPromise: Promise<void> | null;
@@ -75,6 +76,7 @@ export class Connectors {
       lastUsedAt: null,
       executions: 0,
       opening: null,
+      openingController: null,
       closing: false,
       openWaiters: new Set(),
       closingPromise: null,
@@ -126,24 +128,39 @@ export class Connectors {
     if (signal?.aborted) throw cancelError(signal);
     if (rec.driver) {
       const driver = rec.driver;
-      const opening = rec.opening ?? (rec.opening = driver.connect(signal).then(
-        () => {
-          if (signal?.aborted) {
-            void driver.close().catch(() => {});
-            throw cancelError(signal);
-          }
-          return driver;
-        },
-        (error) => {
-          rec.status = 'defined';
-          throw signal?.aborted ? cancelError(signal) : error;
-        },
-      ));
+      let opening = rec.opening;
+      if (!opening) {
+        const controller = new AbortController();
+        rec.openingController = controller;
+        opening = driver.connect(controller.signal).then(
+          () => {
+            if (controller.signal.aborted) {
+              if (!rec.closing && rec.driver === driver) {
+                rec.driver = null;
+                rec.status = 'defined';
+                void driver.close().catch(() => {});
+              }
+              throw cancelError(controller.signal);
+            }
+            return driver;
+          },
+          (error) => {
+            rec.status = 'defined';
+            if (controller.signal.aborted && !rec.closing && rec.driver === driver) {
+              rec.driver = null;
+              void driver.close().catch(() => {});
+            }
+            throw controller.signal.aborted ? cancelError(controller.signal) : error;
+          },
+        );
+        rec.opening = opening;
+        this.clearOpeningWhenSettled(rec, opening);
+      }
       try {
         await this.waitForOpen(rec, opening, signal);
         if (rec.closing) throw this.connectionClosingError(name);
       } finally {
-        if (rec.opening === opening) rec.opening = null;
+        this.abortOpeningIfUnused(rec, opening);
       }
       rec.lastUsedAt = new Date().toISOString();
       rec.status = 'connected';
@@ -155,6 +172,7 @@ export class Connectors {
       return driver;
     }
 
+    const controller = new AbortController();
     const opening = (async () => {
       let spec = resolveConnectionSpec(rec.spec, rec.env);
       if (spec.passwordRef && resolveCredentials) {
@@ -162,14 +180,13 @@ export class Connectors {
       }
       const driver = this.buildDriver(spec);
       try {
-        await driver.connect(signal);
-        if (signal?.aborted) {
+        await driver.connect(controller.signal);
+        if (controller.signal.aborted) {
           void driver.close().catch(() => {});
-          throw cancelError(signal);
+          throw cancelError(controller.signal);
         }
       } catch (err) {
-        rec.opening = null;
-        throw signal?.aborted ? cancelError(signal) : err;
+        throw controller.signal.aborted ? cancelError(controller.signal) : err;
       }
       rec.driver = driver;
       rec.status = 'connected';
@@ -179,14 +196,41 @@ export class Connectors {
       return driver;
     })();
     rec.opening = opening;
+    rec.openingController = controller;
+    this.clearOpeningWhenSettled(rec, opening);
 
     try {
       const driver = await this.waitForOpen(rec, opening, signal);
       if (rec.closing) throw this.connectionClosingError(name);
       return driver;
     } finally {
-      if (rec.opening === opening) rec.opening = null;
+      this.abortOpeningIfUnused(rec, opening);
     }
+  }
+
+  private clearOpeningWhenSettled(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi>,
+  ): void {
+    void opening.then(
+      () => this.clearOpening(rec, opening),
+      () => this.clearOpening(rec, opening),
+    );
+  }
+
+  private clearOpening(rec: ConnectorRecord, opening: Promise<DriverApi>): void {
+    if (rec.opening !== opening) return;
+    rec.opening = null;
+    rec.openingController = null;
+  }
+
+  private abortOpeningIfUnused(
+    rec: ConnectorRecord,
+    opening: Promise<DriverApi>,
+  ): void {
+    if (rec.opening !== opening || rec.openWaiters.size > 0) return;
+    const controller = rec.openingController;
+    if (controller && !controller.signal.aborted) controller.abort();
   }
 
   private async waitForOpen(
@@ -201,6 +245,7 @@ export class Connectors {
       const cleanup = () => {
         rec.openWaiters.delete(cancel);
         signal?.removeEventListener('abort', onAbort);
+        this.abortOpeningIfUnused(rec, opening);
       };
       const finish = (callback: () => void) => {
         if (settled) return;
@@ -255,6 +300,7 @@ export class Connectors {
     if (rec.closingPromise) return rec.closingPromise;
     const opening = rec.opening;
     rec.closing = true;
+    rec.openingController?.abort();
     for (const cancel of rec.openWaiters) cancel();
     const closing = (async () => {
       await this.closeRecord(rec, opening);

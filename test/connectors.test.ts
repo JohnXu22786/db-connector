@@ -111,6 +111,112 @@ test('open is idempotent and shared by concurrent callers', async () => {
   assert.equal(d1, d2);
 });
 
+test('cancelling one shared open waiter does not cancel the underlying open', async () => {
+  const h = makeHarness();
+  const connectStarted = deferred<void>();
+  const releaseConnect = deferred<void>();
+  let connectCalls = 0;
+  let receivedSignal: AbortSignal | undefined;
+  const driver: DriverApi = {
+    kind: 'sqlite',
+    connect: async (signal) => {
+      connectCalls += 1;
+      receivedSignal = signal;
+      connectStarted.resolve();
+      await releaseConnect.promise;
+      if (signal?.aborted) throw new Error('shared open was cancelled');
+    },
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write() {
+      return { affectedRows: 0, isDdl: false };
+    },
+    async introspect() {
+      return { tables: [], views: [], columns: [], indexes: [], foreignKeys: [] };
+    },
+    async close() {},
+  };
+  installDriver(h, driver);
+  h.connectors.define({ name: 'shared-open', driver: 'sqlite' });
+
+  const firstController = new AbortController();
+  const first = h.connectors.open('shared-open', undefined, firstController.signal);
+  await connectStarted.promise;
+  const second = h.connectors.open('shared-open', undefined, new AbortController().signal);
+
+  firstController.abort();
+  await assert.rejects(
+    first,
+    (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Cancelled,
+  );
+  assert.ok(receivedSignal);
+  assert.equal(receivedSignal.aborted, false);
+
+  releaseConnect.resolve();
+  const opened = await second;
+  assert.equal(opened, driver);
+  assert.equal(connectCalls, 1);
+  await h.connectors.close('shared-open');
+});
+
+test('an aborted reconnect discards the closed driver before the next open', async () => {
+  const h = makeHarness();
+  const reconnectStarted = deferred<void>();
+  const releaseReconnect = deferred<void>();
+  let builds = 0;
+  let firstDriverClosed = false;
+  const firstDriver: DriverApi = {
+    kind: 'mysql',
+    connect: async (signal) => {
+      reconnectStarted.resolve();
+      await releaseReconnect.promise;
+      if (signal?.aborted) throw new Error('reconnect was cancelled');
+    },
+    async read() {
+      return { columns: [], rows: [], rowCount: 0 };
+    },
+    async write() {
+      return { affectedRows: 0, isDdl: false };
+    },
+    async introspect() {
+      return { tables: [], views: [], columns: [], indexes: [], foreignKeys: [] };
+    },
+    async close() {
+      firstDriverClosed = true;
+    },
+  };
+  const freshDriver = { ...firstDriver, connect: async () => {} };
+  (h.connectors as unknown as {
+    buildDriver(spec: unknown): DriverApi;
+  }).buildDriver = () => {
+    builds += 1;
+    return freshDriver;
+  };
+  h.connectors.define({ name: 'reconnect', driver: 'mysql', database: 'test' });
+  const record = (h.connectors as unknown as {
+    map: Map<string, { driver: DriverApi | null; status: string }>;
+  }).map.get('reconnect');
+  assert.ok(record);
+  record.driver = firstDriver;
+  record.status = 'connected';
+
+  const controller = new AbortController();
+  const reconnect = h.connectors.open('reconnect', undefined, controller.signal);
+  await reconnectStarted.promise;
+  controller.abort();
+  releaseReconnect.resolve();
+  await assert.rejects(
+    reconnect,
+    (error: unknown) => error instanceof DbConnectorError && error.code === ErrorCode.Cancelled,
+  );
+  assert.equal(firstDriverClosed, true);
+
+  const opened = await h.connectors.open('reconnect');
+  assert.equal(opened, freshDriver);
+  assert.equal(builds, 1);
+});
+
 test('close removes the connection; closeAll clears everything', async () => {
   const h = makeHarness();
   h.connectors.define({ name: 'a', driver: 'sqlite', database: join(h.dir, 'a.sqlite') });
