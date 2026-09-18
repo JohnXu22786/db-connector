@@ -50,6 +50,29 @@ test('executor preserves PostgreSQL JSONB operators in audit summaries', async (
   assert.equal(records[0]!.statement.summary, "SELECT doc #> 'x' FROM t LIMIT 10");
 });
 
+test('read-like db_exec guards driver materialization with the configured row cap', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let executedSql = '';
+  installDriver(h, emptyDriver({
+    read: async (sql) => {
+      executedSql = sql;
+      return { columns: ['id'], rows: [[1], [2], [3]], rowCount: 3 };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-exec', driver: 'sqlite', database: 'test' });
+
+  const result = await h.engine.exec(
+    { connection: 'bounded-exec', sql: 'SELECT id FROM items ORDER BY id', way: 'cli' },
+    freshSignal(),
+  );
+
+  assert.equal(result.kind, 'read');
+  assert.equal(executedSql, 'SELECT id FROM items ORDER BY id LIMIT 2');
+  const records = await h.audit.query({ connection: 'bounded-exec' });
+  assert.equal(records[0]!.rows, 2);
+  assert.match(result.note, /returned 2 row\(s\) \(capped at 2\)/);
+});
+
 test('invalid query validation is audited', async () => {
   const h = makeHarness();
 
