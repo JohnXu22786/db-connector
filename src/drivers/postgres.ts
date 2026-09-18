@@ -818,9 +818,21 @@ function queryWithCancellation(
 
     signal.addEventListener('abort', onAbort, { once: true });
     try {
-      query = new Query(config, undefined, handleResult);
       if (onRow) {
-        (query as unknown as PgStreamQuery).on('row', onRow);
+        const streamQuery = new Query(config);
+        query = streamQuery;
+        streamQuery
+          .on('row', onRow)
+          .on('error', (err) => handleResult(err))
+          .on('end', (result) => {
+            handleResult(null, {
+              fields: result?.fields ?? [],
+              rows: [],
+              rowCount: 0,
+            });
+          });
+      } else {
+        query = new Query(config, undefined, handleResult);
       }
       const returned = client.query(query);
       if (returned !== query && isThenable(returned)) {
