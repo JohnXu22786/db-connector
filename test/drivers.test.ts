@@ -783,12 +783,26 @@ test('PostgreSQL read conversion preserves empty columns and duplicate values', 
 });
 
 test('PostgreSQL bounded reads retain no rows beyond the requested cap', async () => {
+  type QueryResult = {
+    fields: Array<{ name: string }>;
+    rows: unknown[][];
+    rowCount: number;
+  };
+  type QueryCallback = (err: unknown, result?: QueryResult) => void;
+
   class FakePgStreamQuery {
     readonly config: { text: string };
+    readonly callbackMaterializedRows: unknown[][] = [];
     private readonly listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    private readonly callback?: QueryCallback;
 
-    constructor(config: { text: string }) {
+    constructor(
+      config: { text: string },
+      _values?: unknown[],
+      callback?: QueryCallback,
+    ) {
       this.config = config;
+      this.callback = callback;
     }
 
     on(event: string, listener: (...args: unknown[]) => void): this {
@@ -800,24 +814,38 @@ test('PostgreSQL bounded reads retain no rows beyond the requested cap', async (
 
     emit(event: string, ...args: unknown[]): void {
       for (const listener of this.listeners.get(event) ?? []) listener(...args);
+      if (event === 'row' && this.callback) {
+        const row = args[0];
+        if (Array.isArray(row)) this.callbackMaterializedRows.push(row);
+      }
+      if (event === 'end' && this.callback) {
+        const fields = (args[0] as { fields?: Array<{ name: string }> } | undefined)?.fields ?? [];
+        this.callback(null, {
+          fields,
+          rows: this.callbackMaterializedRows,
+          rowCount: this.callbackMaterializedRows.length,
+        });
+      }
     }
   }
 
   const events: string[] = [];
+  const queries: FakePgStreamQuery[] = [];
   const client = {
-    async query(input: unknown): Promise<unknown> {
-      if (typeof input === 'string') {
-        events.push(input);
-        return { fields: [], rows: [], rowCount: null };
-      }
+    query(input: unknown): unknown {
       if (input instanceof FakePgStreamQuery) {
         events.push(input.config.text);
+        queries.push(input);
         queueMicrotask(() => {
-          const fields = [{ name: 'id' }];
-          input.emit('row', [1], { fields });
-          input.emit('row', [2], { fields });
-          input.emit('row', [3], { fields });
-          input.emit('end', { fields });
+          if (input.config.text === 'SHOW ALL') {
+            const fields = [{ name: 'id' }];
+            input.emit('row', [1], { fields });
+            input.emit('row', [2], { fields });
+            input.emit('row', [3], { fields });
+            input.emit('end', { fields });
+          } else {
+            input.emit('end', { fields: [] });
+          }
         });
         return input;
       }
@@ -839,6 +867,8 @@ test('PostgreSQL bounded reads retain no rows beyond the requested cap', async (
   assert.deepEqual(result.columns, ['id']);
   assert.deepEqual(result.rows, [[1], [2]]);
   assert.equal(result.truncated, true);
+  const boundedQuery = queries.find((query) => query.config.text === 'SHOW ALL');
+  assert.equal(boundedQuery?.callbackMaterializedRows.length, 0);
   assert.deepEqual(events, ['BEGIN TRANSACTION READ ONLY', 'SHOW ALL', 'ROLLBACK']);
 });
 
