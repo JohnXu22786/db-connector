@@ -282,7 +282,115 @@ export function scan(sql: string, options: ScanOptions | DriverKind = {}): Token
     i += 1;
   }
 
+  if (postgresEscapeStrings) markQuestionOperators(tokens);
   return tokens;
+}
+
+/**
+ * PostgreSQL uses `?`, `?|`, `?&`, and `@?` as JSONB operators. A question
+ * mark is a positional parameter everywhere else, so reclassify it only when
+ * the surrounding tokens form a binary expression.
+ */
+function markQuestionOperators(tokens: Token[]): void {
+  const meaningfulIndexes = tokens
+    .map((token, index) => token.type === 'space' || token.type === 'comment' ? -1 : index)
+    .filter((index) => index >= 0);
+
+  for (let i = 0; i < meaningfulIndexes.length; i += 1) {
+    const index = meaningfulIndexes[i]!;
+    const token = tokens[index]!;
+    if (token.type !== 'param' || token.value !== '?') continue;
+
+    const previous = i > 0 ? tokens[meaningfulIndexes[i - 1]!] : undefined;
+    const next = i + 1 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 1]!] : undefined;
+    const nextNext = i + 2 < meaningfulIndexes.length
+      ? tokens[meaningfulIndexes[i + 2]!] : undefined;
+
+    const isAdjacentToNext = next !== undefined && token.pos + token.value.length === next.pos;
+    const isAdjacentToPrevious = previous !== undefined && previous.pos + previous.value.length === token.pos;
+    const right = isAdjacentToNext && next?.type === 'symbol' && (next.value === '|' || next.value === '&')
+      ? nextNext
+      : next;
+    const leftIndex = isAdjacentToPrevious && previous?.type === 'symbol' && previous.value === '@'
+      ? i - 2
+      : i - 1;
+    const left = leftIndex >= 0 ? tokens[meaningfulIndexes[leftIndex]!] : undefined;
+    const leftPrevious = leftIndex > 0
+      ? tokens[meaningfulIndexes[leftIndex - 1]!]
+      : undefined;
+
+    if (
+      !isFetchRowLimitParameter(tokens, meaningfulIndexes, i) &&
+      !isByClauseParameter(tokens, meaningfulIndexes, i) &&
+      isExpressionEnd(left, leftPrevious) &&
+      isExpressionStart(right)
+    ) {
+      token.type = 'symbol';
+    }
+  }
+}
+
+const QUESTION_OPERATOR_BOUNDARIES = new Set([
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'LIMIT', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'RETURNING', 'INTO',
+  'AND', 'OR', 'NOT', 'IS', 'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO',
+  'AS', 'ON', 'USING', 'JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
+  'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'COLLATE',
+  'WINDOW',
+]);
+
+/**
+ * PostgreSQL permits non-reserved keywords as bare column names. Keep only
+ * reserved/type-function keywords as unconditional expression-start
+ * boundaries. Clause-specific checks above preserve parameters in FETCH and
+ * GROUP/ORDER/PARTITION BY forms without rejecting keyword operands.
+ */
+const QUESTION_OPERATOR_START_BOUNDARIES = new Set([
+  'SELECT', 'FROM', 'WHERE', 'GROUP', 'ORDER', 'OFFSET', 'FETCH',
+  'FOR', 'UNION', 'INTERSECT', 'EXCEPT', 'INTO',
+  'AND', 'OR', 'NOT', 'IS', 'IN', 'LIKE', 'ILIKE', 'SIMILAR', 'TO',
+  'AS', 'ON', 'USING', 'JOIN', 'LEFT', 'RIGHT', 'FULL', 'INNER', 'OUTER', 'CROSS',
+  'WHEN', 'THEN', 'ELSE', 'END', 'ASC', 'DESC', 'COLLATE', 'WINDOW',
+]);
+
+function isFetchRowLimitParameter(tokens: Token[], indexes: number[], index: number): boolean {
+  const fetch = index >= 2 ? tokens[indexes[index - 2]!] : undefined;
+  const direction = index >= 1 ? tokens[indexes[index - 1]!] : undefined;
+  const row = index + 1 < indexes.length ? tokens[indexes[index + 1]!] : undefined;
+  const only = index + 2 < indexes.length ? tokens[indexes[index + 2]!] : undefined;
+  return fetch?.type === 'word' && fetch.value.toUpperCase() === 'FETCH' &&
+    direction?.type === 'word' && ['FIRST', 'NEXT'].includes(direction.value.toUpperCase()) &&
+    row?.type === 'word' && ['ROW', 'ROWS'].includes(row.value.toUpperCase()) &&
+    only?.type === 'word' && only.value.toUpperCase() === 'ONLY';
+}
+
+function isByClauseParameter(tokens: Token[], indexes: number[], index: number): boolean {
+  if (index < 2) return false;
+  const by = tokens[indexes[index - 1]!];
+  const clause = tokens[indexes[index - 2]!];
+  return by?.type === 'word' && by.value.toUpperCase() === 'BY' &&
+    clause?.type === 'word' && ['GROUP', 'ORDER', 'PARTITION'].includes(clause.value.toUpperCase());
+}
+
+function isExpressionEnd(token: Token | undefined, previous?: Token): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') {
+    // PostgreSQL allows reserved words after a qualification dot, e.g.
+    // `t.where`, so the final spelling alone cannot identify a clause.
+    if (previous?.type === 'symbol' && previous.value === '.') return true;
+    return token.value.toUpperCase() === 'END' ||
+      !QUESTION_OPERATOR_BOUNDARIES.has(token.value.toUpperCase());
+  }
+  return token.type === 'symbol' && (/^[0-9.]$/.test(token.value) || /^[)\]}]$/.test(token.value));
+}
+
+function isExpressionStart(token: Token | undefined): boolean {
+  if (!token) return false;
+  if (token.type === 'string' || token.type === 'quotedid' || token.type === 'param') return true;
+  if (token.type === 'word') return !QUESTION_OPERATOR_START_BOUNDARIES.has(token.value.toUpperCase());
+  return token.type === 'symbol' && /^[([{0-9.]$/.test(token.value);
 }
 
 /** Meaningful tokens: everything except whitespace and comments. */

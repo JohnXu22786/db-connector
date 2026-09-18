@@ -250,6 +250,71 @@ test('tagged PostgreSQL dollar strings still protect placeholders and semicolons
   assert.doesNotThrow(() => assertSingleStatement('SELECT $tag$; SELECT $tag$', 'postgres'));
 });
 
+test('PostgreSQL JSONB operators are not positional parameters', () => {
+  const sql = [
+    "SELECT payload ? 'key'",
+    "payload ?| ARRAY['a']",
+    "payload ?& ARRAY['b']",
+    "payload @? '$.c'",
+    'id = ?',
+  ].join(' AND ');
+
+  assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), {
+    sql: [
+      "SELECT payload ? 'key'",
+      "payload ?| ARRAY['a']",
+      "payload ?& ARRAY['b']",
+      "payload @? '$.c'",
+      'id = $1',
+    ].join(' AND '),
+    count: 1,
+  });
+});
+
+test('PostgreSQL FETCH row-limit placeholders remain positional parameters', () => {
+  for (const clause of ['FETCH FIRST ? ROWS ONLY', 'FETCH NEXT ? ROW ONLY']) {
+    assert.deepEqual(
+      toDollarPlaceholders(`SELECT id FROM t ${clause}`, 'postgres'),
+      {
+        sql: `SELECT id FROM t ${clause.replace('?', '$1')}`,
+        count: 1,
+      },
+    );
+  }
+
+  const orderBy = 'SELECT id FROM t ORDER BY ? NULLS FIRST';
+  assert.deepEqual(toDollarPlaceholders(orderBy, 'postgres'), {
+    sql: 'SELECT id FROM t ORDER BY $1 NULLS FIRST',
+    count: 1,
+  });
+});
+
+test('PostgreSQL SIMILAR TO placeholders remain positional parameters before ESCAPE', () => {
+  assert.deepEqual(
+    toDollarPlaceholders("SELECT value FROM t WHERE value SIMILAR TO ? ESCAPE '!'", 'postgres'),
+    {
+      sql: "SELECT value FROM t WHERE value SIMILAR TO $1 ESCAPE '!'",
+      count: 1,
+    },
+  );
+});
+
+test('PostgreSQL JSONB operators accept keyword operands', () => {
+  for (const operand of [
+    'limit', 'returning', 'first', 'row', 'rows', 'filter', 'over', 'escape', 'between', 'by',
+    'values', 'partition',
+  ]) {
+    const sql = `SELECT payload ? ${operand} FROM t`;
+    assert.deepEqual(toDollarPlaceholders(sql, 'postgres'), { sql, count: 0 }, operand);
+  }
+
+  const bareKeyword = "SELECT first ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(bareKeyword, 'postgres'), { sql: bareKeyword, count: 0 });
+
+  const qualified = "SELECT t.where ? 'key' FROM t";
+  assert.deepEqual(toDollarPlaceholders(qualified, 'postgres'), { sql: qualified, count: 0 });
+});
+
 test('toDollarPlaceholders rewrites positional ? outside strings/comments', () => {
   assert.deepEqual(toDollarPlaceholders('SELECT * FROM t WHERE a = ? AND b = ?'), {
     sql: 'SELECT * FROM t WHERE a = $1 AND b = $2',
