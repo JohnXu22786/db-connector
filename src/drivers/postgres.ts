@@ -23,26 +23,43 @@ interface PgQueryResult {
 
 interface PgArrayQueryResult extends Omit<PgQueryResult, 'rows'> {
   rows: unknown[][];
+  truncated?: boolean;
 }
 
 interface PgQueryConfig {
   text: string;
   values?: unknown[];
+  signal?: AbortSignal;
   name?: string;
   rowMode?: 'array';
 }
 
 type PgQueryHandle = object;
 type PgQueryCallback = (err: Error | null, result?: PgQueryResult) => void;
-type PgQueryConstructor = new (
-  config: PgQueryConfig,
-  values?: unknown[],
-  callback?: PgQueryCallback,
-) => PgQueryHandle;
+
+interface PgStreamResult {
+  fields?: Array<{ name: string }>;
+}
+
+interface PgStreamQuery {
+  on(event: 'row', listener: (row: unknown[], result?: PgStreamResult) => void): PgStreamQuery;
+  on(event: 'error', listener: (err: unknown) => void): PgStreamQuery;
+  on(event: 'end', listener: (result?: PgStreamResult) => void): PgStreamQuery;
+}
+
+type PgQueryConstructor = {
+  new (config: PgQueryConfig): PgStreamQuery;
+  new (
+    config: PgQueryConfig,
+    values?: unknown[],
+    callback?: PgQueryCallback,
+  ): PgQueryHandle;
+};
 
 interface PgQueryable {
   query(query: PgQueryHandle): PgQueryHandle | Promise<PgQueryResult>;
   query(text: string): Promise<PgQueryResult>;
+  query(query: PgStreamQuery): unknown;
 }
 
 interface PgClientLike extends PgQueryable {
@@ -204,16 +221,37 @@ export class PgDriver implements DriverApi {
     void client.end().catch(() => {}).finally(removeClientErrorGuard);
   }
 
-  async read(sql: string, params: unknown[], signal: AbortSignal): Promise<ReadOutcome> {
-    return this.withOperationLock(() => this.readUnlocked(sql, params, signal), signal);
+  async read(
+    sql: string,
+    params: unknown[],
+    signal: AbortSignal,
+    maxRows?: number,
+  ): Promise<ReadOutcome> {
+    return this.withOperationLock(
+      () => this.readUnlocked(sql, params, signal, maxRows),
+      signal,
+    );
   }
 
   private async readUnlocked(
     sql: string,
     params: unknown[],
     signal: AbortSignal,
+    maxRows?: number,
   ): Promise<ReadOutcome> {
     const client = this.ensure();
+    const bounded = maxRows !== undefined && Number.isFinite(maxRows);
+    if (bounded && maxRows! < 0) {
+      throw new RangeError('maxRows must be a non-negative number');
+    }
+    const rowLimit = bounded ? Math.floor(maxRows!) : undefined;
+    if (bounded && isNativePgClient(client)) throw nativeModeError();
+    if (bounded && !this.queryConstructor) {
+      throw new DbConnectorError(
+        ErrorCode.UnsupportedDriver,
+        'bounded PostgreSQL reads require the event-emitting pg client',
+      );
+    }
     const converted = toDollarPlaceholders(sql, 'postgres');
     try {
       // Server-side read-only backstop: even a statement that slips past the
@@ -228,6 +266,9 @@ export class PgDriver implements DriverApi {
         (err) => this.invalidateClient(client, err),
       );
       try {
+        let streamedRows: unknown[][] | undefined;
+        let streamedFields: Array<{ name: string }> | undefined;
+        let streamedTruncated = false;
         const result = await queryWithCancellation(
           client,
           this.clientConstructor!,
@@ -236,6 +277,14 @@ export class PgDriver implements DriverApi {
           { text: converted.sql, values: params, rowMode: 'array' },
           signal,
           (err) => this.invalidateClient(client, err),
+          bounded
+            ? (row, streamResult) => {
+              streamedRows ??= [];
+              streamedFields ??= streamResult?.fields;
+              if (streamedRows.length < rowLimit!) streamedRows.push(row);
+              else streamedTruncated = true;
+            }
+            : undefined,
         );
         await queryWithCancellation(
           client,
@@ -246,7 +295,16 @@ export class PgDriver implements DriverApi {
           signal,
           (err) => this.invalidateClient(client, err),
         );
-        return outcomeOf(result as unknown as PgArrayQueryResult);
+        const boundedResult = bounded
+          ? {
+            ...result,
+            fields: streamedFields ?? result.fields,
+            rows: streamedRows ?? [],
+            rowCount: streamedRows?.length ?? 0,
+            ...(streamedTruncated ? { truncated: true } : {}),
+          }
+          : result;
+        return outcomeOf(boundedResult as unknown as PgArrayQueryResult);
       } catch (err) {
         if (isCancellationFailure(err) || signal.aborted) {
           this.invalidateClient(client, err);
@@ -669,6 +727,7 @@ function queryWithCancellation(
   config: PgQueryConfig,
   signal: AbortSignal,
   onCancellationFailure: (err: unknown) => void,
+  onRow?: (row: unknown[], result?: PgStreamResult) => void,
 ): Promise<PgQueryResult> {
   if (signal.aborted) return Promise.reject(cancelError(signal));
 
@@ -746,6 +805,9 @@ function queryWithCancellation(
     signal.addEventListener('abort', onAbort, { once: true });
     try {
       query = new Query(config, undefined, handleResult);
+      if (onRow) {
+        (query as unknown as PgStreamQuery).on('row', onRow);
+      }
       const returned = client.query(query);
       if (returned !== query && isThenable(returned)) {
         void returned.then(
@@ -777,10 +839,26 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
     typeof (value as { then?: unknown }).then === 'function';
 }
 
+function isNativePgClient(client: PgClientLike): boolean {
+  return client.native !== undefined;
+}
+
+function nativeModeError(): DbConnectorError {
+  return new DbConnectorError(
+    ErrorCode.UnsupportedDriver,
+    'PostgreSQL native client mode is not supported for bounded reads; unset NODE_PG_FORCE_NATIVE',
+  );
+}
+
 function outcomeOf(result: PgArrayQueryResult): ReadOutcome {
   const columns = result.fields.map((f) => f.name);
   const rows = result.rows.map((row) => row.map((value) => value ?? null));
-  return { columns, rows, rowCount: rows.length };
+  return {
+    columns,
+    rows,
+    rowCount: rows.length,
+    ...(result.truncated ? { truncated: true } : {}),
+  };
 }
 
 function normalizeSsl(ssl: unknown): boolean | object | undefined {

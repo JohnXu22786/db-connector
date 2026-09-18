@@ -33,6 +33,37 @@ function emptyDriver(overrides: Partial<DriverApi> = {}): DriverApi {
   };
 }
 
+test('db_query passes its cap to the driver and preserves bounded truncation', async () => {
+  const h = makeHarness({ query: { maxRows: 2 } });
+  let receivedMaxRows: number | undefined;
+  installDriver(h, emptyDriver({
+    read: async (_sql, _params, _signal, maxRows) => {
+      receivedMaxRows = maxRows;
+      return {
+        columns: ['id'],
+        rows: [[1], [2]],
+        rowCount: 2,
+        truncated: true,
+      };
+    },
+  }));
+  h.connectors.define({ name: 'bounded-query', driver: 'sqlite' });
+
+  const result = await h.engine.query(
+    {
+      connection: 'bounded-query',
+      sql: 'SELECT id FROM items LIMIT 100',
+      limit: 2,
+      way: 'cli',
+    },
+    freshSignal(),
+  );
+
+  assert.equal(receivedMaxRows, 2);
+  assert.deepEqual(result.rows, [[1], [2]]);
+  assert.equal(result.truncated, true);
+});
+
 test('executor preserves PostgreSQL JSONB operators in audit summaries', async () => {
   const h = makeHarness();
   installDriver(h, emptyDriver({ kind: 'postgres' }));
