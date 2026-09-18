@@ -355,7 +355,7 @@ export class ExecutionEngine {
           classification.kind === 'select'
             ? ensureSelectLimit(bound.sql, limit, driverKind).sql
             : bound.sql;
-        const outcome = await driver.read(protectedSql, bound.values, deadline.signal);
+        const outcome = await driver.read(protectedSql, bound.values, deadline.signal, limit);
         const { rows } = capRows(outcome.rows, limit);
         this.connectors.touch(opts.connection);
         const auditId = await this.auditOk({
