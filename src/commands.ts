@@ -8,6 +8,7 @@
  */
 
 import type { ExecutionEngine } from './executor.js';
+import { DbConnectorError, ErrorCode } from './errors.js';
 import type { DshContext } from './types.js';
 
 const HELP = `db — SQL database operations
@@ -117,8 +118,8 @@ export async function runDbLine(
         connectionString: flagStr(flags, 'connection-string'),
         schema: flagStr(flags, 'schema'),
       } as const;
-      await engine.connect(spec as never);
-      return `Connected ${name} (${driver}).`;
+      const status = await engine.connect(spec as never);
+      return `Connected ${name} (${status.driver}).`;
     }
 
     case 'close': {
@@ -235,10 +236,16 @@ function decodeCsv(text: string): unknown[] {
 }
 
 function flagNumber(flags: Record<string, string | boolean>, key: string): number | undefined {
-  const v = flagStr(flags, key);
-  if (v === undefined) return undefined;
+  const raw = flags[key];
+  if (raw === undefined) return undefined;
+  if (raw === true) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, `"${key}" must be a number`);
+  }
+  const v = raw;
   const n = Number(v);
-  if (!Number.isFinite(n)) return undefined;
+  if (!Number.isFinite(n)) {
+    throw new DbConnectorError(ErrorCode.InvalidArgs, `"${key}" must be a number`);
+  }
   return n;
 }
 

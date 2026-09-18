@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { AuditLog } from '../dist/audit.js';
+import { summarizeSql } from '../dist/sql.js';
 
 function freshPath(): string {
   return join(mkdtempSync(join(tmpdir(), 'db-connector-audit-')), 'audit.jsonl');
@@ -113,6 +114,27 @@ test('audit summaries redact PostgreSQL dollar-quoted literals', async () => {
   const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
   assert.equal(rec.statement.summary, "SELECT 'x'");
   assert.ok(!JSON.stringify(rec).includes('DOLLAR_SECRET'));
+});
+
+test('audit summaries preserve PostgreSQL JSONB operators', async () => {
+  const log = new AuditLog(freshPath());
+  const sql = "SELECT doc #> '{a}' FROM t";
+  await log.append(input({ sql }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.deepEqual(rec.statement, summarizeSql(sql, 512));
+  assert.equal(rec.statement.summary, "SELECT doc #> 'x' FROM t");
+});
+
+test('audit summaries redact MySQL hash comments', async () => {
+  const log = new AuditLog(freshPath());
+  await log.append(input({ sql: 'SELECT * FROM t # MYSQL_SECRET', driver: 'mysql' }));
+  await log.flush();
+
+  const rec = JSON.parse((await readFile(log.path, 'utf8')).trim());
+  assert.equal(rec.statement.summary, 'SELECT * FROM t');
+  assert.ok(!JSON.stringify(rec).includes('MYSQL_SECRET'));
 });
 
 test('error records carry code + message, rows default to 0', async () => {
@@ -242,6 +264,22 @@ test('tolerates a malformed line in the middle of the log', async () => {
   await log.flush();
   const recs = await log.query({});
   assert.equal(recs.length, 2);
+});
+
+test('ignores valid JSON values that are not audit records', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'db-connector-audit-'));
+  const path = join(dir, 'audit.jsonl');
+  const log = new AuditLog(path);
+  await writeFile(path, 'null\n[]\n"not-record"\n42\n{}\n');
+  await log.append(input({ connection: 'valid' }));
+
+  const records = await log.query({});
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.connection, 'valid');
+
+  const filtered = await log.query({ connection: 'valid' });
+  assert.equal(filtered.length, 1);
+  assert.equal(filtered[0]!.connection, 'valid');
 });
 
 test('an append failure never throws and does not poison later attempts', async () => {

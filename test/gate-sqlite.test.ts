@@ -409,6 +409,21 @@ test('result cap applies and reports truncation', async () => {
   assert.equal(capped.limit, 5);
 });
 
+test('zero result cap is enforced by the SELECT guard', async () => {
+  const h = await setup();
+  const result = await h.engine.query(
+    { connection: 'sample', sql: 'SELECT * FROM users', limit: 0, way: 'cli' },
+    freshSignal(),
+  );
+  assert.deepEqual(result.rows, []);
+  assert.equal(result.rowCount, 0);
+  assert.equal(result.limit, 0);
+
+  const { records } = await h.engine.audit({ connection: 'sample', limit: 50 });
+  const hit = records.find((r) => r.kind === 'query' && r.statement.summary.includes('LIMIT 0'));
+  assert.ok(hit, 'expected the zero-row guard in the audit record');
+});
+
 test('SELECT guard limit is appended when absent', async () => {
   const h = await setup();
   for (let i = 0; i < 10; i += 1) {
