@@ -982,6 +982,36 @@ export function rewriteNamedToPositional(
   return { sql: state.out, order };
 }
 
+function isSqliteParameterWord(tokens: Token[], index: number): boolean {
+  const token = tokens[index];
+  if (token?.type !== 'word') return false;
+
+  const directlyBefore = (previous: Token | undefined, next: Token): boolean =>
+    previous !== undefined && previous.pos + previous.value.length === next.pos;
+  const isParameterPrefix = (candidate: Token | undefined): boolean =>
+    candidate?.type === 'symbol' && (candidate.value === '$' || candidate.value === '@');
+
+  let current = index;
+  while (current >= 0) {
+    const prefix = tokens[current - 1];
+    if (isParameterPrefix(prefix) && directlyBefore(prefix, tokens[current]!)) return true;
+
+    const separator = tokens[current - 1];
+    const name = tokens[current - 2];
+    if (
+      separator?.type !== 'symbol' ||
+      separator.value !== '::' ||
+      !directlyBefore(separator, tokens[current]!) ||
+      name?.type !== 'word' ||
+      !directlyBefore(name, separator)
+    ) {
+      return false;
+    }
+    current -= 2;
+  }
+  return false;
+}
+
 /**
  * Append `LIMIT <n>` to a single top-level SELECT that has no top-level LIMIT
  * or PostgreSQL FETCH row limit already. Used only as a courtesy guard: the
@@ -993,9 +1023,28 @@ export function ensureSelectLimit(
   driver?: DriverKind,
 ): { sql: string; applied: boolean } {
   const { kind } = classifyStatement(sql, driver);
-  if (kind !== 'select') return { sql, applied: false };
-
   const tokens = meaningful(sql, driver);
+  const finalDataKeyword = tokens.findLast(
+    (t, index) => {
+      if (t.type !== 'word' || t.depth !== 0 || !DATA_KEYWORDS.has(t.value.toUpperCase())) {
+        return false;
+      }
+      // SQLite `$name`/`@name` parameters can also have one or more
+      // adjacent `::suffix` segments.
+      // Do not mistake `$VALUES`, `$name::VALUES`, or their `@` forms for a
+      // compound query term.
+      return !(driver === 'sqlite' && isSqliteParameterWord(tokens, index));
+    },
+  );
+  // SQLite does not allow LIMIT on a compound whose final term is VALUES.
+  // Server drivers support LIMIT on standalone VALUES, so keep their guard.
+  if (
+    kind !== 'select' ||
+    (driver === 'sqlite' && finalDataKeyword?.value.toUpperCase() === 'VALUES')
+  ) {
+    return { sql, applied: false };
+  }
+
   const hasTopLevelLimit = tokens.some(
     (t) => t.type === 'word' && t.depth === 0 && t.value.toUpperCase() === 'LIMIT',
   );

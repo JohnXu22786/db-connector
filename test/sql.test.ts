@@ -434,6 +434,39 @@ test('ensureSelectLimit appends LIMIT only when none exists at top level', () =>
   assert.equal(ensureSelectLimit('SELECT 1 /* ; */', 5).sql, 'SELECT 1 LIMIT 5 /* ; */');
 });
 
+test('ensureSelectLimit leaves SQLite VALUES statements unchanged', () => {
+  const values = ensureSelectLimit('VALUES (1), (2)', 1, 'sqlite');
+  assert.equal(values.applied, false);
+  assert.equal(values.sql, 'VALUES (1), (2)');
+
+  const compound = ensureSelectLimit('SELECT 0 UNION ALL VALUES (1)', 1, 'sqlite');
+  assert.equal(compound.applied, false);
+  assert.equal(compound.sql, 'SELECT 0 UNION ALL VALUES (1)');
+
+  for (const sql of ['SELECT $VALUES', 'SELECT @VALUES']) {
+    const parameter = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameter.applied, true);
+    assert.equal(parameter.sql, `${sql} LIMIT 1`);
+  }
+
+  for (const sql of [
+    'SELECT $foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::VALUES FROM (VALUES (1), (2))',
+    'SELECT $foo::bar::VALUES FROM (VALUES (1), (2))',
+    'SELECT @foo::bar::VALUES FROM (VALUES (1), (2))',
+  ]) {
+    const parameterSuffix = ensureSelectLimit(sql, 1, 'sqlite');
+    assert.equal(parameterSuffix.applied, true);
+    assert.equal(parameterSuffix.sql, `${sql} LIMIT 1`);
+  }
+
+  for (const driver of ['postgres', 'mysql'] as const) {
+    const serverValues = ensureSelectLimit('VALUES (1), (2)', 1, driver);
+    assert.equal(serverValues.applied, true);
+    assert.equal(serverValues.sql, 'VALUES (1), (2) LIMIT 1');
+  }
+});
+
 test('ensureSelectLimit places the MySQL guard before # comments', () => {
   const sql = 'SELECT * FROM t # trailing comment';
   assert.deepEqual(ensureSelectLimit(sql, 10, 'mysql'), {
